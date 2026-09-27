@@ -17,10 +17,6 @@ messages(session_id, seq, source, project, role, text, created_at,
          PRIMARY KEY(session_id, seq))
 ```
 
-`duckpgq` and `vss` extensions load best-effort at open. Search uses literal
-case-insensitive term matching and ranks matching messages by phrase match
-and term density; it works offline. Vector search remains future work.
-
 ## Kept vs dropped per source
 
 Kept: user prompts, assistant text, system/developer text.
