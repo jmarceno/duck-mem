@@ -13,7 +13,7 @@ import (
 	"duck-mem/internal/embed"
 	"duck-mem/internal/topics"
 
-	_ "github.com/marcboeker/go-duckdb/v2"
+	duckdb "github.com/marcboeker/go-duckdb/v2"
 )
 
 // Message is one kept utterance from a session. Tool calls and tool
@@ -320,16 +320,6 @@ func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
 			return nil
 		}
 	}
-	tx, err := db.sql.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if !prefixMatches {
-		if _, err := tx.Exec(`DELETE FROM messages WHERE session_id=?`, sessionID); err != nil {
-			return err
-		}
-	}
 	start := 0
 	if prefixMatches {
 		start = len(old)
@@ -338,51 +328,37 @@ func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
 		if m.SessionID != sessionID {
 			return fmt.Errorf("message session %q does not match %q", m.SessionID, sessionID)
 		}
-		if err := insertMessage(tx, m); err != nil {
+	}
+	fresh := msgs[start:]
+	dirty := len(old) > 0 && !prefixMatches
+	return db.withTx(func(conn *duckdb.Conn) error {
+		if !prefixMatches {
+			if err := execConn(conn, `DELETE FROM messages WHERE session_id=`+sqlString(sessionID)); err != nil {
+				return err
+			}
+		}
+		if err := copyMessages(conn, stageMessages(fresh, false), false); err != nil {
 			return err
 		}
-	}
-	if len(old) > 0 && !prefixMatches {
-		if _, err := tx.Exec(`INSERT INTO meta(key, value) VALUES('graph_dirty', '1')
-			ON CONFLICT(key) DO UPDATE SET value='1'`); err != nil {
-			return err
+		if dirty {
+			return execConn(conn, `INSERT INTO meta(key, value) VALUES('graph_dirty', '1')
+				ON CONFLICT(key) DO UPDATE SET value='1'`)
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 // InsertMessages stores messages; re-ingesting the same (session_id, seq)
 // is a no-op so ingest runs are idempotent. New rows enter unindexed
 // (indexed=0) for the next incremental IndexNew run.
 func (db *DB) InsertMessages(msgs []Message) error {
-	for _, m := range msgs {
-		if err := insertMessage(db.sql, m); err != nil {
-			return err
-		}
+	if len(msgs) == 0 {
+		return nil
 	}
-	return nil
-}
-
-type execer interface {
-	Exec(query string, args ...any) (sql.Result, error)
-}
-
-func insertMessage(ex execer, m Message) error {
-	vec := embed.Embed(m.Text)
-	if vec == nil {
-		_, err := ex.Exec(
-			`INSERT INTO messages(session_id, seq, source, project, role, text, created_at, indexed, embedding)
-			 VALUES(?, ?, ?, ?, ?, ?, ?, 0, NULL)
-			 ON CONFLICT(session_id, seq) DO NOTHING`,
-			m.SessionID, m.Seq, m.Source, m.Project, m.Role, m.Text, nullableTime(m.CreatedAt))
-		return err
-	}
-	_, err := ex.Exec(
-		`INSERT INTO messages(session_id, seq, source, project, role, text, created_at, indexed, embedding)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?::FLOAT[`+strconv.Itoa(embed.Dim)+`])
-		 ON CONFLICT(session_id, seq) DO NOTHING`,
-		m.SessionID, m.Seq, m.Source, m.Project, m.Role, m.Text, nullableTime(m.CreatedAt), vectorLiteral(vec))
-	return err
+	rows := stageMessages(msgs, true)
+	return db.withTx(func(conn *duckdb.Conn) error {
+		return copyMessages(conn, rows, true)
+	})
 }
 
 // maxCosineDistance drops neighbors that share essentially no terms.
@@ -503,20 +479,16 @@ func (db *DB) ReplaceEdges(edges map[ProjectEdge]int) error {
 	if err := db.ensureEdgesSchema(); err != nil {
 		return err
 	}
-	tx, err := db.sql.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM topic_edges`); err != nil {
-		return err
-	}
-	for e, w := range edges {
-		if err := upsertEdge(tx, e, w, ""); err != nil {
+	topics, staged := collectEdges(edges, nil)
+	return db.withTx(func(conn *duckdb.Conn) error {
+		if err := resetGraphTables(conn); err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		if err := copyTopicsAndEdges(conn, topics, staged, false); err != nil {
+			return err
+		}
+		return ensurePropertyGraphConn(conn, false)
+	})
 }
 
 // v4 stores directed endpoints so duckpgq can traverse topic_edges.
@@ -600,18 +572,19 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	rows, err := db.sql.Query(`SELECT session_id, seq, project, text FROM messages WHERE indexed=0`)
+	rows, err := db.sql.Query(`SELECT session_id, seq, project, text, embedding IS NULL FROM messages WHERE indexed=0`)
 	if err != nil {
 		return 0, 0, err
 	}
 	type doc struct {
 		sid, proj, text string
 		seq             int
+		missing         bool
 	}
 	var docs []doc
 	for rows.Next() {
 		var d doc
-		if err := rows.Scan(&d.sid, &d.seq, &d.proj, &d.text); err != nil {
+		if err := rows.Scan(&d.sid, &d.seq, &d.proj, &d.text, &d.missing); err != nil {
 			rows.Close()
 			return 0, 0, err
 		}
@@ -624,6 +597,13 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 	if len(docs) == 0 {
 		return 0, 0, nil
 	}
+	texts := make([]string, len(docs))
+	missing := make([]bool, len(docs))
+	for i, d := range docs {
+		texts[i] = d.text
+		missing[i] = d.missing
+	}
+	scanned, vecs := prepareMessages(texts, missing)
 	// Per-project df views over the shared flat map.
 	projDF := map[string]map[string]int{}
 	getDF := func(proj string) map[string]int {
@@ -639,23 +619,20 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 	// (modulo pre-existing drift). Totals already include the new rows:
 	// they were inserted before indexing.
 	dfDelta := map[[2]string]int{}
-	for _, d := range docs {
-		seen := map[string]bool{}
-		for _, w := range topics.Terms(d.text) {
-			if !seen[w] {
-				seen[w] = true
-				dfDelta[[2]string{d.proj, w}]++
-				getDF(d.proj)[w]++
-			}
+	for i, d := range docs {
+		for _, w := range scanned[i].Terms {
+			dfDelta[[2]string{d.proj, w}]++
+			getDF(d.proj)[w]++
 		}
 	}
 	pairDelta := map[ProjectEdge]int{}
 	evidence := map[ProjectEdge]string{}
-	for _, d := range docs {
-		for _, e := range topics.SelectPairs(d.text, getDF(d.proj), minDF, topics.HubCap(totals[d.proj], minDF)) {
+	for i, d := range docs {
+		maxDF := topics.HubCap(totals[d.proj], minDF)
+		for _, e := range topics.SelectPairsFromTerms(scanned[i].Terms, getDF(d.proj), minDF, maxDF) {
 			pairDelta[ProjectEdge{Project: d.proj, A: e[0], B: e[1]}]++
 		}
-		for _, t := range topics.ExtractTyped(d.text) {
+		for _, t := range scanned[i].Typed {
 			e := ProjectEdge{Project: d.proj, A: t.A, B: t.B, From: t.From, To: t.To, Kind: t.Kind}
 			pairDelta[e]++
 			if evidence[e] == "" {
@@ -663,30 +640,29 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 			}
 		}
 	}
-	tx, err := db.sql.Begin()
-	if err != nil {
-		return 0, 0, err
-	}
-	defer tx.Rollback()
-	for e, n := range pairDelta {
-		if err := upsertEdge(tx, e, n, evidence[e]); err != nil {
-			return 0, 0, err
-		}
-	}
+	topicRows, edgeRows := collectEdges(pairDelta, evidence)
+	dfRows := make([]stagedDF, 0, len(dfDelta))
 	for pt, n := range dfDelta {
-		if _, err := tx.Exec(
-			`INSERT INTO term_df(project, term, msgs) VALUES(?, ?, ?)
-			 ON CONFLICT(project, term) DO UPDATE SET msgs=term_df.msgs+excluded.msgs`,
-			pt[0], pt[1], n); err != nil {
-			return 0, 0, err
+		dfRows = append(dfRows, stagedDF{project: pt[0], term: pt[1], msgs: int32(n)})
+	}
+	var embRows []stagedEmb
+	for i, d := range docs {
+		if vecs[i] != nil {
+			embRows = append(embRows, stagedEmb{sessionID: d.sid, seq: int32(d.seq), vec: vecs[i]})
 		}
 	}
-	for _, d := range docs {
-		if err := markIndexed(tx, d.sid, d.seq, d.text); err != nil {
-			return 0, 0, err
+	if err := db.withTx(func(conn *duckdb.Conn) error {
+		if err := copyTopicsAndEdges(conn, topicRows, edgeRows, true); err != nil {
+			return err
 		}
-	}
-	if err := tx.Commit(); err != nil {
+		if err := copyTermDF(conn, dfRows, true); err != nil {
+			return err
+		}
+		if err := copyEmbeddings(conn, embRows); err != nil {
+			return err
+		}
+		return execConn(conn, `UPDATE messages SET indexed=1 WHERE indexed=0`)
+	}); err != nil {
 		return 0, 0, err
 	}
 	return len(docs), len(pairDelta), nil
@@ -702,35 +678,36 @@ func (db *DB) IndexFull(minDF int) error {
 	if err != nil {
 		return err
 	}
-	groups := map[string][]TextDoc{}
-	for _, d := range docs {
-		groups[d.Project] = append(groups[d.Project], d)
-	}
-	tx, err := db.sql.Begin()
+	missingSet, err := db.missingEmbeddings()
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM topic_edges`); err != nil {
-		return err
+	groups := map[string][]int{}
+	texts := make([]string, len(docs))
+	missing := make([]bool, len(docs))
+	for i, d := range docs {
+		texts[i] = d.Text
+		groups[d.Project] = append(groups[d.Project], i)
+		_, missing[i] = missingSet[msgKey{d.SessionID, d.Seq}]
 	}
-	if _, err := tx.Exec(`DELETE FROM term_df`); err != nil {
-		return err
-	}
-	for proj, projectDocs := range groups {
-		texts := make([]string, len(projectDocs))
-		for i, d := range projectDocs {
-			texts[i] = d.Text
+	scanned, vecs := prepareMessages(texts, missing)
+	edgeW := map[ProjectEdge]int{}
+	evidence := map[ProjectEdge]string{}
+	var dfRows []stagedDF
+	for proj, idxs := range groups {
+		df := map[string]int{}
+		for _, i := range idxs {
+			for _, w := range scanned[i].Terms {
+				df[w]++
+			}
 		}
-		df := topics.DocFreq(texts)
-		maxDF := topics.HubCap(len(texts), minDF)
-		edgeW := map[ProjectEdge]int{}
-		evidence := map[ProjectEdge]string{}
-		for _, d := range projectDocs {
-			for _, e := range topics.SelectPairs(d.Text, df, minDF, maxDF) {
+		maxDF := topics.HubCap(len(idxs), minDF)
+		for _, i := range idxs {
+			d := docs[i]
+			for _, e := range topics.SelectPairsFromTerms(scanned[i].Terms, df, minDF, maxDF) {
 				edgeW[ProjectEdge{Project: proj, A: e[0], B: e[1]}]++
 			}
-			for _, tp := range topics.ExtractTyped(d.Text) {
+			for _, tp := range scanned[i].Typed {
 				e := ProjectEdge{Project: proj, A: tp.A, B: tp.B, From: tp.From, To: tp.To, Kind: tp.Kind}
 				edgeW[e]++
 				if evidence[e] == "" {
@@ -738,27 +715,63 @@ func (db *DB) IndexFull(minDF int) error {
 				}
 			}
 		}
-		for e, w := range edgeW {
-			if err := upsertEdge(tx, e, w, evidence[e]); err != nil {
-				return err
-			}
-		}
 		for w, n := range df {
-			if _, err := tx.Exec(`INSERT INTO term_df(project, term, msgs) VALUES(?, ?, ?)`, proj, w, n); err != nil {
-				return err
-			}
+			dfRows = append(dfRows, stagedDF{project: proj, term: w, msgs: int32(n)})
 		}
 	}
-	if _, err := tx.Exec(`UPDATE messages SET indexed=1`); err != nil {
-		return err
+	topicRows, edgeRows := collectEdges(edgeW, evidence)
+	var embRows []stagedEmb
+	for i, d := range docs {
+		if vecs[i] != nil {
+			embRows = append(embRows, stagedEmb{sessionID: d.SessionID, seq: int32(d.Seq), vec: vecs[i]})
+		}
 	}
-	if err := backfillEmbeddings(tx); err != nil {
-		return err
+	return db.withTx(func(conn *duckdb.Conn) error {
+		if err := resetGraphTables(conn); err != nil {
+			return err
+		}
+		if err := execConn(conn, `DELETE FROM term_df`); err != nil {
+			return err
+		}
+		if err := copyTopicsAndEdges(conn, topicRows, edgeRows, false); err != nil {
+			return err
+		}
+		if err := ensurePropertyGraphConn(conn, false); err != nil {
+			return err
+		}
+		if err := copyTermDF(conn, dfRows, false); err != nil {
+			return err
+		}
+		if err := copyEmbeddings(conn, embRows); err != nil {
+			return err
+		}
+		if err := execConn(conn, `UPDATE messages SET indexed=1`); err != nil {
+			return err
+		}
+		return execConn(conn, `DELETE FROM meta WHERE key='graph_dirty'`)
+	})
+}
+
+type msgKey struct {
+	sessionID string
+	seq       int
+}
+
+func (db *DB) missingEmbeddings() (map[msgKey]struct{}, error) {
+	rows, err := db.sql.Query(`SELECT session_id, seq FROM messages WHERE embedding IS NULL`)
+	if err != nil {
+		return nil, err
 	}
-	if _, err := tx.Exec(`DELETE FROM meta WHERE key='graph_dirty'`); err != nil {
-		return err
+	defer rows.Close()
+	out := map[msgKey]struct{}{}
+	for rows.Next() {
+		var k msgKey
+		if err := rows.Scan(&k.sessionID, &k.seq); err != nil {
+			return nil, err
+		}
+		out[k] = struct{}{}
 	}
-	return tx.Commit()
+	return out, rows.Err()
 }
 
 // loadDF returns term document frequencies keyed project+"\x00"+term,
@@ -1020,97 +1033,39 @@ func edgeID(src, dst, kind, from, to string) string {
 	return src + "\x1e" + dst + "\x1e" + kind + "\x1e" + from + "\x1e" + to
 }
 
-func upsertEdge(tx execer, e ProjectEdge, weight int, evidence string) error {
-	if evidence == "" {
-		evidence = ""
-	}
-	ends := [][2]string{{e.A, e.B}, {e.B, e.A}}
-	for _, end := range ends {
-		src, dst := topicID(e.Project, end[0]), topicID(e.Project, end[1])
-		for _, id := range []struct{ id, term string }{{src, end[0]}, {dst, end[1]}} {
-			if _, err := tx.Exec(
-				`INSERT INTO topics(topic_id, project, term) VALUES(?, ?, ?)
-				 ON CONFLICT(topic_id) DO NOTHING`,
-				id.id, e.Project, id.term); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO topic_edges(edge_id, src_id, dst_id, project, term_a, term_b, weight, kind, from_term, to_term, evidence)
-			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(edge_id) DO UPDATE SET weight = topic_edges.weight + excluded.weight`,
-			edgeID(src, dst, e.kind(), e.From, e.To), src, dst, e.Project, e.A, e.B, weight, e.kind(), e.From, e.To, evidence); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func markIndexed(tx execer, sessionID string, seq int, text string) error {
-	vec := embed.Embed(text)
-	if vec == nil {
-		_, err := tx.Exec(`UPDATE messages SET indexed=1, embedding=NULL WHERE session_id=? AND seq=?`, sessionID, seq)
-		return err
-	}
-	_, err := tx.Exec(
-		`UPDATE messages SET indexed=1, embedding=?::FLOAT[`+strconv.Itoa(embed.Dim)+`] WHERE session_id=? AND seq=?`,
-		vectorLiteral(vec), sessionID, seq)
-	return err
-}
-
-func backfillEmbeddings(tx *sql.Tx) error {
-	rows, err := tx.Query(`SELECT session_id, seq, text FROM messages WHERE embedding IS NULL`)
-	if err != nil {
-		return err
-	}
-	type row struct {
-		sid, text string
-		seq       int
-	}
-	var pending []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.sid, &r.seq, &r.text); err != nil {
-			rows.Close()
-			return err
-		}
-		pending = append(pending, r)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, r := range pending {
-		vec := embed.Embed(r.text)
-		if vec == nil {
-			continue
-		}
-		if _, err := tx.Exec(
-			`UPDATE messages SET embedding=?::FLOAT[`+strconv.Itoa(embed.Dim)+`] WHERE session_id=? AND seq=?`,
-			vectorLiteral(vec), r.sid, r.seq); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (db *DB) ensurePropertyGraph() error {
-	topics, edges := "topics", "topic_edges"
 	if db.readOnly {
+		return db.withTx(func(conn *duckdb.Conn) error {
+			return ensurePropertyGraphConn(conn, true)
+		})
+	}
+	_, err := db.sql.Exec(propertyGraphSQL(false))
+	if err != nil {
+		return fmt.Errorf("duckpgq property graph: %w", err)
+	}
+	return nil
+}
+
+func ensurePropertyGraphConn(conn *duckdb.Conn, readOnly bool) error {
+	if err := execConn(conn, propertyGraphSQL(readOnly)); err != nil {
+		return fmt.Errorf("duckpgq property graph: %w", err)
+	}
+	return nil
+}
+
+func propertyGraphSQL(readOnly bool) string {
+	topics, edges := "topics", "topic_edges"
+	if readOnly {
 		topics, edges = "src.topics", "src.topic_edges"
 	}
-	_, err := db.sql.Exec(fmt.Sprintf(`CREATE OR REPLACE PROPERTY GRAPH topic_graph
+	return fmt.Sprintf(`CREATE OR REPLACE PROPERTY GRAPH topic_graph
 		VERTEX TABLES (%s)
 		EDGE TABLES (
 			%s
 				SOURCE KEY (src_id) REFERENCES %s (topic_id)
 				DESTINATION KEY (dst_id) REFERENCES %s (topic_id)
 				LABEL Rel
-		)`, topics, edges, topics, topics))
-	if err != nil {
-		return fmt.Errorf("duckpgq property graph: %w", err)
-	}
-	return nil
+		)`, topics, edges, topics, topics)
 }
 
 func vectorLiteral(v []float32) string {

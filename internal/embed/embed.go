@@ -6,6 +6,7 @@
 package embed
 
 import (
+	"hash"
 	"hash/fnv"
 	"math"
 
@@ -17,30 +18,35 @@ const Dim = 384
 
 // Embed returns an L2-normalized vector, or nil when text has no content terms.
 func Embed(text string) []float32 {
-	toks := topics.Tokenize(text)
+	return EmbedTokens(topics.Tokenize(text))
+}
+
+// EmbedTokens builds the vector from content tokens already produced by topics.Analyze.
+func EmbedTokens(toks []string) []float32 {
 	if len(toks) == 0 {
 		return nil
 	}
 	v := make([]float32, Dim)
-	seen := map[string]bool{}
+	h := fnv.New64a()
+	seen := map[string]struct{}{}
 	for _, t := range toks {
-		if seen[t] {
+		if _, ok := seen[t]; ok {
 			continue
 		}
-		seen[t] = true
-		add(v, "u:"+t, 1)
+		seen[t] = struct{}{}
+		add(h, v, "u:", t, "")
 	}
-	seenBi := map[string]bool{}
+	seenBi := map[[2]string]struct{}{}
 	for i := 1; i < len(toks); i++ {
 		if toks[i] == toks[i-1] {
 			continue
 		}
-		bi := "b:" + toks[i-1] + "\x00" + toks[i]
-		if seenBi[bi] {
+		key := [2]string{toks[i-1], toks[i]}
+		if _, ok := seenBi[key]; ok {
 			continue
 		}
-		seenBi[bi] = true
-		add(v, bi, 1)
+		seenBi[key] = struct{}{}
+		add(h, v, "b:", key[0], key[1])
 	}
 	var sum float64
 	for _, x := range v {
@@ -56,14 +62,19 @@ func Embed(text string) []float32 {
 	return v
 }
 
-func add(v []float32, feature string, w float32) {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(feature))
+func add(h hash.Hash64, v []float32, prefix, a, b string) {
+	h.Reset()
+	_, _ = h.Write([]byte(prefix))
+	_, _ = h.Write([]byte(a))
+	if b != "" {
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(b))
+	}
 	sum := h.Sum64()
 	idx := int(sum % uint64(Dim))
 	if sum&1 == 0 {
-		v[idx] += w
+		v[idx]++
 	} else {
-		v[idx] -= w
+		v[idx]--
 	}
 }

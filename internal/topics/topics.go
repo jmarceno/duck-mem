@@ -6,10 +6,13 @@
 package topics
 
 import (
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
+	"unicode/utf8"
 )
 
 // stopwords drop glue words that would otherwise dominate the graph.
@@ -62,44 +65,79 @@ var stopwords = map[string]bool{
 // hub words ("turn", "user", "agent") connect everything to everything.
 const MaxDFRatio = 0.25
 
+// Doc is one message scanned once: content tokens (with repeats), the unique
+// terms in that order, and the typed relations.
+type Doc struct {
+	Tokens []string
+	Terms  []string
+	Typed  []TypedPair
+}
+
+// Analyze scans text once for tokens, terms, and typed relations.
+func Analyze(text string) Doc {
+	var d Doc
+	seen := map[string]bool{}
+	scanSentences(text, func(raw string) {
+		toks := contentTokens(strings.ToLower(raw))
+		if len(toks) == 0 {
+			return
+		}
+		d.Typed = append(d.Typed, extractSent(toks, strings.TrimSpace(raw))...)
+		for _, w := range toks {
+			if !isContent(w) {
+				continue
+			}
+			d.Tokens = append(d.Tokens, w)
+			if !seen[w] {
+				seen[w] = true
+				d.Terms = append(d.Terms, w)
+			}
+		}
+	})
+	return d
+}
+
+// AnalyzeMany scans texts independently, preserving order.
+func AnalyzeMany(texts []string) []Doc {
+	out := make([]Doc, len(texts))
+	if len(texts) < 64 {
+		for i, t := range texts {
+			out[i] = Analyze(t)
+		}
+		return out
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(texts) {
+		workers = len(texts)
+	}
+	var wg sync.WaitGroup
+	jobs := make(chan int, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				out[i] = Analyze(texts[i])
+			}
+		}()
+	}
+	for i := range texts {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return out
+}
+
 // Tokenize returns content tokens in order, keeping repeats so adjacent
 // phrases stay visible to the embedder.
 func Tokenize(text string) []string {
-	var raw []string
-	var cur strings.Builder
-	flush := func() {
-		w := cur.String()
-		cur.Reset()
-		if len(w) < 3 || stopwords[w] {
-			return
-		}
-		if isDigits(w) {
-			return
-		}
-		raw = append(raw, w)
-	}
-	for _, r := range strings.ToLower(text) {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			cur.WriteRune(r)
-		} else {
-			flush()
-		}
-	}
-	flush()
-	return raw
+	return Analyze(text).Tokens
 }
 
 // Terms extracts ordered unique content terms from text.
 func Terms(text string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, w := range Tokenize(text) {
-		if !seen[w] {
-			seen[w] = true
-			out = append(out, w)
-		}
-	}
-	return out
+	return Analyze(text).Terms
 }
 
 func isDigits(s string) bool {
@@ -139,13 +177,9 @@ func HubCap(total, minDF int) int {
 // DocFreq counts per-message term frequency over a corpus.
 func DocFreq(texts []string) map[string]int {
 	df := map[string]int{}
-	for _, t := range texts {
-		seen := map[string]bool{}
-		for _, w := range Terms(t) {
-			if !seen[w] {
-				seen[w] = true
-				df[w]++
-			}
+	for _, d := range AnalyzeMany(texts) {
+		for _, w := range d.Terms {
+			df[w]++
 		}
 	}
 	return df
@@ -209,18 +243,32 @@ func isContent(w string) bool {
 	return len(w) >= 3 && !stopwords[w] && !isDigits(w)
 }
 
-// contentTokens lowercases and splits text, keeping order and
+// scanSentences visits each sentence slice of text. Delimiters are the same
+// as ExtractTyped historically split on, and they are not part of the slice.
+func scanSentences(text string, fn func(raw string)) {
+	start := 0
+	for i, r := range text {
+		if r == '.' || r == '!' || r == '?' || r == ';' || r == '\n' {
+			fn(text[start:i])
+			start = i + utf8.RuneLen(r)
+		}
+	}
+	fn(text[start:])
+}
+
+// contentTokens splits already-lowercased text, keeping order and
 // duplicates (unlike Terms): extraction needs positions.
 func contentTokens(text string) []string {
 	var out []string
 	var cur strings.Builder
 	flush := func() {
-		if w := cur.String(); w != "" {
-			out = append(out, w)
+		if cur.Len() == 0 {
+			return
 		}
+		out = append(out, cur.String())
 		cur.Reset()
 	}
-	for _, r := range strings.ToLower(text) {
+	for _, r := range text {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			cur.WriteRune(r)
 		} else if r == '\'' {
@@ -238,13 +286,7 @@ func contentTokens(text string) []string {
 // possessive "X's Y" -> owns, replacement verbs and "instead of" ->
 // replaces. Both endpoints must be content words.
 func ExtractTyped(text string) []TypedPair {
-	var out []TypedPair
-	for _, sent := range strings.FieldsFunc(text, func(r rune) bool {
-		return r == '.' || r == '!' || r == '?' || r == ';' || r == '\n'
-	}) {
-		out = append(out, extractSent(contentTokens(sent), strings.TrimSpace(sent))...)
-	}
-	return out
+	return Analyze(text).Typed
 }
 
 func typedPair(from, to, kind, evidence string) TypedPair {
@@ -307,17 +349,28 @@ func extractSent(toks []string, evidence string) []TypedPair {
 // SelectPairs extracts the narrow pair set for one message against
 // corpus df counts: top distinctive qualifying terms, paired.
 func SelectPairs(text string, df map[string]int, minDF, maxDF int) []Edge {
-	return Pairs(SelectTop(Terms(text), df, minDF, maxDF, TopTermsPerMessage))
+	return SelectPairsFromTerms(Terms(text), df, minDF, maxDF)
+}
+
+// SelectPairsFromTerms pairs an already-scanned term list.
+func SelectPairsFromTerms(terms []string, df map[string]int, minDF, maxDF int) []Edge {
+	return Pairs(SelectTop(terms, df, minDF, maxDF, TopTermsPerMessage))
 }
 
 // BuildEdges counts co-mentions across message texts (batch path used by
 // full rebuilds). Terms below minDF are noise, above the hub cap are hubs.
 func BuildEdges(texts []string, minDF int) map[Edge]int {
-	df := DocFreq(texts)
+	docs := AnalyzeMany(texts)
+	df := map[string]int{}
+	for _, d := range docs {
+		for _, w := range d.Terms {
+			df[w]++
+		}
+	}
 	maxDF := HubCap(len(texts), minDF)
 	edges := map[Edge]int{}
-	for _, t := range texts {
-		for _, e := range SelectPairs(t, df, minDF, maxDF) {
+	for _, d := range docs {
+		for _, e := range SelectPairsFromTerms(d.Terms, df, minDF, maxDF) {
 			edges[e]++
 		}
 	}
@@ -327,13 +380,9 @@ func BuildEdges(texts []string, minDF int) map[Edge]int {
 // TopTerms returns the highest-df terms, useful for sanity checks.
 func TopTerms(texts []string, n int) []string {
 	df := map[string]int{}
-	for _, t := range texts {
-		seen := map[string]bool{}
-		for _, w := range Terms(t) {
-			if !seen[w] {
-				seen[w] = true
-				df[w]++
-			}
+	for _, d := range AnalyzeMany(texts) {
+		for _, w := range d.Terms {
+			df[w]++
 		}
 	}
 	type kv struct {
