@@ -28,6 +28,10 @@ func main() {
 		ingestCmd(os.Args[2:])
 	case "query":
 		queryCmd(os.Args[2:])
+	case "index":
+		indexCmd(os.Args[2:])
+	case "related":
+		relatedCmd(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		usage()
@@ -39,25 +43,29 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `usage:
   duck-mem ingest [--db PATH] [ROOT...]   ingest session logs (default roots when omitted)
   duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>
+  duck-mem index [--db PATH] [--min-df N] rebuild the topic co-mention graph
+  duck-mem related [--db PATH] [--depth 1|2] [--limit N] <term>
 `)
 }
 
 // splitArgs lets flags appear before or after positionals (Go's flag
-// package stops parsing at the first positional argument). Only known
-// flags are recognized; everything else is positional query/root text.
-func splitArgs(args []string, known map[string]bool) (flags, positional []string) {
+// package stops parsing at the first positional argument). The map marks
+// which known flags take a value (false = boolean switch); everything
+// else is positional query/root text.
+func splitArgs(args []string, takesValue map[string]bool) (flags, positional []string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		name := a
 		if j := strings.IndexByte(a, '='); j >= 0 {
 			name = a[:j]
 		}
-		if !known[name] || strings.Contains(a, "=") {
-			if known[name] {
-				flags = append(flags, a)
-			} else {
-				positional = append(positional, a)
-			}
+		takes, known := takesValue[name]
+		if !known {
+			positional = append(positional, a)
+			continue
+		}
+		if !takes || strings.Contains(a, "=") {
+			flags = append(flags, a)
 			continue
 		}
 		if i+1 < len(args) {
@@ -110,6 +118,69 @@ func ingestCmd(args []string) {
 		nMsg += len(msgs)
 	}
 	fmt.Printf("files=%d sessions=%d messages=%d skipped=%d db=%s\n", len(files), nSess, nMsg, nSkip, *dbPath)
+	newMsgs, newPairs, err := db.IndexNew(2)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("index: +%d messages, +%d pairs\n", newMsgs, newPairs)
+}
+
+func indexCmd(args []string) {
+	fs := flag.NewFlagSet("index", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDB(), "DuckDB file")
+	minDF := fs.Int("min-df", 2, "min messages a term must appear in")
+	full := fs.Bool("full", false, "full rebuild: exact thresholds, heals drift (run weekly)")
+	flagArgs, _ := splitArgs(args, map[string]bool{"--db": true, "--min-df": true, "--full": false})
+	_ = fs.Parse(flagArgs)
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		fatal(err)
+	}
+	defer db.Close()
+	if *full {
+		if err := db.IndexFull(*minDF); err != nil {
+			fatal(err)
+		}
+		fmt.Println("topic graph rebuilt (full)")
+		return
+	}
+	newMsgs, newPairs, err := db.IndexNew(*minDF)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("index: +%d messages, +%d pairs\n", newMsgs, newPairs)
+}
+
+func relatedCmd(args []string) {
+	fs := flag.NewFlagSet("related", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDB(), "DuckDB file")
+	project := fs.String("project", "", "restrict to project (substring match)")
+	depth := fs.Int("depth", 1, "1: direct co-mentions, 2: include neighbors-of-neighbors")
+	limit := fs.Int("limit", 20, "max topics")
+	known := map[string]bool{"--db": true, "--project": true, "--depth": true, "--limit": true}
+	flagArgs, positional := splitArgs(args, known)
+	_ = fs.Parse(flagArgs)
+	fs.Parse(positional)
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "related needs a term")
+		os.Exit(2)
+	}
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		fatal(err)
+	}
+	defer db.Close()
+	hits, err := db.Related(joinArgs(fs.Args()), *project, *depth, *limit)
+	if err != nil {
+		fatal(err)
+	}
+	for _, h := range hits {
+		if h.Via == "" {
+			fmt.Printf("%s (%d)\n", h.Term, h.Weight)
+		} else {
+			fmt.Printf("%s (%d, via %s)\n", h.Term, h.Weight, h.Via)
+		}
+	}
 }
 
 func queryCmd(args []string) {

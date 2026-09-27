@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"duck-mem/internal/topics"
+
 	_ "github.com/marcboeker/go-duckdb/v2"
 )
 
@@ -88,6 +90,35 @@ func (db *DB) init() error {
 			PRIMARY KEY(session_id, seq))`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source)`,
+		`CREATE TABLE IF NOT EXISTS topic_edges(
+			project TEXT NOT NULL DEFAULT '',
+			term_a TEXT NOT NULL,
+			term_b TEXT NOT NULL,
+			weight INTEGER NOT NULL,
+			kind TEXT NOT NULL DEFAULT 'co-mention',
+			PRIMARY KEY(project, term_a, term_b))`,
+		// term_df holds per-project document frequencies so incremental
+		// runs make the same keep/drop decisions as a full rebuild.
+		`CREATE TABLE IF NOT EXISTS term_df(
+			project TEXT NOT NULL,
+			term TEXT NOT NULL,
+			msgs INTEGER NOT NULL,
+			PRIMARY KEY(project, term))`,
+	} {
+		if _, err := db.sql.Exec(q); err != nil {
+			return err
+		}
+	}
+	// Non-destructive migrations for databases created earlier.
+	// (DuckDB cannot ADD COLUMN with constraints, so add nullable and
+	// backfill.) Rows predating the indexed flag were indexed under the
+	// old full rebuild, so mark them: the next full rebuild heals any
+	// mismatch.
+	for _, q := range []string{
+		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS indexed INTEGER`,
+		`ALTER TABLE topic_edges ADD COLUMN IF NOT EXISTS kind TEXT`,
+		`UPDATE messages SET indexed=1 WHERE indexed IS NULL`,
+		`UPDATE topic_edges SET kind='co-mention' WHERE kind IS NULL`,
 	} {
 		if _, err := db.sql.Exec(q); err != nil {
 			return err
@@ -110,12 +141,13 @@ func (db *DB) UpsertSession(s Session) error {
 }
 
 // InsertMessages stores messages; re-ingesting the same (session_id, seq)
-// is a no-op so ingest runs are idempotent.
+// is a no-op so ingest runs are idempotent. New rows enter unindexed
+// (indexed=0) for the next incremental IndexNew run.
 func (db *DB) InsertMessages(msgs []Message) error {
 	for _, m := range msgs {
 		if _, err := db.sql.Exec(
-			`INSERT INTO messages(session_id, seq, source, project, role, text, created_at)
-			 VALUES(?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO messages(session_id, seq, source, project, role, text, created_at, indexed)
+			 VALUES(?, ?, ?, ?, ?, ?, ?, 0)
 			 ON CONFLICT(session_id, seq) DO NOTHING`,
 			m.SessionID, m.Seq, m.Source, m.Project, m.Role, m.Text, nullableTime(m.CreatedAt)); err != nil {
 			return err
@@ -160,6 +192,394 @@ func (db *DB) Search(query, project, source string, limit int) ([]Hit, error) {
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// TextDoc is one message text plus its project, for per-project indexing.
+type TextDoc struct {
+	Project string
+	Text    string
+}
+
+// ProjectEdge is one weighted co-mention within a project.
+type ProjectEdge struct {
+	Project string
+	A, B    string
+	// Kind names the relation type. Empty means 'co-mention'; typed
+	// relations (owns, replaces, fixes) are future extraction work.
+	Kind string
+}
+
+func (e ProjectEdge) kind() string {
+	if e.Kind == "" {
+		return "co-mention"
+	}
+	return e.Kind
+}
+
+// AllTexts returns every message text, for (re)building the topic graph.
+func (db *DB) AllTexts() ([]TextDoc, error) {
+	rows, err := db.sql.Query(`SELECT project, text FROM messages`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TextDoc
+	for rows.Next() {
+		var d TextDoc
+		if err := rows.Scan(&d.Project, &d.Text); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// ReplaceEdges rebuilds the co-occurrence graph wholesale.
+func (db *DB) ReplaceEdges(edges map[ProjectEdge]int) error {
+	if err := db.ensureEdgesSchema(); err != nil {
+		return err
+	}
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM topic_edges`); err != nil {
+		return err
+	}
+	for e, w := range edges {
+		if _, err := tx.Exec(`INSERT INTO topic_edges(project, term_a, term_b, weight, kind) VALUES(?, ?, ?, ?, ?)`,
+			e.Project, e.A, e.B, w, e.kind()); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ensureEdgesSchema recreates pre-project topic_edges tables (which carry
+// no state worth migrating: a rebuild restores them).
+func (db *DB) ensureEdgesSchema() error {
+	var n int
+	if err := db.sql.QueryRow(
+		`SELECT count(*) FROM pragma_table_info('topic_edges') WHERE name IN ('project', 'kind')`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 2 {
+		return nil
+	}
+	for _, q := range []string{
+		`DROP TABLE topic_edges`,
+		`CREATE TABLE topic_edges(
+			project TEXT NOT NULL DEFAULT '',
+			term_a TEXT NOT NULL,
+			term_b TEXT NOT NULL,
+			weight INTEGER NOT NULL,
+			kind TEXT NOT NULL DEFAULT 'co-mention',
+			PRIMARY KEY(project, term_a, term_b))`,
+	} {
+		if _, err := db.sql.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// IndexNew indexes only messages not yet indexed and advances the graph
+// incrementally: pair weights grow by co-mention delta, term_df tracks
+// document frequencies for threshold decisions. Runs are idempotent:
+// already-indexed messages are skipped, so re-running changes nothing.
+//
+// Approximation (healed by IndexFull): keep/drop decisions use df counts
+// as of this run, so a term crossing minDF later undercounts its early
+// pairs, and a new hub keeps its early edges.
+func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
+	df, totals, err := db.loadDF()
+	if err != nil {
+		return 0, 0, err
+	}
+	rows, err := db.sql.Query(`SELECT session_id, seq, project, text FROM messages WHERE indexed=0`)
+	if err != nil {
+		return 0, 0, err
+	}
+	type doc struct {
+		sid, proj, text string
+		seq             int
+	}
+	var docs []doc
+	for rows.Next() {
+		var d doc
+		if err := rows.Scan(&d.sid, &d.seq, &d.proj, &d.text); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		docs = append(docs, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+	if len(docs) == 0 {
+		return 0, 0, nil
+	}
+	// Per-project df views over the shared flat map.
+	projDF := map[string]map[string]int{}
+	getDF := func(proj string) map[string]int {
+		m, ok := projDF[proj]
+		if !ok {
+			m = dfView(df, proj)
+			projDF[proj] = m
+		}
+		return m
+	}
+	// First pass: fold the new messages into df so pair decisions use
+	// batch-final counts, matching a full rebuild over the same corpus
+	// (modulo pre-existing drift). Totals already include the new rows:
+	// they were inserted before indexing.
+	dfDelta := map[[2]string]int{}
+	for _, d := range docs {
+		seen := map[string]bool{}
+		for _, w := range topics.Terms(d.text) {
+			if !seen[w] {
+				seen[w] = true
+				dfDelta[[2]string{d.proj, w}]++
+				getDF(d.proj)[w]++
+			}
+		}
+	}
+	pairDelta := map[ProjectEdge]int{}
+	for _, d := range docs {
+		for _, e := range topics.SelectPairs(d.text, getDF(d.proj), minDF, topics.HubCap(totals[d.proj], minDF)) {
+			pairDelta[ProjectEdge{Project: d.proj, A: e[0], B: e[1]}]++
+		}
+	}
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	for e, n := range pairDelta {
+		if _, err := tx.Exec(
+			`INSERT INTO topic_edges(project, term_a, term_b, weight, kind) VALUES(?, ?, ?, ?, 'co-mention')
+			 ON CONFLICT(project, term_a, term_b) DO UPDATE SET weight=topic_edges.weight+excluded.weight`,
+			e.Project, e.A, e.B, n); err != nil {
+			return 0, 0, err
+		}
+	}
+	for pt, n := range dfDelta {
+		if _, err := tx.Exec(
+			`INSERT INTO term_df(project, term, msgs) VALUES(?, ?, ?)
+			 ON CONFLICT(project, term) DO UPDATE SET msgs=term_df.msgs+excluded.msgs`,
+			pt[0], pt[1], n); err != nil {
+			return 0, 0, err
+		}
+	}
+	for _, d := range docs {
+		if _, err := tx.Exec(`UPDATE messages SET indexed=1 WHERE session_id=? AND seq=?`, d.sid, d.seq); err != nil {
+			return 0, 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return len(docs), len(pairDelta), nil
+}
+
+// IndexFull rebuilds the graph from scratch: exact thresholds, healed
+// drift. Run on a schedule (e.g. weekly cron); IndexNew covers the days.
+func (db *DB) IndexFull(minDF int) error {
+	if err := db.ensureEdgesSchema(); err != nil {
+		return err
+	}
+	docs, err := db.AllTexts()
+	if err != nil {
+		return err
+	}
+	groups := map[string][]string{}
+	for _, d := range docs {
+		groups[d.Project] = append(groups[d.Project], d.Text)
+	}
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM topic_edges`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM term_df`); err != nil {
+		return err
+	}
+	for proj, texts := range groups {
+		df := topics.DocFreq(texts)
+		maxDF := topics.HubCap(len(texts), minDF)
+		edgeW := map[topics.Edge]int{}
+		for _, t := range texts {
+			for _, e := range topics.SelectPairs(t, df, minDF, maxDF) {
+				edgeW[e]++
+			}
+		}
+		for e, w := range edgeW {
+			if _, err := tx.Exec(
+				`INSERT INTO topic_edges(project, term_a, term_b, weight, kind) VALUES(?, ?, ?, ?, 'co-mention')`,
+				proj, e[0], e[1], w); err != nil {
+				return err
+			}
+		}
+		for w, n := range df {
+			if _, err := tx.Exec(`INSERT INTO term_df(project, term, msgs) VALUES(?, ?, ?)`, proj, w, n); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(`UPDATE messages SET indexed=1`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// loadDF returns term document frequencies keyed project+"\x00"+term,
+// plus per-project message totals.
+func (db *DB) loadDF() (map[string]int, map[string]int, error) {
+	df := map[string]int{}
+	rows, err := db.sql.Query(`SELECT project, term, msgs FROM term_df`)
+	if err != nil {
+		return nil, nil, err
+	}
+	for rows.Next() {
+		var p, t string
+		var n int
+		if err := rows.Scan(&p, &t, &n); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		df[p+"\x00"+t] = n
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	totals := map[string]int{}
+	rows, err = db.sql.Query(`SELECT project, count(*) FROM messages GROUP BY project`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p string
+		var n int
+		if err := rows.Scan(&p, &n); err != nil {
+			return nil, nil, err
+		}
+		totals[p] = n
+	}
+	return df, totals, rows.Err()
+}
+
+// dfView projects the flat df map onto one project's term counts.
+func dfView(df map[string]int, proj string) map[string]int {
+	out := map[string]int{}
+	for k, n := range df {
+		if len(k) > len(proj)+1 && k[:len(proj)] == proj && k[len(proj)] == 0 {
+			out[k[len(proj)+1:]] = n
+		}
+	}
+	return out
+}
+
+// RelatedHit is one related topic. Via is empty at depth 1; at depth 2 it
+// names the intermediate topic (term -via-> hit).
+type RelatedHit struct {
+	Term   string
+	Weight int
+	Via    string
+}
+
+// Related returns topics co-mentioned with term. Empty project searches
+// all projects; otherwise edges are filtered by project substring match.
+// Depth 1 ranks direct neighbors by co-mention count; depth 2 adds
+// neighbors-of-neighbors, scored by the two-hop weight sum.
+func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, error) {
+	term = strings.ToLower(term)
+	neighbors := func(t string) ([]RelatedHit, error) {
+		q := `SELECT CASE WHEN term_a=? THEN term_b ELSE term_a END AS other, weight
+			 FROM topic_edges WHERE (term_a=? OR term_b=?)`
+		args := []any{t, t, t}
+		if project != "" {
+			q += ` AND project ILIKE '%'||?||'%' ESCAPE '\'`
+			args = append(args, escapeLike(project))
+		}
+		rows, err := db.sql.Query(q, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []RelatedHit
+		for rows.Next() {
+			var h RelatedHit
+			if err := rows.Scan(&h.Term, &h.Weight); err != nil {
+				return nil, err
+			}
+			out = append(out, h)
+		}
+		return out, rows.Err()
+	}
+	seen := map[string]RelatedHit{}
+	direct := map[string]int{}
+	first, err := neighbors(term)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range first {
+		seen[h.Term] = h
+		direct[h.Term] = h.Weight
+	}
+	if depth >= 2 {
+		// Expand only the strongest direct neighbors: expanding every
+		// neighbor lets glue verbs (check, want, see) flood two-hop results.
+		ordered := make([]RelatedHit, 0, len(direct))
+		for t, w := range direct {
+			ordered = append(ordered, RelatedHit{Term: t, Weight: w})
+		}
+		sortByWeight(ordered)
+		if len(ordered) > maxVia {
+			ordered = ordered[:maxVia]
+		}
+		for _, v := range ordered {
+			via, w1 := v.Term, v.Weight
+			second, err := neighbors(via)
+			if err != nil {
+				return nil, err
+			}
+			for _, h := range second {
+				if h.Term == term {
+					continue
+				}
+				if cur, ok := seen[h.Term]; !ok || w1+h.Weight > cur.Weight {
+					seen[h.Term] = RelatedHit{Term: h.Term, Weight: w1 + h.Weight, Via: via}
+				}
+			}
+		}
+	}
+	out := make([]RelatedHit, 0, len(seen))
+	for _, h := range seen {
+		out = append(out, h)
+	}
+	sortByWeight(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// maxVia bounds depth-2 expansion to the strongest direct neighbors.
+const maxVia = 8
+
+func sortByWeight(h []RelatedHit) {
+	for i := 1; i < len(h); i++ {
+		for j := i; j > 0 && h[j].Weight > h[j-1].Weight; j-- {
+			h[j], h[j-1] = h[j-1], h[j]
+		}
+	}
 }
 
 // Count returns (sessions, messages) totals, for ingest reporting.

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -72,5 +73,142 @@ func TestSearchFindsByKeywordFiltersAndDedupes(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("duplicate messages stored: n=%d", n)
+	}
+}
+
+func TestRelatedRanksDirectAndTwoHop(t *testing.T) {
+	db := openTemp(t)
+	if err := db.ReplaceEdges(map[ProjectEdge]int{
+		{Project: "/home/u/omen", A: "bastion", B: "sentry"}:   5,
+		{Project: "/home/u/omen", A: "bastion", B: "aegis"}:    2,
+		{Project: "/home/u/omen", A: "sanctuary", B: "sentry"}: 3,
+		{Project: "/home/u/other", A: "bastion", B: "hubspot"}:  9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := db.Related("Bastion", "omen", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 2 || hits[0].Term != "sentry" || hits[0].Weight != 5 || hits[0].Via != "" {
+		t.Fatalf("depth1 wrong: %+v", hits)
+	}
+
+	hits, err = db.Related("bastion", "omen", 2, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, h := range hits {
+		if h.Term == "hubspot" {
+			t.Fatalf("other-project edge leaked: %+v", hits)
+		}
+		if h.Term == "sanctuary" && h.Via == "sentry" && h.Weight == 8 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("two-hop sanctuary via sentry missing: %+v", hits)
+	}
+}
+
+func insertMsg(t *testing.T, db *DB, sid string, seq int, text string) {
+	t.Helper()
+	if err := db.UpsertSession(Session{ID: sid, Source: "codex", Project: "p", Path: "f"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessages([]Message{{
+		SessionID: sid, Seq: seq, Source: "codex", Project: "p", Role: "user", Text: text,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func edgeWeight(t *testing.T, db *DB, a, b string) int {
+	t.Helper()
+	var w int
+	err := db.sql.QueryRow(`SELECT weight FROM topic_edges WHERE term_a=? AND term_b=?`, a, b).Scan(&w)
+	if err != nil {
+		return -1
+	}
+	return w
+}
+
+func TestIndexNewIsIncrementalAndIdempotent(t *testing.T) {
+	db := openTemp(t)
+	insertMsg(t, db, "s1", 0, "bastion deploys sentry turret")
+	insertMsg(t, db, "s1", 1, "bastion sentry fires")
+
+	n, pairs, err := db.IndexNew(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 || pairs == 0 {
+		t.Fatalf("first index: msgs=%d pairs=%d", n, pairs)
+	}
+	if w := edgeWeight(t, db, "bastion", "sentry"); w != 2 {
+		t.Fatalf("bastion-sentry weight = %d, want 2", w)
+	}
+
+	n, _, err = db.IndexNew(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("re-index should find nothing new, got %d", n)
+	}
+	if w := edgeWeight(t, db, "bastion", "sentry"); w != 2 {
+		t.Fatalf("re-index changed weight to %d", w)
+	}
+
+	insertMsg(t, db, "s2", 0, "bastion sentry holds")
+	n, _, err = db.IndexNew(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 new message, got %d", n)
+	}
+	if w := edgeWeight(t, db, "bastion", "sentry"); w != 3 {
+		t.Fatalf("bastion-sentry weight = %d, want 3", w)
+	}
+}
+
+func TestIndexFullHealsThresholdDrift(t *testing.T) {
+	db := openTemp(t)
+	insertMsg(t, db, "s1", 0, "bastion sentry turret")
+	if _, _, err := db.IndexNew(5); err != nil {
+		t.Fatal(err)
+	}
+	if w := edgeWeight(t, db, "bastion", "sentry"); w != -1 {
+		t.Fatalf("rare pair should be absent, weight = %d", w)
+	}
+	if err := db.IndexFull(1); err != nil {
+		t.Fatal(err)
+	}
+	if w := edgeWeight(t, db, "bastion", "sentry"); w != 1 {
+		t.Fatalf("full rebuild should materialize pair, weight = %d", w)
+	}
+}
+
+func TestDepth2ExpandsStrongestViasOnly(t *testing.T) {
+	db := openTemp(t)
+	edges := map[ProjectEdge]int{}
+	for i := 1; i <= 9; i++ {
+		edges[ProjectEdge{Project: "p", A: "hub", B: fmt.Sprintf("n%d", i)}] = 10 - i
+	}
+	edges[ProjectEdge{Project: "p", A: "n9", B: "far"}] = 1
+	if err := db.ReplaceEdges(edges); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := db.Related("hub", "p", 2, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hits {
+		if h.Term == "far" {
+			t.Fatalf("weak-via two-hop leaked (maxVia=%d): %+v", maxVia, hits)
+		}
 	}
 }

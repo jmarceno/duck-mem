@@ -42,6 +42,34 @@ not parsed (only migrated IDs remain there); transcripts + plans are covered.
 ```bash
 duck-mem ingest [--db PATH] [ROOT...]   # default roots cover all four stores above
 duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>
+duck-mem index [--db PATH] [--min-df N] [--full] # incremental; --full rebuilds
+duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
+```
+
+## Topic relationships
+
+`related` answers "what is discussed together with X" from a co-mention
+graph (`topic_edges`): two terms share an edge weighted by how many messages
+mention both. Depth 2 follows neighbors-of-neighbors (`term -via-> hit`),
+expanding only the 8 strongest direct links. This is lexical co-occurrence,
+not semantics — `bastion-sentry` means the two are talked about together,
+not that one owns the other. The `kind` column reserves typed relations
+(owns, replaces, fixes) for future extraction work.
+
+## Indexing: incremental by default, full weekly
+
+`ingest` and `index` only process messages not yet indexed (`messages.indexed`):
+pair weights grow by delta and per-project document frequencies accumulate in
+`term_df`, so insertion cost is O(new messages). Pairs are created narrowly —
+the 8 most distinctive qualifying terms per message, at most 28 pairs — so
+weak edges never materialize instead of being pruned after the fact.
+
+Threshold decisions use counts as of each run, so a term crossing `minDF`
+later slightly undercounts its early pairs. `index --full` rebuilds from
+scratch with exact thresholds and heals that drift; run it weekly:
+
+```bash
+0 4 * * 0 duck-mem index --full   # weekly heal; daily ingest stays incremental
 ```
 
 Flags may come before or after the query text.
