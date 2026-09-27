@@ -31,6 +31,7 @@ const (
 	KindMuse
 	KindCursorTranscript
 	KindCursorPlan
+	KindOpenCode
 )
 
 // Classify picks the parser from the file path.
@@ -38,6 +39,8 @@ func Classify(path string) Kind {
 	switch {
 	case strings.HasSuffix(path, ".plan.md"):
 		return KindCursorPlan
+	case filepath.Base(path) == "opencode.db":
+		return KindOpenCode
 	case strings.Contains(path, "/agent-transcripts/") && strings.HasSuffix(path, ".jsonl"):
 		return KindCursorTranscript
 	case filepath.Base(path) == "session.jsonl" && strings.Contains(path, "/muse/sessions/"):
@@ -59,6 +62,7 @@ func DefaultRoots(home string) []string {
 		filepath.Join(home, ".local", "share", "muse", "sessions"),
 		filepath.Join(home, ".cursor", "projects"),
 		filepath.Join(home, ".cursor", "plans"),
+		filepath.Join(home, ".local", "share", "opencode", "opencode.db"),
 	}
 }
 

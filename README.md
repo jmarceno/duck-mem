@@ -1,6 +1,6 @@
 # duck-mem
 
-Agent memory: session logs from Codex, Claude, Cursor and Muse land in one
+Agent memory: session logs from Codex, Claude, Cursor, Muse and OpenCode land in one
 DuckDB file, minus tool calls. Agents search it through the CLI (or by
 querying the DuckDB file directly).
 
@@ -33,6 +33,11 @@ environment snapshots, queue/metadata records.
 | Claude | `~/.claude/projects/*/*.jsonl` | record `cwd` |
 | Muse | `…/muse/sessions/**/**/session.jsonl` (incl. `subagent/`) | `route_facts` cwd / `workspace_root` |
 | Cursor | `~/.cursor/projects/*/agent-transcripts/*/*.jsonl`, `~/.cursor/plans/*.plan.md` (whole plan = one `note`) | transcript slug matched to `~/.config/Cursor/User/workspaceStorage/*/workspace.json` / — |
+| OpenCode | `~/.local/share/opencode/opencode.db` | `session_v2.directory`, falling back to `project.worktree` |
+
+OpenCode's SQLite store is read in read-only mode, including current WAL data.
+Parent and child sessions are imported. Assistant `text` parts are kept;
+`tool` and `reasoning` parts and metadata records are dropped.
 
 Cursor transcript projects use the workspace metadata's folder path, including
 hyphenated names and worktrees. Unmapped or ambiguous slugs stay as
@@ -44,7 +49,7 @@ not parsed (only migrated IDs remain there); transcripts + plans are covered.
 ## Usage
 
 ```bash
-duck-mem ingest [--db PATH] [ROOT...]   # default roots cover all four stores above
+duck-mem ingest [--db PATH] [ROOT...]   # default roots cover all five stores above
 duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>
 duck-mem index [--db PATH] [--min-df N] [--full] # incremental; --full rebuilds
 duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
@@ -60,7 +65,8 @@ To foreground-test: go build -o ~/.local/bin/duck-mem ./cmd/duck-mem && duck-mem
 minutes), logging one line per cycle to stdout. File checkpoints skip unchanged
 logs; growing JSONL files are read from the saved byte offset when the old
 tail matches. Rewritten, truncated, or remapped files are reparsed and
-reconciled. Cursor plans are reparsed when changed. Foreground for now; the
+reconciled. Cursor plans are reparsed when changed. OpenCode's database is
+re-read when the main file or WAL changes. Foreground for now; the
 service unit comes later. Each cycle opens the database and closes it
 again: DuckDB allows one process at a time, so holding the file would
 block queries — CLI commands additionally retry through the brief
@@ -125,7 +131,7 @@ pass rebuilds the graph to remove stale relationships.
 
 Per AGENTS.md methodology (no E2E, no existence assertions, smallest set):
 
-- `internal/ingest/ingest_test.go` — one conversation fixture per source:
+- `internal/ingest/ingest_test.go` and `opencode_test.go` — conversation fixtures per source:
   user/assistant text kept, tool calls/outputs/reasoning dropped.
 - `internal/store/store_test.go` — keyword AND-match, project filter,
   re-ingest dedupe, related ranking (typed-first, depth-2 via cap),

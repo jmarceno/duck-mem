@@ -21,6 +21,7 @@ import (
 )
 
 const parserVersion = 1
+const openCodeParserVersion = 1
 
 func defaultDB() string {
 	home, _ := os.UserHomeDir()
@@ -182,6 +183,17 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 	cursorProjects := map[string]map[string]string{}
 	for _, f := range ingest.Discover(roots) {
 		files++
+		if ingest.Classify(f) == ingest.KindOpenCode {
+			sessions, messages, err := ingestOpenCode(db, f)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "skip %s: %v\n", f, err)
+				nSkip++
+			} else {
+				nSess += sessions
+				nMsg += messages
+			}
+			continue
+		}
 		info, err := os.Stat(f)
 		if err != nil {
 			nSkip++
@@ -256,6 +268,66 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 		nMsg += len(msgs)
 	}
 	return files, nSess, nMsg, nSkip
+}
+
+func ingestOpenCode(db *store.DB, path string) (int, int, error) {
+	before, err := sqliteState(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	checkpoint, err := db.GetCheckpoint(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	if checkpoint != nil && checkpoint.ParserVersion == openCodeParserVersion &&
+		checkpoint.Size == before.Size && checkpoint.ModTimeNS == before.ModTimeNS &&
+		checkpoint.TailHash == before.TailHash {
+		return 0, 0, nil
+	}
+	sessions, err := ingest.IngestOpenCode(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	count := 0
+	for _, s := range sessions {
+		if err := db.UpsertSession(s.Session); err != nil {
+			return 0, 0, err
+		}
+		if err := db.SyncMessages(s.Session.ID, s.Messages); err != nil {
+			return 0, 0, err
+		}
+		count += len(s.Messages)
+	}
+	after, err := sqliteState(path)
+	if err == nil && before.Size == after.Size && before.ModTimeNS == after.ModTimeNS && before.TailHash == after.TailHash {
+		after.ParserVersion = openCodeParserVersion
+		if err := db.SaveCheckpoint(after); err != nil {
+			return 0, 0, err
+		}
+	}
+	return len(sessions), count, nil
+}
+
+// SQLite may keep recent writes entirely in its WAL; checkpoint both files.
+func sqliteState(path string) (store.FileCheckpoint, error) {
+	main, err := fileState(path)
+	if err != nil {
+		return store.FileCheckpoint{}, err
+	}
+	wal, err := fileState(path + "-wal")
+	if os.IsNotExist(err) {
+		return main, nil
+	}
+	if err != nil {
+		return store.FileCheckpoint{}, err
+	}
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%s:%d:%d:%s", main.Size, main.ModTimeNS, main.TailHash, wal.Size, wal.ModTimeNS, wal.TailHash)))
+	main.Size += wal.Size
+	if wal.ModTimeNS > main.ModTimeNS {
+		main.ModTimeNS = wal.ModTimeNS
+	}
+	main.TailHash = hex.EncodeToString(hash[:])
+	return main, nil
 }
 
 func hashTail(path string, size int64) (string, error) {
