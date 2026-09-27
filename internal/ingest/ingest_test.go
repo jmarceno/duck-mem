@@ -37,6 +37,62 @@ func TestCodexKeepsLargeAndRepeatedMessages(t *testing.T) {
 	}
 }
 
+func TestCodexAppendParsesOnlyNewMessages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".codex", "append.jsonl")
+	initial := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"append","cwd":"/project"}}`,
+		`{"timestamp":"2026-09-27T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"start"}]}}`,
+		`{"timestamp":"2026-09-27T00:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+	}, "\n") + "\n"
+	writeTemp(t, path, initial)
+	sess, old, err := IngestFile(path)
+	if err != nil || len(old) != 2 {
+		t.Fatalf("initial parse: messages=%d err=%v", len(old), err)
+	}
+	appendText := strings.Join([]string{
+		`{"timestamp":"2026-09-27T00:00:01.5Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"done"}]}}}`,
+		`{"timestamp":"2026-09-27T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}}`,
+	}, "\n") + "\n"
+	writeTemp(t, path, initial+appendText)
+	updated, added, err := IngestAppended(path, int64(len(initial)), sess, &old[len(old)-1], nil)
+	if err != nil || updated.ID != sess.ID || updated.Project != sess.Project || len(added) != 1 || added[0].Seq != 2 || added[0].Text != "next" {
+		t.Fatalf("append parse: session=%+v messages=%+v err=%v", updated, added, err)
+	}
+}
+
+func TestOtherJSONLAppendParsersKeepSequence(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct{ path, initial, added string }{
+		{
+			path:    filepath.Join(dir, ".claude/projects/p/c.jsonl"),
+			initial: `{"type":"user","sessionId":"c1","cwd":"/p","message":{"content":"start"}}`,
+			added:   `{"type":"assistant","sessionId":"c1","cwd":"/p","message":{"content":"next"}}`,
+		},
+		{
+			path:    filepath.Join(dir, "muse/sessions/session.jsonl"),
+			initial: `{"payload_type":"runtime.session","stream":{"id":"m1"},"payload":{"event":{"kind":"started","prompt":"start"}}}`,
+			added:   `{"payload_type":"runtime.session","stream":{"id":"m1"},"payload":{"event":{"kind":"assistant_message_committed","text":"next"}}}`,
+		},
+		{
+			path:    filepath.Join(dir, ".cursor/projects/home-p/agent-transcripts/t/t.jsonl"),
+			initial: `{"role":"user","message":{"content":[{"type":"text","text":"start"}]}}`,
+			added:   `{"role":"assistant","message":{"content":[{"type":"text","text":"next"}]}}`,
+		},
+	}
+	for _, tc := range cases {
+		writeTemp(t, tc.path, tc.initial+"\n")
+		sess, old, err := IngestFile(tc.path)
+		if err != nil || len(old) != 1 {
+			t.Fatalf("%s initial parse: messages=%+v err=%v", tc.path, old, err)
+		}
+		writeTemp(t, tc.path, tc.initial+"\n"+tc.added+"\n")
+		updated, added, err := IngestAppended(tc.path, int64(len(tc.initial)+1), sess, &old[0], LoadCursorProjects(dir))
+		if err != nil || updated.ID != sess.ID || len(added) != 1 || added[0].Seq != 1 || added[0].Text != "next" {
+			t.Fatalf("%s append parse: session=%+v messages=%+v err=%v", tc.path, updated, added, err)
+		}
+	}
+}
+
 func TestIngestKeepsConversationDropsToolCalls(t *testing.T) {
 	dir := t.TempDir()
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/url"
 	"os"
@@ -104,6 +105,22 @@ func IngestFileWithCursorProjects(path string, projects map[string]string) (stor
 	return store.Session{}, nil, nil
 }
 
+// IngestAppended parses only newly appended JSONL bytes. The caller must
+// verify the old file prefix and fall back to a full parse on metadata change.
+func IngestAppended(path string, offset int64, previous store.Session, last *store.Message, projects map[string]string) (store.Session, []store.Message, error) {
+	switch Classify(path) {
+	case KindCodex:
+		return parseCodexFrom(path, offset, previous, last)
+	case KindClaude:
+		return parseClaudeFrom(path, offset, previous, last)
+	case KindMuse:
+		return parseMuseFrom(path, offset, previous, last)
+	case KindCursorTranscript:
+		return parseCursorTranscriptFrom(path, offset, previous, last, projects)
+	}
+	return store.Session{}, nil, fmt.Errorf("append parsing unsupported for %s", path)
+}
+
 func newSession(id, source, project, path string, started time.Time) store.Session {
 	if id == "" {
 		id = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
@@ -115,8 +132,18 @@ func newSession(id, source, project, path string, started time.Time) store.Sessi
 // records. Some sources emit the same utterance in two neighboring envelopes;
 // a later repetition in the conversation is still a distinct message.
 type collector struct {
-	sess store.Session
-	msgs []store.Message
+	sess    store.Session
+	msgs    []store.Message
+	nextSeq int
+	last    *store.Message
+}
+
+func newCollector(sess store.Session, last *store.Message) *collector {
+	c := &collector{sess: sess, last: last}
+	if last != nil {
+		c.nextSeq = last.Seq + 1
+	}
+	return c
 }
 
 func (c *collector) add(role, text string, at time.Time) {
@@ -124,30 +151,36 @@ func (c *collector) add(role, text string, at time.Time) {
 	if text == "" {
 		return
 	}
-	if n := len(c.msgs); n > 0 {
-		prev := c.msgs[n-1]
+	if c.last != nil {
+		prev := *c.last
 		if prev.Role == role && prev.Text == text && !at.IsZero() && !prev.CreatedAt.IsZero() &&
 			!at.Before(prev.CreatedAt) && at.Sub(prev.CreatedAt) <= time.Second {
 			return
 		}
 	}
-	c.msgs = append(c.msgs, store.Message{
+	m := store.Message{
 		SessionID: c.sess.ID,
-		Seq:       len(c.msgs),
+		Seq:       c.nextSeq,
 		Source:    c.sess.Source,
 		Project:   c.sess.Project,
 		Role:      role,
 		Text:      text,
 		CreatedAt: at,
-	})
+	}
+	c.msgs = append(c.msgs, m)
+	c.last = &c.msgs[len(c.msgs)-1]
+	c.nextSeq++
 }
 
-func readLines(path string, fn func(map[string]any)) error {
+func readLinesFrom(path string, offset int64, fn func(map[string]any)) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
 	r := bufio.NewReader(f)
 	for {
 		data, readErr := r.ReadBytes('\n')
@@ -211,11 +244,13 @@ func microsToTime(v any) time.Time {
 // ---- Codex rollout jsonl ----
 
 func parseCodex(path string) (store.Session, []store.Message, error) {
-	sess := newSession("", "codex", "", path, time.Time{})
-	c := &collector{sess: sess}
-	var cwd, sid string
-	var started time.Time
-	err := readLines(path, func(o map[string]any) {
+	return parseCodexFrom(path, 0, newSession("", "codex", "", path, time.Time{}), nil)
+}
+
+func parseCodexFrom(path string, offset int64, sess store.Session, last *store.Message) (store.Session, []store.Message, error) {
+	c := newCollector(sess, last)
+	cwd, sid, started := sess.Project, sess.ID, sess.StartedAt
+	err := readLinesFrom(path, offset, func(o map[string]any) {
 		at := parseTime(o["timestamp"])
 		switch s, _ := o["type"].(string); s {
 		case "session_meta", "turn_context":
@@ -343,11 +378,13 @@ func claudeText(content any) string {
 }
 
 func parseClaude(path string) (store.Session, []store.Message, error) {
-	sess := newSession("", "claude", "", path, time.Time{})
-	c := &collector{sess: sess}
-	var sid, cwd string
-	var started time.Time
-	err := readLines(path, func(o map[string]any) {
+	return parseClaudeFrom(path, 0, newSession("", "claude", "", path, time.Time{}), nil)
+}
+
+func parseClaudeFrom(path string, offset int64, sess store.Session, last *store.Message) (store.Session, []store.Message, error) {
+	c := newCollector(sess, last)
+	sid, cwd, started := sess.ID, sess.Project, sess.StartedAt
+	err := readLinesFrom(path, offset, func(o map[string]any) {
 		if v, _ := o["sessionId"].(string); v != "" {
 			sid = v
 		}
@@ -447,11 +484,13 @@ func museUserTexts(payload map[string]any, out *[]string) {
 }
 
 func parseMuse(path string) (store.Session, []store.Message, error) {
-	sess := newSession("", "muse", "", path, time.Time{})
-	c := &collector{sess: sess}
-	var sid, cwd string
-	var started time.Time
-	err := readLines(path, func(o map[string]any) {
+	return parseMuseFrom(path, 0, newSession("", "muse", "", path, time.Time{}), nil)
+}
+
+func parseMuseFrom(path string, offset int64, sess store.Session, last *store.Message) (store.Session, []store.Message, error) {
+	c := newCollector(sess, last)
+	sid, cwd, started := sess.ID, sess.Project, sess.StartedAt
+	err := readLinesFrom(path, offset, func(o map[string]any) {
 		museRecords(o, func(r map[string]any) {
 			if v := str(r, "stream", "id"); v != "" {
 				sid = v
@@ -525,9 +564,12 @@ func parseMuse(path string) (store.Session, []store.Message, error) {
 // ---- Cursor agent transcripts ----
 
 func parseCursorTranscript(path string, projects map[string]string) (store.Session, []store.Message, error) {
-	sess := newSession("", "cursor", cursorProject(path, projects), path, time.Time{})
-	c := &collector{sess: sess}
-	err := readLines(path, func(o map[string]any) {
+	return parseCursorTranscriptFrom(path, 0, newSession("", "cursor", CursorProject(path, projects), path, time.Time{}), nil, projects)
+}
+
+func parseCursorTranscriptFrom(path string, offset int64, sess store.Session, last *store.Message, projects map[string]string) (store.Session, []store.Message, error) {
+	c := newCollector(sess, last)
+	err := readLinesFrom(path, offset, func(o map[string]any) {
 		role, _ := o["role"].(string)
 		if role != "user" && role != "assistant" {
 			return
@@ -558,9 +600,11 @@ func parseCursorTranscript(path string, projects map[string]string) (store.Sessi
 		return sess, nil, err
 	}
 	sess.ID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	sess.Project = CursorProject(path, projects)
 	c.sess = sess
 	for i := range c.msgs {
 		c.msgs[i].SessionID = sess.ID
+		c.msgs[i].Project = sess.Project
 	}
 	return sess, c.msgs, nil
 }
@@ -626,7 +670,8 @@ func cursorSlug(path string) string {
 	return b.String()
 }
 
-func cursorProject(path string, projects map[string]string) string {
+// CursorProject returns the resolved folder or an explicit unresolved slug.
+func CursorProject(path string, projects map[string]string) string {
 	i := strings.Index(path, "/.cursor/projects/")
 	if i < 0 {
 		return ""

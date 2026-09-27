@@ -4,8 +4,11 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,6 +19,8 @@ import (
 	"duck-mem/internal/ingest"
 	"duck-mem/internal/store"
 )
+
+const parserVersion = 1
 
 func defaultDB() string {
 	home, _ := os.UserHomeDir()
@@ -171,15 +176,20 @@ func daemonCmd(args []string) {
 	}
 }
 
-// runCycle ingests every discoverable file. Inserts are idempotent and
-// IndexNew skips indexed messages, so repeated cycles only pay for what
-// changed (plus a directory walk).
+// runCycle skips unchanged files and reads only the appended bytes of
+// append-only JSONL files. Rewrites take the full reconciliation path.
 func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 	cursorProjects := map[string]map[string]string{}
 	for _, f := range ingest.Discover(roots) {
 		files++
+		info, err := os.Stat(f)
+		if err != nil {
+			nSkip++
+			continue
+		}
 		var projects map[string]string
-		if ingest.Classify(f) == ingest.KindCursorTranscript {
+		kind := ingest.Classify(f)
+		if kind == ingest.KindCursorTranscript {
 			home := ingest.CursorHome(f)
 			var ok bool
 			projects, ok = cursorProjects[home]
@@ -188,7 +198,36 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 				cursorProjects[home] = projects
 			}
 		}
-		sess, msgs, err := ingest.IngestFileWithCursorProjects(f, projects)
+		checkpoint, err := db.GetCheckpoint(f)
+		if err != nil {
+			nSkip++
+			continue
+		}
+		projectMatches := kind != ingest.KindCursorTranscript ||
+			(checkpoint != nil && checkpoint.Project == ingest.CursorProject(f, projects))
+		if checkpoint != nil && checkpoint.ParserVersion == parserVersion && projectMatches &&
+			checkpoint.Size == info.Size() && checkpoint.ModTimeNS == info.ModTime().UnixNano() {
+			continue
+		}
+		var sess store.Session
+		var msgs []store.Message
+		appended := false
+		if checkpoint != nil && checkpoint.ParserVersion == parserVersion && projectMatches &&
+			kind != ingest.KindCursorPlan && checkpoint.EndsLine && info.Size() > checkpoint.Size {
+			if oldHash, err := hashTail(f, checkpoint.Size); err == nil && oldHash == checkpoint.TailHash {
+				previous, err := db.GetSession(checkpoint.SessionID)
+				if err == nil {
+					last, err := db.LastMessage(checkpoint.SessionID)
+					if err == nil {
+						sess, msgs, err = ingest.IngestAppended(f, checkpoint.Size, previous, last, projects)
+						appended = err == nil && sess.ID == checkpoint.SessionID && sess.Project == checkpoint.Project
+					}
+				}
+			}
+		}
+		if !appended {
+			sess, msgs, err = ingest.IngestFileWithCursorProjects(f, projects)
+		}
 		if err != nil || sess.ID == "" {
 			nSkip++
 			continue
@@ -197,14 +236,74 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 			nSkip++
 			continue
 		}
-		if err := db.SyncMessages(sess.ID, msgs); err != nil {
+		if appended {
+			err = db.InsertMessages(msgs)
+		} else {
+			err = db.SyncMessages(sess.ID, msgs)
+		}
+		if err != nil {
 			nSkip++
 			continue
+		}
+		state, err := fileState(f)
+		if err == nil && state.Size == info.Size() && state.ModTimeNS == info.ModTime().UnixNano() {
+			state.SessionID, state.Project, state.ParserVersion = sess.ID, sess.Project, parserVersion
+			if err := db.SaveCheckpoint(state); err != nil {
+				nSkip++
+			}
 		}
 		nSess++
 		nMsg += len(msgs)
 	}
 	return files, nSess, nMsg, nSkip
+}
+
+func hashTail(path string, size int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	start := size - 4096
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, size-start)
+	if len(buf) > 0 {
+		if n, err := f.ReadAt(buf, start); err != nil || n != len(buf) {
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
+			return "", err
+		}
+	}
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func fileState(path string) (store.FileCheckpoint, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return store.FileCheckpoint{}, err
+	}
+	hash, err := hashTail(path, info.Size())
+	if err != nil {
+		return store.FileCheckpoint{}, err
+	}
+	state := store.FileCheckpoint{Path: path, Size: info.Size(), ModTimeNS: info.ModTime().UnixNano(), TailHash: hash}
+	if info.Size() > 0 {
+		f, err := os.Open(path)
+		if err != nil {
+			return store.FileCheckpoint{}, err
+		}
+		defer f.Close()
+		var last [1]byte
+		if _, err := f.ReadAt(last[:], info.Size()-1); err != nil {
+			return store.FileCheckpoint{}, err
+		}
+		state.EndsLine = last[0] == '\n'
+	}
+	return state, nil
 }
 
 func indexCmd(args []string) {

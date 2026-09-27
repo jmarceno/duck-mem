@@ -57,7 +57,10 @@ To foreground-test: go build -o ~/.local/bin/duck-mem ./cmd/duck-mem && duck-mem
 ## Daemon
 
 `daemon` runs ingest + incremental index on a loop (default every 5
-minutes), logging one line per cycle to stdout. Foreground for now; the
+minutes), logging one line per cycle to stdout. File checkpoints skip unchanged
+logs; growing JSONL files are read from the saved byte offset when the old
+tail matches. Rewritten, truncated, or remapped files are reparsed and
+reconciled. Cursor plans are reparsed when changed. Foreground for now; the
 service unit comes later. Each cycle opens the database and closes it
 again: DuckDB allows one process at a time, so holding the file would
 block queries — CLI commands additionally retry through the brief

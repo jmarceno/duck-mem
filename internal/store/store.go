@@ -51,6 +51,18 @@ type Hit struct {
 // DB wraps the DuckDB handle.
 type DB struct{ sql *sql.DB }
 
+// FileCheckpoint records the file state already reflected in messages.
+type FileCheckpoint struct {
+	Path          string
+	Size          int64
+	ModTimeNS     int64
+	TailHash      string
+	EndsLine      bool
+	SessionID     string
+	Project       string
+	ParserVersion int
+}
+
 // Open creates/opens the DuckDB file and initializes the schema.
 // Already installed extensions load best-effort. Opening a database must not
 // download extensions: neither is needed by the current search or index.
@@ -133,6 +145,15 @@ func (db *DB) init() error {
 		`CREATE TABLE IF NOT EXISTS meta(
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS file_checkpoints(
+			path TEXT PRIMARY KEY,
+			size BIGINT NOT NULL,
+			mtime_ns BIGINT NOT NULL,
+			tail_hash TEXT NOT NULL,
+			ends_line BOOLEAN NOT NULL,
+			session_id TEXT NOT NULL,
+			project TEXT NOT NULL,
+			parser_version INTEGER NOT NULL)`,
 	} {
 		if _, err := db.sql.Exec(q); err != nil {
 			return err
@@ -164,6 +185,59 @@ func (db *DB) init() error {
 
 // Close releases the handle.
 func (db *DB) Close() error { return db.sql.Close() }
+
+func (db *DB) GetCheckpoint(path string) (*FileCheckpoint, error) {
+	var c FileCheckpoint
+	err := db.sql.QueryRow(`SELECT path, size, mtime_ns, tail_hash, ends_line, session_id, project, parser_version
+		FROM file_checkpoints WHERE path=?`, path).
+		Scan(&c.Path, &c.Size, &c.ModTimeNS, &c.TailHash, &c.EndsLine, &c.SessionID, &c.Project, &c.ParserVersion)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (db *DB) SaveCheckpoint(c FileCheckpoint) error {
+	_, err := db.sql.Exec(`INSERT INTO file_checkpoints(path, size, mtime_ns, tail_hash, ends_line, session_id, project, parser_version)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,
+		tail_hash=excluded.tail_hash, ends_line=excluded.ends_line,
+		session_id=excluded.session_id, project=excluded.project, parser_version=excluded.parser_version`,
+		c.Path, c.Size, c.ModTimeNS, c.TailHash, c.EndsLine, c.SessionID, c.Project, c.ParserVersion)
+	return err
+}
+
+func (db *DB) GetSession(id string) (Session, error) {
+	var s Session
+	var started sql.NullTime
+	err := db.sql.QueryRow(`SELECT session_id, source, project, started_at, path FROM sessions WHERE session_id=?`, id).
+		Scan(&s.ID, &s.Source, &s.Project, &started, &s.Path)
+	if started.Valid {
+		s.StartedAt = started.Time
+	}
+	return s, err
+}
+
+func (db *DB) LastMessage(sessionID string) (*Message, error) {
+	var m Message
+	var at sql.NullTime
+	err := db.sql.QueryRow(`SELECT session_id, seq, source, project, role, text, created_at
+		FROM messages WHERE session_id=? ORDER BY seq DESC LIMIT 1`, sessionID).
+		Scan(&m.SessionID, &m.Seq, &m.Source, &m.Project, &m.Role, &m.Text, &at)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if at.Valid {
+		m.CreatedAt = at.Time
+	}
+	return &m, nil
+}
 
 // UpsertSession records a session; re-ingests refresh its metadata.
 func (db *DB) UpsertSession(s Session) error {
