@@ -47,6 +47,9 @@ duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
 duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
 ```
 
+To foreground-test: go build -o ~/.local/bin/duck-mem ./cmd/duck-mem && duck-mem daemon.
+
+
 ## Daemon
 
 `daemon` runs ingest + incremental index on a loop (default every 5
