@@ -51,10 +51,12 @@ duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
 `related` answers "what is discussed together with X" from a co-mention
 graph (`topic_edges`): two terms share an edge weighted by how many messages
 mention both. Depth 2 follows neighbors-of-neighbors (`term -via-> hit`),
-expanding only the 8 strongest direct links. This is lexical co-occurrence,
-not semantics — `bastion-sentry` means the two are talked about together,
-not that one owns the other. The `kind` column reserves typed relations
-(owns, replaces, fixes) for future extraction work.
+expanding only the 8 strongest direct links. Typed relations outrank
+bare co-mentions: rule extraction finds possessive `X's Y` (owns) and
+replacement verbs / "instead of" (replaces) per sentence, e.g.
+`(bastion, turret, owns)`, `(super, turret, replaces)`. Typed edges are
+stored undirected — the pair names the relationship, `query` shows the
+source message for direction.
 
 ## Indexing: incremental by default, full weekly
 

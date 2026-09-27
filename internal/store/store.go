@@ -96,7 +96,7 @@ func (db *DB) init() error {
 			term_b TEXT NOT NULL,
 			weight INTEGER NOT NULL,
 			kind TEXT NOT NULL DEFAULT 'co-mention',
-			PRIMARY KEY(project, term_a, term_b))`,
+			PRIMARY KEY(project, term_a, term_b, kind))`,
 		// term_df holds per-project document frequencies so incremental
 		// runs make the same keep/drop decisions as a full rebuild.
 		`CREATE TABLE IF NOT EXISTS term_df(
@@ -104,6 +104,9 @@ func (db *DB) init() error {
 			term TEXT NOT NULL,
 			msgs INTEGER NOT NULL,
 			PRIMARY KEY(project, term))`,
+		`CREATE TABLE IF NOT EXISTS meta(
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL)`,
 	} {
 		if _, err := db.sql.Exec(q); err != nil {
 			return err
@@ -256,26 +259,33 @@ func (db *DB) ReplaceEdges(edges map[ProjectEdge]int) error {
 	return tx.Commit()
 }
 
-// ensureEdgesSchema recreates pre-project topic_edges tables (which carry
-// no state worth migrating: a rebuild restores them).
+// edgesSchemaVersion tracks the topic_edges layout. v2: kind is part of
+// the primary key so one pair can hold co-mention and typed edges side
+// by side.
+const edgesSchemaVersion = "2"
+
+// ensureEdgesSchema recreates outdated topic_edges tables (which carry no
+// state worth migrating: a rebuild restores them).
 func (db *DB) ensureEdgesSchema() error {
-	var n int
-	if err := db.sql.QueryRow(
-		`SELECT count(*) FROM pragma_table_info('topic_edges') WHERE name IN ('project', 'kind')`).Scan(&n); err != nil {
-		return err
-	}
-	if n == 2 {
+	var v string
+	_ = db.sql.QueryRow(`SELECT value FROM meta WHERE key='edges_schema'`).Scan(&v)
+	if v == edgesSchemaVersion {
 		return nil
 	}
 	for _, q := range []string{
-		`DROP TABLE topic_edges`,
+		`DROP TABLE IF EXISTS topic_edges`,
 		`CREATE TABLE topic_edges(
 			project TEXT NOT NULL DEFAULT '',
 			term_a TEXT NOT NULL,
 			term_b TEXT NOT NULL,
 			weight INTEGER NOT NULL,
 			kind TEXT NOT NULL DEFAULT 'co-mention',
-			PRIMARY KEY(project, term_a, term_b))`,
+			PRIMARY KEY(project, term_a, term_b, kind))`,
+		`INSERT INTO meta(key, value) VALUES('edges_schema', '2')
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		// The graph was just dropped: every message needs indexing again.
+		`UPDATE messages SET indexed=0`,
+		`DELETE FROM term_df`,
 	} {
 		if _, err := db.sql.Exec(q); err != nil {
 			return err
@@ -293,6 +303,9 @@ func (db *DB) ensureEdgesSchema() error {
 // as of this run, so a term crossing minDF later undercounts its early
 // pairs, and a new hub keeps its early edges.
 func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
+	if err := db.ensureEdgesSchema(); err != nil {
+		return 0, 0, err
+	}
 	df, totals, err := db.loadDF()
 	if err != nil {
 		return 0, 0, err
@@ -351,6 +364,9 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 		for _, e := range topics.SelectPairs(d.text, getDF(d.proj), minDF, topics.HubCap(totals[d.proj], minDF)) {
 			pairDelta[ProjectEdge{Project: d.proj, A: e[0], B: e[1]}]++
 		}
+		for _, t := range topics.ExtractTyped(d.text) {
+			pairDelta[ProjectEdge{Project: d.proj, A: t.A, B: t.B, Kind: t.Kind}]++
+		}
 	}
 	tx, err := db.sql.Begin()
 	if err != nil {
@@ -359,9 +375,9 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 	defer tx.Rollback()
 	for e, n := range pairDelta {
 		if _, err := tx.Exec(
-			`INSERT INTO topic_edges(project, term_a, term_b, weight, kind) VALUES(?, ?, ?, ?, 'co-mention')
-			 ON CONFLICT(project, term_a, term_b) DO UPDATE SET weight=topic_edges.weight+excluded.weight`,
-			e.Project, e.A, e.B, n); err != nil {
+			`INSERT INTO topic_edges(project, term_a, term_b, weight, kind) VALUES(?, ?, ?, ?, ?)
+			 ON CONFLICT(project, term_a, term_b, kind) DO UPDATE SET weight=topic_edges.weight+excluded.weight`,
+			e.Project, e.A, e.B, n, e.kind()); err != nil {
 			return 0, 0, err
 		}
 	}
@@ -412,16 +428,19 @@ func (db *DB) IndexFull(minDF int) error {
 	for proj, texts := range groups {
 		df := topics.DocFreq(texts)
 		maxDF := topics.HubCap(len(texts), minDF)
-		edgeW := map[topics.Edge]int{}
+		edgeW := map[ProjectEdge]int{}
 		for _, t := range texts {
 			for _, e := range topics.SelectPairs(t, df, minDF, maxDF) {
-				edgeW[e]++
+				edgeW[ProjectEdge{Project: proj, A: e[0], B: e[1]}]++
+			}
+			for _, tp := range topics.ExtractTyped(t) {
+				edgeW[ProjectEdge{Project: proj, A: tp.A, B: tp.B, Kind: tp.Kind}]++
 			}
 		}
 		for e, w := range edgeW {
 			if _, err := tx.Exec(
-				`INSERT INTO topic_edges(project, term_a, term_b, weight, kind) VALUES(?, ?, ?, ?, 'co-mention')`,
-				proj, e[0], e[1], w); err != nil {
+				`INSERT INTO topic_edges(project, term_a, term_b, weight, kind) VALUES(?, ?, ?, ?, ?)`,
+				proj, e.A, e.B, w, e.kind()); err != nil {
 				return err
 			}
 		}
@@ -487,11 +506,13 @@ func dfView(df map[string]int, proj string) map[string]int {
 }
 
 // RelatedHit is one related topic. Via is empty at depth 1; at depth 2 it
-// names the intermediate topic (term -via-> hit).
+// names the intermediate topic (term -via-> hit). Kind is the relation
+// type ('co-mention' unless a rule extracted better).
 type RelatedHit struct {
 	Term   string
 	Weight int
 	Via    string
+	Kind   string
 }
 
 // Related returns topics co-mentioned with term. Empty project searches
@@ -501,7 +522,7 @@ type RelatedHit struct {
 func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, error) {
 	term = strings.ToLower(term)
 	neighbors := func(t string) ([]RelatedHit, error) {
-		q := `SELECT CASE WHEN term_a=? THEN term_b ELSE term_a END AS other, weight
+		q := `SELECT CASE WHEN term_a=? THEN term_b ELSE term_a END AS other, weight, kind
 			 FROM topic_edges WHERE (term_a=? OR term_b=?)`
 		args := []any{t, t, t}
 		if project != "" {
@@ -516,7 +537,7 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 		var out []RelatedHit
 		for rows.Next() {
 			var h RelatedHit
-			if err := rows.Scan(&h.Term, &h.Weight); err != nil {
+			if err := rows.Scan(&h.Term, &h.Weight, &h.Kind); err != nil {
 				return nil, err
 			}
 			out = append(out, h)
@@ -530,8 +551,10 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 		return nil, err
 	}
 	for _, h := range first {
-		seen[h.Term] = h
-		direct[h.Term] = h.Weight
+		seen[h.Term+"\x00"+h.Kind] = h
+		if w, ok := direct[h.Term]; !ok || h.Weight > w {
+			direct[h.Term] = h.Weight
+		}
 	}
 	if depth >= 2 {
 		// Expand only the strongest direct neighbors: expanding every
@@ -540,7 +563,7 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 		for t, w := range direct {
 			ordered = append(ordered, RelatedHit{Term: t, Weight: w})
 		}
-		sortByWeight(ordered)
+		sortHits(ordered)
 		if len(ordered) > maxVia {
 			ordered = ordered[:maxVia]
 		}
@@ -554,8 +577,9 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 				if h.Term == term {
 					continue
 				}
-				if cur, ok := seen[h.Term]; !ok || w1+h.Weight > cur.Weight {
-					seen[h.Term] = RelatedHit{Term: h.Term, Weight: w1 + h.Weight, Via: via}
+				key := h.Term + "\x00" + h.Kind
+				if cur, ok := seen[key]; !ok || w1+h.Weight > cur.Weight {
+					seen[key] = RelatedHit{Term: h.Term, Weight: w1 + h.Weight, Via: via, Kind: h.Kind}
 				}
 			}
 		}
@@ -564,7 +588,7 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 	for _, h := range seen {
 		out = append(out, h)
 	}
-	sortByWeight(out)
+	sortHits(out)
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -574,9 +598,18 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 // maxVia bounds depth-2 expansion to the strongest direct neighbors.
 const maxVia = 8
 
-func sortByWeight(h []RelatedHit) {
+// sortHits ranks typed relations above co-mentions, then by weight: a
+// rule-extracted link outranks any number of bare co-mentions.
+func sortHits(h []RelatedHit) {
+	less := func(a, b RelatedHit) bool {
+		ta, tb := a.Kind != "" && a.Kind != "co-mention", b.Kind != "" && b.Kind != "co-mention"
+		if ta != tb {
+			return ta
+		}
+		return a.Weight > b.Weight
+	}
 	for i := 1; i < len(h); i++ {
-		for j := i; j > 0 && h[j].Weight > h[j-1].Weight; j-- {
+		for j := i; j > 0 && less(h[j], h[j-1]); j-- {
 			h[j], h[j-1] = h[j-1], h[j]
 		}
 	}

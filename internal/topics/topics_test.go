@@ -73,6 +73,29 @@ func TestSelectPairsKeepsTopDistinctive(t *testing.T) {
 	}
 }
 
+func TestExtractTypedFindsOwnsAndReplaces(t *testing.T) {
+	got := ExtractTyped("Bastion's turret anchors the room. The sentry replaces the dome. Nothing happens here.")
+	want := map[TypedPair]bool{
+		{A: "bastion", B: "turret", Kind: KindOwns}:  false,
+		{A: "dome", B: "sentry", Kind: KindReplaces}: false,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %d pairs", got, len(want))
+	}
+	for _, p := range got {
+		if _, ok := want[p]; !ok {
+			t.Errorf("unexpected pair %+v", p)
+		} else {
+			want[p] = true
+		}
+	}
+	for p, seen := range want {
+		if !seen {
+			t.Errorf("missing pair %+v", p)
+		}
+	}
+}
+
 func TestBuildEdgesDropsRareTerms(t *testing.T) {
 	texts := []string{"bastion sentry", "bastion sentry turret"}
 	edges := BuildEdges(texts, 2)

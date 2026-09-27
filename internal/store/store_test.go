@@ -82,7 +82,7 @@ func TestRelatedRanksDirectAndTwoHop(t *testing.T) {
 		{Project: "/home/u/omen", A: "bastion", B: "sentry"}:   5,
 		{Project: "/home/u/omen", A: "bastion", B: "aegis"}:    2,
 		{Project: "/home/u/omen", A: "sanctuary", B: "sentry"}: 3,
-		{Project: "/home/u/other", A: "bastion", B: "hubspot"}:  9,
+		{Project: "/home/u/other", A: "bastion", B: "hubspot"}: 9,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -189,6 +189,23 @@ func TestIndexFullHealsThresholdDrift(t *testing.T) {
 	}
 	if w := edgeWeight(t, db, "bastion", "sentry"); w != 1 {
 		t.Fatalf("full rebuild should materialize pair, weight = %d", w)
+	}
+}
+
+func TestTypedEdgesOutrankCoMention(t *testing.T) {
+	db := openTemp(t)
+	if err := db.ReplaceEdges(map[ProjectEdge]int{
+		{Project: "p", A: "bastion", B: "noise"}:                    9,
+		{Project: "p", A: "bastion", B: "sentry", Kind: "replaces"}: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := db.Related("bastion", "p", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 2 || hits[0].Term != "sentry" || hits[0].Kind != "replaces" {
+		t.Fatalf("typed edge should rank first: %+v", hits)
 	}
 }
 

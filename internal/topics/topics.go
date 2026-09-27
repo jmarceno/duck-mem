@@ -180,6 +180,118 @@ func Pairs(kept []string) []Edge {
 	return out
 }
 
+// Relation kinds produced by rule extraction. Stored undirected:
+// (super, turret, replaces) says the pair has a replacement
+// relationship; direction comes from the source message via query.
+const (
+	KindOwns     = "owns"
+	KindReplaces = "replaces"
+)
+
+// TypedPair is one rule-extracted relation; A < B canonicalized.
+type TypedPair struct {
+	A, B string
+	Kind string
+}
+
+// replaceVerbs mark a replacement relationship between the nearest
+// content words on each side.
+var replaceVerbs = map[string]bool{
+	"replace": true, "replaces": true, "replaced": true, "replacing": true,
+	"supersede": true, "supersedes": true, "superseded": true, "superseding": true,
+}
+
+func isContent(w string) bool {
+	return len(w) >= 3 && !stopwords[w] && !isDigits(w)
+}
+
+// contentTokens lowercases and splits text, keeping order and
+// duplicates (unlike Terms): extraction needs positions.
+func contentTokens(text string) []string {
+	var out []string
+	var cur strings.Builder
+	flush := func() {
+		if w := cur.String(); w != "" {
+			out = append(out, w)
+		}
+		cur.Reset()
+	}
+	for _, r := range strings.ToLower(text) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			cur.WriteRune(r)
+		} else if r == '\'' {
+			flush()
+			out = append(out, "'")
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return out
+}
+
+// ExtractTyped finds rule-based relations in text, sentence by sentence:
+// possessive "X's Y" -> owns, replacement verbs and "instead of" ->
+// replaces. Both endpoints must be content words.
+func ExtractTyped(text string) []TypedPair {
+	var out []TypedPair
+	for _, sent := range strings.FieldsFunc(text, func(r rune) bool {
+		return r == '.' || r == '!' || r == '?' || r == ';' || r == '\n'
+	}) {
+		out = append(out, extractSent(contentTokens(sent))...)
+	}
+	return out
+}
+
+func extractSent(toks []string) []TypedPair {
+	var out []TypedPair
+	// Possessive: X ' s Y.
+	for i := 0; i+3 < len(toks); i++ {
+		if toks[i+1] == "'" && toks[i+2] == "s" && isContent(toks[i]) && isContent(toks[i+3]) {
+			a, b := toks[i], toks[i+3]
+			if a > b {
+				a, b = b, a
+			}
+			out = append(out, TypedPair{A: a, B: b, Kind: KindOwns})
+		}
+	}
+	// Replacement verbs: nearest content word each side.
+	isInsteadOf := func(i int) bool {
+		return toks[i] == "instead" && i+1 < len(toks) && toks[i+1] == "of"
+	}
+	for i, t := range toks {
+		verb := replaceVerbs[t]
+		if !verb && !(t == "instead" && isInsteadOf(i)) {
+			continue
+		}
+		after := i + 1
+		if t == "instead" {
+			after = i + 2 // skip "of"
+		}
+		subj, obj := "", ""
+		for j := i - 1; j >= 0; j-- {
+			if isContent(toks[j]) {
+				subj = toks[j]
+				break
+			}
+		}
+		for j := after; j < len(toks); j++ {
+			if isContent(toks[j]) {
+				obj = toks[j]
+				break
+			}
+		}
+		if subj == "" || obj == "" || subj == obj {
+			continue
+		}
+		if subj > obj {
+			subj, obj = obj, subj
+		}
+		out = append(out, TypedPair{A: subj, B: obj, Kind: KindReplaces})
+	}
+	return out
+}
+
 // SelectPairs extracts the narrow pair set for one message against
 // corpus df counts: top distinctive qualifying terms, paired.
 func SelectPairs(text string, df map[string]int, minDF, maxDF int) []Edge {
