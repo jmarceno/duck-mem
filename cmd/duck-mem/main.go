@@ -34,6 +34,18 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "--install":
+		if err := installUser(); err != nil {
+			fatal(err)
+		}
+	case "--uninstall":
+		if err := uninstallUser(os.Args[2:]); err != nil {
+			fatal(err)
+		}
+	case "tray":
+		if err := runTray(); err != nil {
+			fatal(err)
+		}
 	case "ingest":
 		ingestCmd(os.Args[2:])
 	case "query":
@@ -53,9 +65,11 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage:
+  duck-mem --install                    install CLI, daemon, and tray for this user
+  duck-mem --uninstall [--keep-data|--purge-data]
   duck-mem ingest [--db PATH] [ROOT...]   ingest session logs (default roots when omitted)
   duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>
-  duck-mem index [--db PATH] [--min-df N] rebuild the topic co-mention graph
+  duck-mem index [--db PATH] [--min-df N] [--full] rebuild the topic graph
   duck-mem related [--db PATH] [--depth 1|2] [--limit N] <term>
   duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
 `)
@@ -118,6 +132,9 @@ func ingestCmd(args []string) {
 		fatal(err)
 	}
 	fmt.Printf("index: +%d messages, +%d pairs\n", newMsgs, newPairs)
+	if err := writeSyncStatus(*dbPath, syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}); err != nil {
+		fmt.Fprintln(os.Stderr, "sync status:", err)
+	}
 }
 
 func daemonCmd(args []string) {
@@ -159,6 +176,9 @@ func daemonCmd(args []string) {
 		if err != nil {
 			fmt.Printf("%s cycle=%d error: %v\n", time.Now().UTC().Format(time.RFC3339), n, err)
 			return
+		}
+		if err := writeSyncStatus(*dbPath, syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}); err != nil {
+			fmt.Printf("%s cycle=%d status error: %v\n", time.Now().UTC().Format(time.RFC3339), n, err)
 		}
 		fmt.Printf("%s cycle=%d files=%d sessions=%d messages=%d skipped=%d indexed=+%d pairs=+%d\n",
 			time.Now().UTC().Format(time.RFC3339), n, files, nSess, nMsg, nSkip, newMsgs, newPairs)
@@ -448,7 +468,7 @@ func queryCmd(args []string) {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
 	dbPath := fs.String("db", defaultDB(), "DuckDB file")
 	project := fs.String("project", "", "filter by project (substring match)")
-	source := fs.String("source", "", "filter by source: codex|claude|cursor|muse")
+	source := fs.String("source", "", "filter by source: codex|claude|cursor|muse|opencode")
 	limit := fs.Int("limit", 20, "max results")
 	known := map[string]bool{"--db": true, "--project": true, "--source": true, "--limit": true}
 	flagArgs, positional := splitArgs(args, known)

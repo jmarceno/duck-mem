@@ -49,6 +49,11 @@ not parsed (only migrated IDs remain there); transcripts + plans are covered.
 ## Usage
 
 ```bash
+go run ./cmd/duck-mem --install      # user binary, PATH, indexer and tray services
+duck-mem --uninstall                 # asks whether to keep or delete data/config
+duck-mem --uninstall --keep-data     # noninteractive equivalent
+duck-mem --uninstall --purge-data    # delete duck-mem data/config after stopping services
+
 duck-mem ingest [--db PATH] [ROOT...]   # default roots cover all five stores above
 duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>
 duck-mem index [--db PATH] [--min-df N] [--full] # incremental; --full rebuilds
@@ -56,7 +61,20 @@ duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
 duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
 ```
 
-To foreground-test: go build -o ~/.local/bin/duck-mem ./cmd/duck-mem && duck-mem daemon.
+`--install` copies the binary to `~/.local/bin`, adds that directory to
+`~/.profile` if it is absent from `PATH`, and enables and starts
+`duck-mem.service` and `duck-mem-tray.service` as systemd user services. The
+tray uses the StatusNotifierItem and DBusMenu protocols. Its menu shows the
+last completed sync, starts or stops the indexer, and can do a full re-index.
+The last-sync record is in `~/.local/state/duck-mem/last-sync.json`.
+After a new PATH entry, open a new login shell to use `duck-mem` by name.
+
+`--uninstall` stops and removes both services and the binary. Its prompt
+defaults to keeping the database, config, and sync status; only an explicit
+yes (or `--purge-data`) removes those duck-mem directories. It never removes
+the original Codex, Claude, Cursor, Muse, or OpenCode session stores.
+
+The read-only agent skill is at `.agents/skills/duck-mem-query/SKILL.md`.
 
 
 ## Daemon

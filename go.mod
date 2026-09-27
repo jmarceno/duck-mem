@@ -3,6 +3,7 @@ module duck-mem
 go 1.24.0
 
 require (
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/marcboeker/go-duckdb/v2 v2.4.3
 	github.com/mattn/go-sqlite3 v1.14.52
 )

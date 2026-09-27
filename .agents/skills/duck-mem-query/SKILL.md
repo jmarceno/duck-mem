@@ -6,8 +6,8 @@ description: Recall long-term memory from past agent sessions via the local duck
 # Query duck-mem Memory
 
 `duck-mem` is this machine's long-term agent memory: past Codex, Claude,
-Cursor, and Muse sessions, minus tool calls, in a DuckDB file refreshed by
-a background daemon every few minutes. Use it to recover prior decisions,
+Cursor, Muse, and OpenCode sessions, minus tool calls, in a DuckDB file
+refreshed by a user daemon when it is running. Use it to recover prior decisions,
 gotchas, and context instead of re-deriving them.
 
 ## Contract
@@ -26,7 +26,7 @@ duck-mem query [--project P] [--source S] [--limit N] <words...>
 
 - Words AND-match against message text (case-insensitive substring).
 - `--project` filters by project path substring (e.g. `omen-the-game`).
-- `--source` is one of `codex`, `claude`, `cursor`, `muse`.
+- `--source` is one of `codex`, `claude`, `cursor`, `muse`, `opencode`.
 - Flags may come before or after the words.
 
 Example:
@@ -52,10 +52,11 @@ duck-mem related [--project P] [--depth 1|2] [--limit N] <term>
 ```
 
 - Lists topics discussed together with the term, most relevant first.
-- Lines shaped `sentry (replaces, 3)` are typed relations (`owns`,
-  `replaces`) and outrank bare co-mentions like `turret (3)`.
-- Typed edges are undirected: the pair names the relationship; run a
-  `query` on both words to recover direction from the source message.
+- Typed relations (`owns`, `replaces`) show direction and evidence, e.g.
+  `sentry (replaces: sentry -> dome, 3) [source...]`. They outrank bare
+  co-mentions like `turret (3)`.
+- Rule-extracted relations can be wrong; run `query` on both words and
+  check the source message before treating one as a fact.
 - `--depth 2` adds neighbors-of-neighbors as `topic (weight, via hub)`.
 
 Example: `related --project omen-the-game bastion` surfaces the turret
@@ -64,18 +65,20 @@ decision text.
 
 ## When to use it
 
-- Session start on an existing project: one `query --project <name>` for
-  the current task area plus one `related` hop to find linked topics.
+- Session start on an existing project: query with the project name and
+  distinctive terms from the current task, then use one `related` hop to
+  find linked topics. `query` requires search text.
 - Before re-deciding something: search first; prior sessions often decided
   it already (design calls, failed approaches, error fixes).
 - Mid-task when stuck: recall how a past session solved the same error.
 
 ## Limits
 
-- Memory lags the daemon by minutes; it never contains the current
-  conversation.
-- The CLI retries through daemon write cycles automatically; if a command
-  ever reports a lock conflict, wait a few seconds and retry once.
+- Memory lags the daemon by minutes while it runs; it never contains the
+  current conversation. The tray menu shows the last completed sync.
+- The CLI retries brief daemon write cycles automatically. Initial imports
+  and full re-indexes can hold the database longer; on a lock conflict,
+  check the tray's last-sync status and retry after indexing completes.
 - Keyword match only: synonyms and paraphrases can miss. If a query comes
   back empty, retry with different words from the same topic.
 - Snippets are memory, not truth: files may have changed since. Confirm
