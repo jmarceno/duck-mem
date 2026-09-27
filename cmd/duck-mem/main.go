@@ -186,7 +186,7 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 			nSkip++
 			continue
 		}
-		if err := db.InsertMessages(msgs); err != nil {
+		if err := db.SyncMessages(sess.ID, msgs); err != nil {
 			nSkip++
 			continue
 		}

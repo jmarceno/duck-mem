@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -73,6 +74,31 @@ func TestSearchFindsByKeywordFiltersAndDedupes(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("duplicate messages stored: n=%d", n)
+	}
+}
+
+func TestSearchAndRelatedRejectInvalidLimits(t *testing.T) {
+	db := openTemp(t)
+	if _, err := db.Search("anything", "", "", 0); err == nil {
+		t.Fatal("search accepted zero limit")
+	}
+	if _, err := db.Related("anything", "", 2, -1); err == nil {
+		t.Fatal("related accepted negative limit")
+	}
+	if _, err := db.Related("anything", "", 3, 10); err == nil {
+		t.Fatal("related accepted unsupported depth")
+	}
+}
+
+func TestSearchSnippetShowsMatchInLongMessage(t *testing.T) {
+	db := openTemp(t)
+	insertMsg(t, db, "long", 0, strings.Repeat("padding ", 100)+"zephyrturbine conclusion")
+	hits, err := db.Search("zephyrturbine", "", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || !strings.Contains(hits[0].Snippet, "zephyrturbine") {
+		t.Fatalf("matching text missing from snippet: %+v", hits)
 	}
 }
 
@@ -148,6 +174,23 @@ func TestRelatedRanksDirectAndTwoHop(t *testing.T) {
 	}
 }
 
+func TestRelatedAggregatesAcrossProjects(t *testing.T) {
+	db := openTemp(t)
+	if err := db.ReplaceEdges(map[ProjectEdge]int{
+		{Project: "one", A: "bastion", B: "sentry"}: 2,
+		{Project: "two", A: "bastion", B: "sentry"}: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := db.Related("bastion", "", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Term != "sentry" || hits[0].Weight != 5 {
+		t.Fatalf("expected aggregated weight 5, got %+v", hits)
+	}
+}
+
 func insertMsg(t *testing.T, db *DB, sid string, seq int, text string) {
 	t.Helper()
 	if err := db.UpsertSession(Session{ID: sid, Source: "codex", Project: "p", Path: "f"}); err != nil {
@@ -207,6 +250,61 @@ func TestIndexNewIsIncrementalAndIdempotent(t *testing.T) {
 	}
 	if w := edgeWeight(t, db, "bastion", "sentry"); w != 3 {
 		t.Fatalf("bastion-sentry weight = %d, want 3", w)
+	}
+}
+
+func TestSyncMessagesRefreshesEditedSessionAndGraph(t *testing.T) {
+	db := openTemp(t)
+	s := Session{ID: "edited", Source: "codex", Project: "old", Path: "f"}
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatal(err)
+	}
+	message := func(seq int, text, project string) Message {
+		return Message{SessionID: s.ID, Seq: seq, Source: s.Source, Project: project, Role: "user", Text: text}
+	}
+	if err := db.SyncMessages(s.ID, []Message{message(0, "bastion sentry", "old")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.IndexNew(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SyncMessages(s.ID, []Message{message(0, "bastion sentry", "old"), message(1, "bastion sentry", "old")}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, err := db.IndexNew(1); err != nil || n != 1 || edgeWeight(t, db, "bastion", "sentry") != 2 {
+		t.Fatalf("append was not indexed incrementally: n=%d err=%v", n, err)
+	}
+	s.Project = "new"
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SyncMessages(s.ID, []Message{message(0, "bastion turret", "new"), message(1, "bastion turret", "new")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.IndexNew(1); err != nil {
+		t.Fatal(err)
+	}
+	old, err := db.Search("sentry", "", "", 10)
+	if err != nil || len(old) != 0 {
+		t.Fatalf("stale message remained: hits=%+v err=%v", old, err)
+	}
+	hits, err := db.Related("bastion", "new", 1, 10)
+	if err != nil || len(hits) != 1 || hits[0].Term != "turret" || hits[0].Weight != 2 {
+		t.Fatalf("updated graph wrong: hits=%+v err=%v", hits, err)
+	}
+	hits, err = db.Related("bastion", "old", 1, 10)
+	if err != nil || len(hits) != 0 {
+		t.Fatalf("stale graph remained: hits=%+v err=%v", hits, err)
+	}
+	if err := db.SyncMessages(s.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.IndexNew(1); err != nil {
+		t.Fatal(err)
+	}
+	hits, err = db.Related("bastion", "", 1, 10)
+	if err != nil || len(hits) != 0 {
+		t.Fatalf("deleted session still indexed: hits=%+v err=%v", hits, err)
 	}
 }
 

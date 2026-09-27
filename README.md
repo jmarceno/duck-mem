@@ -92,7 +92,9 @@ scratch with exact thresholds and heals that drift; run it weekly:
 Flags may come before or after the query text.
 
 Default db: `~/.local/share/duck-mem/memory.duckdb`. Re-running `ingest` is
-idempotent (`ON CONFLICT DO NOTHING` on `(session_id, seq)`).
+idempotent. Appended messages index incrementally; if a session's earlier
+messages change or disappear, ingest reconciles its rows and the next index
+pass rebuilds the graph to remove stale relationships.
 
 ## Roadmap (suggested, not yet implemented)
 

@@ -2,7 +2,9 @@ package ingest
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -98,19 +100,26 @@ func newSession(id, source, project, path string, started time.Time) store.Sessi
 	return store.Session{ID: id, Source: source, Project: project, Path: path, StartedAt: started}
 }
 
-// collector assigns seq numbers and drops empty / duplicate texts.
+// collector assigns seq numbers and drops empty texts and adjacent duplicate
+// records. Some sources emit the same utterance in two neighboring envelopes;
+// a later repetition in the conversation is still a distinct message.
 type collector struct {
 	sess store.Session
 	msgs []store.Message
-	seen map[string]bool
 }
 
 func (c *collector) add(role, text string, at time.Time) {
 	text = strings.TrimSpace(text)
-	if text == "" || c.seen[text] {
+	if text == "" {
 		return
 	}
-	c.seen[text] = true
+	if n := len(c.msgs); n > 0 {
+		prev := c.msgs[n-1]
+		if prev.Role == role && prev.Text == text && !at.IsZero() && !prev.CreatedAt.IsZero() &&
+			!at.Before(prev.CreatedAt) && at.Sub(prev.CreatedAt) <= time.Second {
+			return
+		}
+	}
 	c.msgs = append(c.msgs, store.Message{
 		SessionID: c.sess.ID,
 		Seq:       len(c.msgs),
@@ -128,20 +137,30 @@ func readLines(path string, fn func(map[string]any)) error {
 		return err
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
+	r := bufio.NewReader(f)
+	for {
+		data, readErr := r.ReadBytes('\n')
+		line := bytes.TrimSpace(data)
+		if len(line) == 0 {
+			if readErr == io.EOF {
+				return nil
+			}
+			if readErr != nil {
+				return readErr
+			}
 			continue
 		}
 		var o map[string]any
-		if err := json.Unmarshal([]byte(line), &o); err != nil {
-			continue
+		if err := json.Unmarshal(line, &o); err == nil {
+			fn(o)
 		}
-		fn(o)
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
 	}
-	return sc.Err()
 }
 
 func str(m map[string]any, keys ...string) string {
@@ -182,7 +201,7 @@ func microsToTime(v any) time.Time {
 
 func parseCodex(path string) (store.Session, []store.Message, error) {
 	sess := newSession("", "codex", "", path, time.Time{})
-	c := &collector{sess: sess, seen: map[string]bool{}}
+	c := &collector{sess: sess}
 	var cwd, sid string
 	var started time.Time
 	err := readLines(path, func(o map[string]any) {
@@ -314,7 +333,7 @@ func claudeText(content any) string {
 
 func parseClaude(path string) (store.Session, []store.Message, error) {
 	sess := newSession("", "claude", "", path, time.Time{})
-	c := &collector{sess: sess, seen: map[string]bool{}}
+	c := &collector{sess: sess}
 	var sid, cwd string
 	var started time.Time
 	err := readLines(path, func(o map[string]any) {
@@ -418,7 +437,7 @@ func museUserTexts(payload map[string]any, out *[]string) {
 
 func parseMuse(path string) (store.Session, []store.Message, error) {
 	sess := newSession("", "muse", "", path, time.Time{})
-	c := &collector{sess: sess, seen: map[string]bool{}}
+	c := &collector{sess: sess}
 	var sid, cwd string
 	var started time.Time
 	err := readLines(path, func(o map[string]any) {
@@ -496,7 +515,7 @@ func parseMuse(path string) (store.Session, []store.Message, error) {
 
 func parseCursorTranscript(path string) (store.Session, []store.Message, error) {
 	sess := newSession("", "cursor", decodeCursorProject(path), path, time.Time{})
-	c := &collector{sess: sess, seen: map[string]bool{}}
+	c := &collector{sess: sess}
 	err := readLines(path, func(o map[string]any) {
 		role, _ := o["role"].(string)
 		if role != "user" && role != "assistant" {

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -50,8 +51,8 @@ type Hit struct {
 type DB struct{ sql *sql.DB }
 
 // Open creates/opens the DuckDB file and initializes the schema.
-// Extensions (vss, duckpgq) load best-effort: iteration 1 search is plain
-// ILIKE, so a missing extension (e.g. offline machine) must not fail.
+// Already installed extensions load best-effort. Opening a database must not
+// download extensions: neither is needed by the current search or index.
 func Open(path string) (*DB, error) {
 	sdb, err := sql.Open("duckdb", path)
 	if err != nil {
@@ -77,14 +78,18 @@ func OpenReadOnly(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// sql.Open is lazy. Force the connection now so callers can retry a
+	// transient writer lock instead of failing on their first query.
+	if err := sdb.Ping(); err != nil {
+		_ = sdb.Close()
+		return nil, err
+	}
 	return &DB{sql: sdb}, nil
 }
 
 func (db *DB) init() error {
 	for _, q := range []string{
-		`INSTALL vss`,
 		`LOAD vss`,
-		`INSTALL duckpgq`,
 		`LOAD duckpgq`,
 	} {
 		_, _ = db.sql.Exec(q)
@@ -150,14 +155,85 @@ func (db *DB) init() error {
 // Close releases the handle.
 func (db *DB) Close() error { return db.sql.Close() }
 
-// UpsertSession records a session; re-ingests update path/started_at.
+// UpsertSession records a session; re-ingests refresh its metadata.
 func (db *DB) UpsertSession(s Session) error {
 	_, err := db.sql.Exec(
 		`INSERT INTO sessions(session_id, source, project, started_at, path)
 		 VALUES(?, ?, ?, ?, ?)
-		 ON CONFLICT(session_id) DO UPDATE SET path=excluded.path, started_at=excluded.started_at`,
+		 ON CONFLICT(session_id) DO UPDATE SET source=excluded.source, project=excluded.project,
+		 path=excluded.path, started_at=excluded.started_at`,
 		s.ID, s.Source, s.Project, nullableTime(s.StartedAt), s.Path)
 	return err
+}
+
+// SyncMessages replaces a session's stored snapshot only when its content
+// changed. Reparsed sessions can gain, lose, or reorder messages; indexed
+// edges from the old snapshot then require a full rebuild.
+func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
+	rows, err := db.sql.Query(`SELECT seq, source, project, role, text FROM messages WHERE session_id=? ORDER BY seq`, sessionID)
+	if err != nil {
+		return err
+	}
+	type stored struct {
+		seq                         int
+		source, project, role, text string
+	}
+	var old []stored
+	for rows.Next() {
+		var m stored
+		if err := rows.Scan(&m.seq, &m.source, &m.project, &m.role, &m.text); err != nil {
+			rows.Close()
+			return err
+		}
+		old = append(old, m)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	prefixMatches := len(old) <= len(msgs)
+	if prefixMatches {
+		for i := range old {
+			m := msgs[i]
+			if m.SessionID != sessionID || old[i] != (stored{m.Seq, m.Source, m.Project, m.Role, m.Text}) {
+				prefixMatches = false
+				break
+			}
+		}
+		if prefixMatches && len(old) == len(msgs) {
+			return nil
+		}
+	}
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if !prefixMatches {
+		if _, err := tx.Exec(`DELETE FROM messages WHERE session_id=?`, sessionID); err != nil {
+			return err
+		}
+	}
+	start := 0
+	if prefixMatches {
+		start = len(old)
+	}
+	for _, m := range msgs[start:] {
+		if m.SessionID != sessionID {
+			return fmt.Errorf("message session %q does not match %q", m.SessionID, sessionID)
+		}
+		if _, err := tx.Exec(`INSERT INTO messages(session_id, seq, source, project, role, text, created_at, indexed)
+			VALUES(?, ?, ?, ?, ?, ?, ?, 0)`, m.SessionID, m.Seq, m.Source, m.Project, m.Role, m.Text, nullableTime(m.CreatedAt)); err != nil {
+			return err
+		}
+	}
+	if len(old) > 0 && !prefixMatches {
+		if _, err := tx.Exec(`INSERT INTO meta(key, value) VALUES('graph_dirty', '1')
+			ON CONFLICT(key) DO UPDATE SET value='1'`); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // InsertMessages stores messages; re-ingesting the same (session_id, seq)
@@ -179,11 +255,22 @@ func (db *DB) InsertMessages(msgs []Message) error {
 // Search AND-matches whitespace-separated tokens case-insensitively
 // against message text. Empty project/source means no filter.
 func (db *DB) Search(query, project, source string, limit int) ([]Hit, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("limit must be positive")
+	}
 	toks := strings.Fields(query)
 	var sb strings.Builder
 	args := []any{}
-	sb.WriteString(`SELECT session_id, seq, source, project, role, substr(text, 1, 300)
-		FROM messages WHERE 1=1`)
+	sb.WriteString(`SELECT session_id, seq, source, project, role, `)
+	if len(toks) > 0 {
+		// Anchor the snippet at a matched token, not the beginning of a
+		// potentially multi-megabyte message.
+		sb.WriteString(`substr(text, greatest(1, strpos(lower(text), lower(?))-80), 300)`)
+		args = append(args, toks[0])
+	} else {
+		sb.WriteString(`substr(text, 1, 300)`)
+	}
+	sb.WriteString(` FROM messages WHERE 1=1`)
 	for _, t := range toks {
 		sb.WriteString(` AND text ILIKE '%'||?||'%' ESCAPE '\'`)
 		args = append(args, escapeLike(t))
@@ -322,6 +409,19 @@ func (db *DB) ensureEdgesSchema() error {
 func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 	if err := db.ensureEdgesSchema(); err != nil {
 		return 0, 0, err
+	}
+	var dirty string
+	if err := db.sql.QueryRow(`SELECT value FROM meta WHERE key='graph_dirty'`).Scan(&dirty); err != nil && err != sql.ErrNoRows {
+		return 0, 0, err
+	}
+	if dirty == "1" {
+		if err := db.sql.QueryRow(`SELECT count(*) FROM messages WHERE indexed=0`).Scan(&newMsgs); err != nil {
+			return 0, 0, err
+		}
+		if err := db.IndexFull(minDF); err != nil {
+			return 0, 0, err
+		}
+		return newMsgs, 0, nil
 	}
 	df, totals, err := db.loadDF()
 	if err != nil {
@@ -470,6 +570,9 @@ func (db *DB) IndexFull(minDF int) error {
 	if _, err := tx.Exec(`UPDATE messages SET indexed=1`); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`DELETE FROM meta WHERE key='graph_dirty'`); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -537,15 +640,19 @@ type RelatedHit struct {
 // Depth 1 ranks direct neighbors by co-mention count; depth 2 adds
 // neighbors-of-neighbors, scored by the two-hop weight sum.
 func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, error) {
+	if limit < 1 || (depth != 1 && depth != 2) {
+		return nil, fmt.Errorf("related needs a positive limit and depth 1 or 2")
+	}
 	term = strings.ToLower(term)
 	neighbors := func(t string) ([]RelatedHit, error) {
-		q := `SELECT CASE WHEN term_a=? THEN term_b ELSE term_a END AS other, weight, kind
+		q := `SELECT CASE WHEN term_a=? THEN term_b ELSE term_a END AS other, sum(weight), kind
 			 FROM topic_edges WHERE (term_a=? OR term_b=?)`
 		args := []any{t, t, t}
 		if project != "" {
 			q += ` AND project ILIKE '%'||?||'%' ESCAPE '\'`
 			args = append(args, escapeLike(project))
 		}
+		q += ` GROUP BY other, kind`
 		rows, err := db.sql.Query(q, args...)
 		if err != nil {
 			return nil, err
@@ -618,18 +725,23 @@ const maxVia = 8
 // sortHits ranks typed relations above co-mentions, then by weight: a
 // rule-extracted link outranks any number of bare co-mentions.
 func sortHits(h []RelatedHit) {
-	less := func(a, b RelatedHit) bool {
+	sort.Slice(h, func(i, j int) bool {
+		a, b := h[i], h[j]
 		ta, tb := a.Kind != "" && a.Kind != "co-mention", b.Kind != "" && b.Kind != "co-mention"
 		if ta != tb {
 			return ta
 		}
-		return a.Weight > b.Weight
-	}
-	for i := 1; i < len(h); i++ {
-		for j := i; j > 0 && less(h[j], h[j-1]); j-- {
-			h[j], h[j-1] = h[j-1], h[j]
+		if a.Weight != b.Weight {
+			return a.Weight > b.Weight
 		}
-	}
+		if a.Term != b.Term {
+			return a.Term < b.Term
+		}
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		return a.Via < b.Via
+	})
 }
 
 // Count returns (sessions, messages) totals, for ingest reporting.

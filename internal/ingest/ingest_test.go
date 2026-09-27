@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,25 @@ func writeTemp(t *testing.T, path, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCodexKeepsLargeAndRepeatedMessages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".codex", "large.jsonl")
+	large := strings.Repeat("x", 1024*1024+1) + " needle"
+	writeTemp(t, path, strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"large","cwd":"/project"}}`,
+		fmt.Sprintf(`{"timestamp":"2026-09-27T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":%q}]}}`, large),
+		`{"timestamp":"2026-09-27T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"retry"}]}}`,
+		`{"timestamp":"2026-09-27T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"retry"}]}}`,
+		`{"timestamp":"2026-09-27T00:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+	}, "\n"))
+	_, msgs, err := IngestFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 4 || msgs[0].Text != large || msgs[1].Text != "retry" || msgs[2].Text != "retry" || msgs[3].Text != "done" {
+		t.Fatalf("large or repeated utterance lost: count=%d", len(msgs))
 	}
 }
 
