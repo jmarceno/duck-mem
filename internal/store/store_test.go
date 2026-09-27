@@ -102,6 +102,20 @@ func TestSearchSnippetShowsMatchInLongMessage(t *testing.T) {
 	}
 }
 
+func TestSearchRanksPhraseAndFocusedMessageFirst(t *testing.T) {
+	db := openTemp(t)
+	insertMsg(t, db, "a", 0, "bastion "+strings.Repeat("padding ", 80)+"sentry")
+	insertMsg(t, db, "b", 0, "bastion sentry")
+	insertMsg(t, db, "c", 0, "bastion sentry "+strings.Repeat("padding ", 80))
+	hits, err := db.Search("bastion sentry", "", "", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 3 || hits[0].SessionID != "b" || hits[1].SessionID != "c" || hits[2].SessionID != "a" {
+		t.Fatalf("relevance ranking wrong: %+v", hits)
+	}
+}
+
 func TestReadOnlyOpenReadsAndRefusesMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.duckdb")
 	writer, err := Open(path)
@@ -339,6 +353,64 @@ func TestTypedEdgesOutrankCoMention(t *testing.T) {
 	}
 	if len(hits) != 2 || hits[0].Term != "sentry" || hits[0].Kind != "replaces" {
 		t.Fatalf("typed edge should rank first: %+v", hits)
+	}
+}
+
+func TestRelatedKeepsDirectionAndSourceEvidence(t *testing.T) {
+	db := openTemp(t)
+	insertMsg(t, db, "forward", 0, "Bastion replaces Sentry.")
+	insertMsg(t, db, "reverse", 0, "Sentry replaces Bastion.")
+	if _, _, err := db.IndexNew(1); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := db.Related("bastion", "p", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, h := range hits {
+		if h.Kind != "replaces" {
+			continue
+		}
+		if h.Term != "sentry" || !strings.Contains(h.Evidence, "#0: ") {
+			t.Fatalf("typed edge lacks source evidence: %+v", h)
+		}
+		seen[h.From+"->"+h.To] = true
+	}
+	if !seen["bastion->sentry"] || !seen["sentry->bastion"] {
+		t.Fatalf("opposite directions collapsed: %+v", hits)
+	}
+}
+
+func TestIndexMigratesOldGraphToDirectedEvidence(t *testing.T) {
+	db := openTemp(t)
+	insertMsg(t, db, "legacy", 0, "Bastion replaces Sentry.")
+	for _, q := range []string{
+		`DROP TABLE topic_edges`,
+		`CREATE TABLE topic_edges(project TEXT, term_a TEXT, term_b TEXT, weight INTEGER, kind TEXT,
+		 PRIMARY KEY(project, term_a, term_b, kind))`,
+		`INSERT INTO meta(key, value) VALUES('edges_schema', '2') ON CONFLICT(key) DO UPDATE SET value='2'`,
+		`UPDATE messages SET indexed=1`,
+	} {
+		if _, err := db.sql.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, _, err := db.IndexNew(1); err != nil || n != 1 {
+		t.Fatalf("legacy graph was not reindexed: n=%d err=%v", n, err)
+	}
+	hits, err := db.Related("bastion", "p", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, h := range hits {
+		if h.Kind == "replaces" && h.From == "bastion" && h.To == "sentry" && strings.Contains(h.Evidence, "legacy#0:") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("migration lost direction or evidence: %+v", hits)
 	}
 }
 

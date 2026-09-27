@@ -76,8 +76,8 @@ func TestSelectPairsKeepsTopDistinctive(t *testing.T) {
 func TestExtractTypedFindsOwnsAndReplaces(t *testing.T) {
 	got := ExtractTyped("Bastion's turret anchors the room. The sentry replaces the dome. Nothing happens here.")
 	want := map[TypedPair]bool{
-		{A: "bastion", B: "turret", Kind: KindOwns}:  false,
-		{A: "dome", B: "sentry", Kind: KindReplaces}: false,
+		{A: "bastion", B: "turret", From: "bastion", To: "turret", Kind: KindOwns, Evidence: "Bastion's turret anchors the room"}: false,
+		{A: "dome", B: "sentry", From: "sentry", To: "dome", Kind: KindReplaces, Evidence: "The sentry replaces the dome"}:        false,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %d pairs", got, len(want))
@@ -93,6 +93,13 @@ func TestExtractTypedFindsOwnsAndReplaces(t *testing.T) {
 		if !seen {
 			t.Errorf("missing pair %+v", p)
 		}
+	}
+}
+
+func TestExtractTypedReversesPassiveReplacement(t *testing.T) {
+	got := ExtractTyped("The dome was replaced by the sentry.")
+	if len(got) != 1 || got[0].From != "sentry" || got[0].To != "dome" || got[0].Kind != KindReplaces {
+		t.Fatalf("passive direction wrong: %+v", got)
 	}
 }
 

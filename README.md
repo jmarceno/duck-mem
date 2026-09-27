@@ -17,9 +17,9 @@ messages(session_id, seq, source, project, role, text, created_at,
          PRIMARY KEY(session_id, seq))
 ```
 
-`duckpgq` and `vss` extensions load best-effort at open; iteration 1 search
-is `ILIKE` keyword match, so ingest/search work offline. Graph + vector
-search are the natural iteration 3 on top of this schema.
+`duckpgq` and `vss` extensions load best-effort at open. Search uses literal
+case-insensitive term matching and ranks matching messages by phrase match
+and term density; it works offline. Vector search remains future work.
 
 ## Kept vs dropped per source
 
@@ -73,9 +73,10 @@ mention both. Depth 2 follows neighbors-of-neighbors (`term -via-> hit`),
 expanding only the 8 strongest direct links. Typed relations outrank
 bare co-mentions: rule extraction finds possessive `X's Y` (owns) and
 replacement verbs / "instead of" (replaces) per sentence, e.g.
-`(bastion, turret, owns)`, `(super, turret, replaces)`. Typed edges are
-stored undirected — the pair names the relationship, `query` shows the
-source message for direction.
+`bastion --owns--> turret` and `sentry --replaces--> dome`. Typed edges
+preserve direction and a source `session#seq` plus sentence in `related`
+output. The first index run after upgrading rebuilds the graph for this
+schema. Co-mentions remain undirected and do not assert causality.
 
 ## Indexing: incremental by default, full weekly
 
@@ -104,10 +105,8 @@ pass rebuilds the graph to remove stale relationships.
 
 - **LLM typed extraction.** Rules misfire (`long (owns)` from "X's long …")
   and only know `owns`/`replaces`. A Graphiti-style per-message LLM pass
-  would raise precision and add kinds (`fixes`, `blocks`, …). The `kind`
-  column and typed-first ranking are ready for it.
-- **Directed typed edges.** `replaces` is stored undirected; direction needs
-  a column plus arrow display (`turret —replaces→ super`).
+  would raise precision and add kinds (`fixes`, `blocks`, …). Source evidence
+  and directed edges are ready for it.
 - **Top-K neighbors per topic (union rule).** If the graph outgrows comfort,
   keep an edge when *either* endpoint ranks it in its top K: bounds size at
   ~2K×vocabulary while keeping everything reachable.

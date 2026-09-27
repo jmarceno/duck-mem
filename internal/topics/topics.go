@@ -180,18 +180,19 @@ func Pairs(kept []string) []Edge {
 	return out
 }
 
-// Relation kinds produced by rule extraction. Stored undirected:
-// (super, turret, replaces) says the pair has a replacement
-// relationship; direction comes from the source message via query.
+// Relation kinds produced by rule extraction.
 const (
 	KindOwns     = "owns"
 	KindReplaces = "replaces"
 )
 
-// TypedPair is one rule-extracted relation; A < B canonicalized.
+// TypedPair is one rule-extracted relation. A/B are canonical for graph
+// lookup; From/To preserve the direction stated by the source sentence.
 type TypedPair struct {
-	A, B string
-	Kind string
+	A, B     string
+	From, To string
+	Kind     string
+	Evidence string
 }
 
 // replaceVerbs mark a replacement relationship between the nearest
@@ -238,21 +239,29 @@ func ExtractTyped(text string) []TypedPair {
 	for _, sent := range strings.FieldsFunc(text, func(r rune) bool {
 		return r == '.' || r == '!' || r == '?' || r == ';' || r == '\n'
 	}) {
-		out = append(out, extractSent(contentTokens(sent))...)
+		out = append(out, extractSent(contentTokens(sent), strings.TrimSpace(sent))...)
 	}
 	return out
 }
 
-func extractSent(toks []string) []TypedPair {
+func typedPair(from, to, kind, evidence string) TypedPair {
+	a, b := from, to
+	if a > b {
+		a, b = b, a
+	}
+	runes := []rune(evidence)
+	if len(runes) > 500 {
+		evidence = string(runes[:500]) + "…"
+	}
+	return TypedPair{A: a, B: b, From: from, To: to, Kind: kind, Evidence: evidence}
+}
+
+func extractSent(toks []string, evidence string) []TypedPair {
 	var out []TypedPair
 	// Possessive: X ' s Y.
 	for i := 0; i+3 < len(toks); i++ {
 		if toks[i+1] == "'" && toks[i+2] == "s" && isContent(toks[i]) && isContent(toks[i+3]) {
-			a, b := toks[i], toks[i+3]
-			if a > b {
-				a, b = b, a
-			}
-			out = append(out, TypedPair{A: a, B: b, Kind: KindOwns})
+			out = append(out, typedPair(toks[i], toks[i+3], KindOwns, evidence))
 		}
 	}
 	// Replacement verbs: nearest content word each side.
@@ -284,10 +293,10 @@ func extractSent(toks []string) []TypedPair {
 		if subj == "" || obj == "" || subj == obj {
 			continue
 		}
-		if subj > obj {
+		if (t == "replaced" || t == "superseded") && after < len(toks) && toks[after] == "by" {
 			subj, obj = obj, subj
 		}
-		out = append(out, TypedPair{A: subj, B: obj, Kind: KindReplaces})
+		out = append(out, typedPair(subj, obj, KindReplaces, evidence))
 	}
 	return out
 }

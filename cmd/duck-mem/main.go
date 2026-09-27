@@ -257,15 +257,19 @@ func relatedCmd(args []string) {
 		fatal(err)
 	}
 	for _, h := range hits {
-		rel := ""
+		rel := fmt.Sprintf("%d", h.Weight)
 		if h.Kind != "" && h.Kind != "co-mention" {
-			rel = h.Kind + ", "
+			rel = fmt.Sprintf("%s: %s -> %s, %d", h.Kind, h.From, h.To, h.Weight)
 		}
 		if h.Via == "" {
-			fmt.Printf("%s (%s%d)\n", h.Term, rel, h.Weight)
+			fmt.Printf("%s (%s)", h.Term, rel)
 		} else {
-			fmt.Printf("%s (%s%d, via %s)\n", h.Term, rel, h.Weight, h.Via)
+			fmt.Printf("%s (%s, via %s)", h.Term, rel, h.Via)
 		}
+		if h.Evidence != "" {
+			fmt.Printf(" [%s]", oneLine(h.Evidence))
+		}
+		fmt.Println()
 	}
 }
 

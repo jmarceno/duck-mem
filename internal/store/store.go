@@ -45,6 +45,7 @@ type Hit struct {
 	Project   string
 	Role      string
 	Snippet   string
+	Score     float64
 }
 
 // DB wraps the DuckDB handle.
@@ -118,7 +119,10 @@ func (db *DB) init() error {
 			term_b TEXT NOT NULL,
 			weight INTEGER NOT NULL,
 			kind TEXT NOT NULL DEFAULT 'co-mention',
-			PRIMARY KEY(project, term_a, term_b, kind))`,
+			from_term TEXT NOT NULL DEFAULT '',
+			to_term TEXT NOT NULL DEFAULT '',
+			evidence TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(project, term_a, term_b, kind, from_term, to_term))`,
 		// term_df holds per-project document frequencies so incremental
 		// runs make the same keep/drop decisions as a full rebuild.
 		`CREATE TABLE IF NOT EXISTS term_df(
@@ -142,8 +146,14 @@ func (db *DB) init() error {
 	for _, q := range []string{
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS indexed INTEGER`,
 		`ALTER TABLE topic_edges ADD COLUMN IF NOT EXISTS kind TEXT`,
+		`ALTER TABLE topic_edges ADD COLUMN IF NOT EXISTS from_term TEXT`,
+		`ALTER TABLE topic_edges ADD COLUMN IF NOT EXISTS to_term TEXT`,
+		`ALTER TABLE topic_edges ADD COLUMN IF NOT EXISTS evidence TEXT`,
 		`UPDATE messages SET indexed=1 WHERE indexed IS NULL`,
 		`UPDATE topic_edges SET kind='co-mention' WHERE kind IS NULL`,
+		`UPDATE topic_edges SET from_term='' WHERE from_term IS NULL`,
+		`UPDATE topic_edges SET to_term='' WHERE to_term IS NULL`,
+		`UPDATE topic_edges SET evidence='' WHERE evidence IS NULL`,
 	} {
 		if _, err := db.sql.Exec(q); err != nil {
 			return err
@@ -270,7 +280,23 @@ func (db *DB) Search(query, project, source string, limit int) ([]Hit, error) {
 	} else {
 		sb.WriteString(`substr(text, 1, 300)`)
 	}
-	sb.WriteString(` FROM messages WHERE 1=1`)
+	sb.WriteString(`, (`)
+	if len(toks) > 1 {
+		sb.WriteString(`CASE WHEN strpos(lower(text), lower(?)) > 0 THEN 100.0 ELSE 0.0 END + `)
+		args = append(args, query)
+	}
+	if len(toks) == 0 {
+		sb.WriteString(`0.0`)
+	} else {
+		for i, t := range toks {
+			if i > 0 {
+				sb.WriteString(` + `)
+			}
+			sb.WriteString(`(length(text)-length(replace(lower(text), lower(?), ''))) * 10.0 / greatest(length(?), 1) / sqrt(greatest(length(text), 1))`)
+			args = append(args, t, t)
+		}
+	}
+	sb.WriteString(`) AS score FROM messages WHERE 1=1`)
 	for _, t := range toks {
 		sb.WriteString(` AND text ILIKE '%'||?||'%' ESCAPE '\'`)
 		args = append(args, escapeLike(t))
@@ -283,7 +309,7 @@ func (db *DB) Search(query, project, source string, limit int) ([]Hit, error) {
 		sb.WriteString(` AND source = ?`)
 		args = append(args, source)
 	}
-	sb.WriteString(` ORDER BY session_id, seq LIMIT ?`)
+	sb.WriteString(` ORDER BY score DESC, created_at DESC NULLS LAST, session_id, seq LIMIT ?`)
 	args = append(args, limit)
 	rows, err := db.sql.Query(sb.String(), args...)
 	if err != nil {
@@ -293,7 +319,7 @@ func (db *DB) Search(query, project, source string, limit int) ([]Hit, error) {
 	var out []Hit
 	for rows.Next() {
 		var h Hit
-		if err := rows.Scan(&h.SessionID, &h.Seq, &h.Source, &h.Project, &h.Role, &h.Snippet); err != nil {
+		if err := rows.Scan(&h.SessionID, &h.Seq, &h.Source, &h.Project, &h.Role, &h.Snippet, &h.Score); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
@@ -303,16 +329,18 @@ func (db *DB) Search(query, project, source string, limit int) ([]Hit, error) {
 
 // TextDoc is one message text plus its project, for per-project indexing.
 type TextDoc struct {
-	Project string
-	Text    string
+	SessionID string
+	Seq       int
+	Project   string
+	Text      string
 }
 
-// ProjectEdge is one weighted co-mention within a project.
+// ProjectEdge is one weighted co-mention or directed typed relation.
 type ProjectEdge struct {
-	Project string
-	A, B    string
-	// Kind names the relation type. Empty means 'co-mention'; typed
-	// relations (owns, replaces, fixes) are future extraction work.
+	Project  string
+	A, B     string
+	From, To string
+	// Kind names the relation type. Empty means 'co-mention'.
 	Kind string
 }
 
@@ -325,7 +353,7 @@ func (e ProjectEdge) kind() string {
 
 // AllTexts returns every message text, for (re)building the topic graph.
 func (db *DB) AllTexts() ([]TextDoc, error) {
-	rows, err := db.sql.Query(`SELECT project, text FROM messages`)
+	rows, err := db.sql.Query(`SELECT session_id, seq, project, text FROM messages`)
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +361,7 @@ func (db *DB) AllTexts() ([]TextDoc, error) {
 	var out []TextDoc
 	for rows.Next() {
 		var d TextDoc
-		if err := rows.Scan(&d.Project, &d.Text); err != nil {
+		if err := rows.Scan(&d.SessionID, &d.Seq, &d.Project, &d.Text); err != nil {
 			return nil, err
 		}
 		out = append(out, d)
@@ -355,18 +383,17 @@ func (db *DB) ReplaceEdges(edges map[ProjectEdge]int) error {
 		return err
 	}
 	for e, w := range edges {
-		if _, err := tx.Exec(`INSERT INTO topic_edges(project, term_a, term_b, weight, kind) VALUES(?, ?, ?, ?, ?)`,
-			e.Project, e.A, e.B, w, e.kind()); err != nil {
+		if _, err := tx.Exec(`INSERT INTO topic_edges(project, term_a, term_b, weight, kind, from_term, to_term) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+			e.Project, e.A, e.B, w, e.kind(), e.From, e.To); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// edgesSchemaVersion tracks the topic_edges layout. v2: kind is part of
-// the primary key so one pair can hold co-mention and typed edges side
-// by side.
-const edgesSchemaVersion = "2"
+// v3 distinguishes opposite directions of typed relationships and stores
+// a source sentence with each edge.
+const edgesSchemaVersion = "3"
 
 // ensureEdgesSchema recreates outdated topic_edges tables (which carry no
 // state worth migrating: a rebuild restores them).
@@ -376,6 +403,11 @@ func (db *DB) ensureEdgesSchema() error {
 	if v == edgesSchemaVersion {
 		return nil
 	}
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, q := range []string{
 		`DROP TABLE IF EXISTS topic_edges`,
 		`CREATE TABLE topic_edges(
@@ -384,18 +416,21 @@ func (db *DB) ensureEdgesSchema() error {
 			term_b TEXT NOT NULL,
 			weight INTEGER NOT NULL,
 			kind TEXT NOT NULL DEFAULT 'co-mention',
-			PRIMARY KEY(project, term_a, term_b, kind))`,
-		`INSERT INTO meta(key, value) VALUES('edges_schema', '2')
+			from_term TEXT NOT NULL DEFAULT '',
+			to_term TEXT NOT NULL DEFAULT '',
+			evidence TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(project, term_a, term_b, kind, from_term, to_term))`,
+		`INSERT INTO meta(key, value) VALUES('edges_schema', '3')
 		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
 		// The graph was just dropped: every message needs indexing again.
 		`UPDATE messages SET indexed=0`,
 		`DELETE FROM term_df`,
 	} {
-		if _, err := db.sql.Exec(q); err != nil {
+		if _, err := tx.Exec(q); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // IndexNew indexes only messages not yet indexed and advances the graph
@@ -477,12 +512,17 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 		}
 	}
 	pairDelta := map[ProjectEdge]int{}
+	evidence := map[ProjectEdge]string{}
 	for _, d := range docs {
 		for _, e := range topics.SelectPairs(d.text, getDF(d.proj), minDF, topics.HubCap(totals[d.proj], minDF)) {
 			pairDelta[ProjectEdge{Project: d.proj, A: e[0], B: e[1]}]++
 		}
 		for _, t := range topics.ExtractTyped(d.text) {
-			pairDelta[ProjectEdge{Project: d.proj, A: t.A, B: t.B, Kind: t.Kind}]++
+			e := ProjectEdge{Project: d.proj, A: t.A, B: t.B, From: t.From, To: t.To, Kind: t.Kind}
+			pairDelta[e]++
+			if evidence[e] == "" {
+				evidence[e] = fmt.Sprintf("%s#%d: %s", d.sid, d.seq, t.Evidence)
+			}
 		}
 	}
 	tx, err := db.sql.Begin()
@@ -492,9 +532,11 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 	defer tx.Rollback()
 	for e, n := range pairDelta {
 		if _, err := tx.Exec(
-			`INSERT INTO topic_edges(project, term_a, term_b, weight, kind) VALUES(?, ?, ?, ?, ?)
-			 ON CONFLICT(project, term_a, term_b, kind) DO UPDATE SET weight=topic_edges.weight+excluded.weight`,
-			e.Project, e.A, e.B, n, e.kind()); err != nil {
+			`INSERT INTO topic_edges(project, term_a, term_b, weight, kind, from_term, to_term, evidence)
+				 VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+				 ON CONFLICT(project, term_a, term_b, kind, from_term, to_term)
+				 DO UPDATE SET weight=topic_edges.weight+excluded.weight`,
+			e.Project, e.A, e.B, n, e.kind(), e.From, e.To, evidence[e]); err != nil {
 			return 0, 0, err
 		}
 	}
@@ -527,9 +569,9 @@ func (db *DB) IndexFull(minDF int) error {
 	if err != nil {
 		return err
 	}
-	groups := map[string][]string{}
+	groups := map[string][]TextDoc{}
 	for _, d := range docs {
-		groups[d.Project] = append(groups[d.Project], d.Text)
+		groups[d.Project] = append(groups[d.Project], d)
 	}
 	tx, err := db.sql.Begin()
 	if err != nil {
@@ -542,22 +584,32 @@ func (db *DB) IndexFull(minDF int) error {
 	if _, err := tx.Exec(`DELETE FROM term_df`); err != nil {
 		return err
 	}
-	for proj, texts := range groups {
+	for proj, projectDocs := range groups {
+		texts := make([]string, len(projectDocs))
+		for i, d := range projectDocs {
+			texts[i] = d.Text
+		}
 		df := topics.DocFreq(texts)
 		maxDF := topics.HubCap(len(texts), minDF)
 		edgeW := map[ProjectEdge]int{}
-		for _, t := range texts {
-			for _, e := range topics.SelectPairs(t, df, minDF, maxDF) {
+		evidence := map[ProjectEdge]string{}
+		for _, d := range projectDocs {
+			for _, e := range topics.SelectPairs(d.Text, df, minDF, maxDF) {
 				edgeW[ProjectEdge{Project: proj, A: e[0], B: e[1]}]++
 			}
-			for _, tp := range topics.ExtractTyped(t) {
-				edgeW[ProjectEdge{Project: proj, A: tp.A, B: tp.B, Kind: tp.Kind}]++
+			for _, tp := range topics.ExtractTyped(d.Text) {
+				e := ProjectEdge{Project: proj, A: tp.A, B: tp.B, From: tp.From, To: tp.To, Kind: tp.Kind}
+				edgeW[e]++
+				if evidence[e] == "" {
+					evidence[e] = fmt.Sprintf("%s#%d: %s", d.SessionID, d.Seq, tp.Evidence)
+				}
 			}
 		}
 		for e, w := range edgeW {
 			if _, err := tx.Exec(
-				`INSERT INTO topic_edges(project, term_a, term_b, weight, kind) VALUES(?, ?, ?, ?, ?)`,
-				proj, e.A, e.B, w, e.kind()); err != nil {
+				`INSERT INTO topic_edges(project, term_a, term_b, weight, kind, from_term, to_term, evidence)
+				 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+				proj, e.A, e.B, w, e.kind(), e.From, e.To, evidence[e]); err != nil {
 				return err
 			}
 		}
@@ -629,10 +681,12 @@ func dfView(df map[string]int, proj string) map[string]int {
 // names the intermediate topic (term -via-> hit). Kind is the relation
 // type ('co-mention' unless a rule extracted better).
 type RelatedHit struct {
-	Term   string
-	Weight int
-	Via    string
-	Kind   string
+	Term     string
+	Weight   int
+	Via      string
+	Kind     string
+	From, To string
+	Evidence string
 }
 
 // Related returns topics co-mentioned with term. Empty project searches
@@ -645,14 +699,15 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 	}
 	term = strings.ToLower(term)
 	neighbors := func(t string) ([]RelatedHit, error) {
-		q := `SELECT CASE WHEN term_a=? THEN term_b ELSE term_a END AS other, sum(weight), kind
+		q := `SELECT CASE WHEN term_a=? THEN term_b ELSE term_a END AS other,
+			 sum(weight), kind, from_term, to_term, min(evidence)
 			 FROM topic_edges WHERE (term_a=? OR term_b=?)`
 		args := []any{t, t, t}
 		if project != "" {
 			q += ` AND project ILIKE '%'||?||'%' ESCAPE '\'`
 			args = append(args, escapeLike(project))
 		}
-		q += ` GROUP BY other, kind`
+		q += ` GROUP BY other, kind, from_term, to_term`
 		rows, err := db.sql.Query(q, args...)
 		if err != nil {
 			return nil, err
@@ -661,7 +716,7 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 		var out []RelatedHit
 		for rows.Next() {
 			var h RelatedHit
-			if err := rows.Scan(&h.Term, &h.Weight, &h.Kind); err != nil {
+			if err := rows.Scan(&h.Term, &h.Weight, &h.Kind, &h.From, &h.To, &h.Evidence); err != nil {
 				return nil, err
 			}
 			out = append(out, h)
@@ -675,12 +730,16 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 		return nil, err
 	}
 	for _, h := range first {
-		seen[h.Term+"\x00"+h.Kind] = h
+		seen[relatedKey(h)] = h
 		if w, ok := direct[h.Term]; !ok || h.Weight > w {
 			direct[h.Term] = h.Weight
 		}
 	}
 	if depth >= 2 {
+		directKeys := map[string]bool{}
+		for key := range seen {
+			directKeys[key] = true
+		}
 		// Expand only the strongest direct neighbors: expanding every
 		// neighbor lets glue verbs (check, want, see) flood two-hop results.
 		ordered := make([]RelatedHit, 0, len(direct))
@@ -701,9 +760,14 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 				if h.Term == term {
 					continue
 				}
-				key := h.Term + "\x00" + h.Kind
+				key := relatedKey(h)
+				if directKeys[key] {
+					continue
+				}
 				if cur, ok := seen[key]; !ok || w1+h.Weight > cur.Weight {
-					seen[key] = RelatedHit{Term: h.Term, Weight: w1 + h.Weight, Via: via, Kind: h.Kind}
+					h.Weight += w1
+					h.Via = via
+					seen[key] = h
 				}
 			}
 		}
@@ -722,6 +786,10 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 // maxVia bounds depth-2 expansion to the strongest direct neighbors.
 const maxVia = 8
 
+func relatedKey(h RelatedHit) string {
+	return h.Term + "\x00" + h.Kind + "\x00" + h.From + "\x00" + h.To
+}
+
 // sortHits ranks typed relations above co-mentions, then by weight: a
 // rule-extracted link outranks any number of bare co-mentions.
 func sortHits(h []RelatedHit) {
@@ -739,6 +807,12 @@ func sortHits(h []RelatedHit) {
 		}
 		if a.Kind != b.Kind {
 			return a.Kind < b.Kind
+		}
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		if a.To != b.To {
+			return a.To < b.To
 		}
 		return a.Via < b.Via
 	})
