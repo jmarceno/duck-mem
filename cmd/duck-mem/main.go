@@ -175,9 +175,20 @@ func daemonCmd(args []string) {
 // IndexNew skips indexed messages, so repeated cycles only pay for what
 // changed (plus a directory walk).
 func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
+	cursorProjects := map[string]map[string]string{}
 	for _, f := range ingest.Discover(roots) {
 		files++
-		sess, msgs, err := ingest.IngestFile(f)
+		var projects map[string]string
+		if ingest.Classify(f) == ingest.KindCursorTranscript {
+			home := ingest.CursorHome(f)
+			var ok bool
+			projects, ok = cursorProjects[home]
+			if !ok {
+				projects = ingest.LoadCursorProjects(home)
+				cursorProjects[home] = projects
+			}
+		}
+		sess, msgs, err := ingest.IngestFileWithCursorProjects(f, projects)
 		if err != nil || sess.ID == "" {
 			nSkip++
 			continue

@@ -32,7 +32,11 @@ environment snapshots, queue/metadata records.
 | Codex | `~/.codex/sessions/**/*.jsonl`, `~/.codex/archived_sessions/*.jsonl` | `session_meta`/`turn_context` cwd |
 | Claude | `~/.claude/projects/*/*.jsonl` | record `cwd` |
 | Muse | `…/muse/sessions/**/**/session.jsonl` (incl. `subagent/`) | `route_facts` cwd / `workspace_root` |
-| Cursor | `~/.cursor/projects/*/agent-transcripts/*/*.jsonl`, `~/.cursor/plans/*.plan.md` (whole plan = one `note`) | transcript path slug / — |
+| Cursor | `~/.cursor/projects/*/agent-transcripts/*/*.jsonl`, `~/.cursor/plans/*.plan.md` (whole plan = one `note`) | transcript slug matched to `~/.config/Cursor/User/workspaceStorage/*/workspace.json` / — |
+
+Cursor transcript projects use the workspace metadata's folder path, including
+hyphenated names and worktrees. Unmapped or ambiguous slugs stay as
+`cursor:<slug>` rather than becoming an invented filesystem path.
 
 Cursor's pre-migration composer blobs in `workspaceStorage/state.vscdb` are
 not parsed (only migrated IDs remain there); transcripts + plans are covered.
@@ -114,8 +118,6 @@ pass rebuilds the graph to remove stale relationships.
   over `topic_edges` once the extension story is solid.
 - **VSS semantic search.** Keyword match misses synonyms/paraphrases; an
   embedding column on `messages` plus `related`-style fusion is the fix.
-- **Cursor slug decoding.** Dashes in project names decode wrong
-  (`omen-the-game` → `omen/the/game`); needs a workspace-mapping lookup.
 
 ## Tests
 

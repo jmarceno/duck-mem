@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"duck-mem/internal/store"
 )
@@ -78,6 +80,15 @@ func Discover(roots []string) []string {
 
 // IngestFile parses one session file into a session plus kept messages.
 func IngestFile(path string) (store.Session, []store.Message, error) {
+	if Classify(path) == KindCursorTranscript {
+		return IngestFileWithCursorProjects(path, LoadCursorProjects(CursorHome(path)))
+	}
+	return IngestFileWithCursorProjects(path, nil)
+}
+
+// IngestFileWithCursorProjects avoids reloading Cursor's workspace mapping
+// for every transcript in an ingest cycle.
+func IngestFileWithCursorProjects(path string, projects map[string]string) (store.Session, []store.Message, error) {
 	switch Classify(path) {
 	case KindCodex:
 		return parseCodex(path)
@@ -86,7 +97,7 @@ func IngestFile(path string) (store.Session, []store.Message, error) {
 	case KindMuse:
 		return parseMuse(path)
 	case KindCursorTranscript:
-		return parseCursorTranscript(path)
+		return parseCursorTranscript(path, projects)
 	case KindCursorPlan:
 		return parseCursorPlan(path)
 	}
@@ -513,8 +524,8 @@ func parseMuse(path string) (store.Session, []store.Message, error) {
 
 // ---- Cursor agent transcripts ----
 
-func parseCursorTranscript(path string) (store.Session, []store.Message, error) {
-	sess := newSession("", "cursor", decodeCursorProject(path), path, time.Time{})
+func parseCursorTranscript(path string, projects map[string]string) (store.Session, []store.Message, error) {
+	sess := newSession("", "cursor", cursorProject(path, projects), path, time.Time{})
 	c := &collector{sess: sess}
 	err := readLines(path, func(o map[string]any) {
 		role, _ := o["role"].(string)
@@ -554,20 +565,82 @@ func parseCursorTranscript(path string) (store.Session, []store.Message, error) 
 	return sess, c.msgs, nil
 }
 
-// decodeCursorProject maps ~/.cursor/projects/<slug>/... back to a path.
-// Slugs join path segments with '-': home-jmarceno-Projects-x -> /home/.../x.
-// Names that originally contained dashes are ambiguous; best effort only.
-func decodeCursorProject(path string) string {
-	idx := strings.Index(path, "/projects/")
-	if idx < 0 {
+// CursorHome finds the home directory for a Cursor transcript path.
+func CursorHome(path string) string {
+	if i := strings.Index(path, "/.cursor/projects/"); i >= 0 {
+		return path[:i]
+	}
+	home, _ := os.UserHomeDir()
+	return home
+}
+
+// LoadCursorProjects uses Cursor's workspace metadata as the authoritative
+// slug-to-folder mapping. Ambiguous or missing slugs stay unresolved.
+func LoadCursorProjects(home string) map[string]string {
+	files, _ := filepath.Glob(filepath.Join(home, ".config", "Cursor", "User", "workspaceStorage", "*", "workspace.json"))
+	projects := map[string]string{}
+	ambiguous := map[string]bool{}
+	for _, file := range files {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		var workspace struct {
+			Folder string `json:"folder"`
+		}
+		if json.Unmarshal(raw, &workspace) != nil {
+			continue
+		}
+		u, err := url.Parse(workspace.Folder)
+		if err != nil || u.Scheme != "file" || u.Host != "" || !filepath.IsAbs(u.Path) {
+			continue
+		}
+		folder := filepath.Clean(u.Path)
+		slug := cursorSlug(folder)
+		if old, ok := projects[slug]; ok && old != folder {
+			ambiguous[slug] = true
+		} else {
+			projects[slug] = folder
+		}
+	}
+	for slug := range ambiguous {
+		delete(projects, slug)
+	}
+	return projects
+}
+
+func cursorSlug(path string) string {
+	var b strings.Builder
+	for i, segment := range strings.Split(strings.Trim(path, string(filepath.Separator)), string(filepath.Separator)) {
+		if i > 0 {
+			b.WriteByte('-')
+		}
+		for _, r := range strings.TrimLeft(segment, ".") {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' {
+				b.WriteRune(r)
+			} else {
+				b.WriteByte('-')
+			}
+		}
+	}
+	return b.String()
+}
+
+func cursorProject(path string, projects map[string]string) string {
+	i := strings.Index(path, "/.cursor/projects/")
+	if i < 0 {
 		return ""
 	}
-	rest := path[idx+len("/projects/"):]
-	slug := rest
-	if i := strings.Index(slug, "/"); i >= 0 {
-		slug = slug[:i]
+	rest := path[i+len("/.cursor/projects/"):]
+	slug, _, ok := strings.Cut(rest, "/")
+	if !ok {
+		return ""
 	}
-	return "/" + strings.ReplaceAll(slug, "-", "/")
+	if project := projects[slug]; project != "" {
+		return project
+	}
+	// The slug alone is useful for filters, but it is not a valid path.
+	return "cursor:" + slug
 }
 
 // ---- Cursor plan files ----

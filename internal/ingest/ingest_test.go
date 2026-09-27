@@ -70,7 +70,8 @@ func TestIngestKeepsConversationDropsToolCalls(t *testing.T) {
 		`{"payload_type":"runtime.session","stream":{"id":"m1"},"recorded_at":1789984409400001,"payload":{"event":{"kind":"output","chunk":"some tool output"}}}`,
 	}, "\n"))
 
-	cursor := dir + "/x/projects/home-u-Proj/agent-transcripts/t1/t1.jsonl"
+	cursor := dir + "/.cursor/projects/home-u-Proj/agent-transcripts/t1/t1.jsonl"
+	writeTemp(t, dir+"/.config/Cursor/User/workspaceStorage/one/workspace.json", `{"folder":"file:///home/u/Proj"}`)
 	writeTemp(t, cursor, strings.Join([]string{
 		`{"role":"user","message":{"content":[{"type":"text","text":"paint the redship hull"}]}}`,
 		`{"role":"assistant","message":{"content":[{"type":"text","text":"painting"},{"type":"tool_use","name":"Read","input":{"path":"/etc/passwd"}}]}}`,
@@ -129,5 +130,34 @@ func TestIngestKeepsConversationDropsToolCalls(t *testing.T) {
 				t.Errorf("%s: tool/reasoning text leaked: %q", path, s)
 			}
 		}
+	}
+}
+
+func TestCursorProjectMappingPreservesHyphenatedNames(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "Projects", "omen-the-game")
+	slug := cursorSlug(project)
+	writeTemp(t, filepath.Join(home, ".config/Cursor/User/workspaceStorage/one/workspace.json"),
+		`{"folder":"file://`+project+`"}`)
+	worktree := filepath.Join(home, ".cursor", "worktrees", "omen-the-game", "k1by")
+	writeTemp(t, filepath.Join(home, ".config/Cursor/User/workspaceStorage/two/workspace.json"),
+		`{"folder":"file://`+worktree+`"}`)
+	path := filepath.Join(home, ".cursor/projects", slug, "agent-transcripts", "s", "s.jsonl")
+	writeTemp(t, path, `{"role":"user","message":{"content":[{"type":"text","text":"hello"}]}}`)
+	sess, msgs, err := IngestFile(path)
+	if err != nil || sess.Project != project || len(msgs) != 1 || msgs[0].Project != project {
+		t.Fatalf("workspace mapping failed: session=%+v messages=%+v err=%v", sess, msgs, err)
+	}
+	worktreePath := filepath.Join(home, ".cursor/projects", cursorSlug(worktree), "agent-transcripts", "w", "w.jsonl")
+	writeTemp(t, worktreePath, `{"role":"user","message":{"content":[{"type":"text","text":"worktree"}]}}`)
+	sess, _, err = IngestFile(worktreePath)
+	if err != nil || sess.Project != worktree || strings.Contains(cursorSlug(worktree), "--cursor") {
+		t.Fatalf("worktree slug mapping failed: session=%+v err=%v", sess, err)
+	}
+	unknown := filepath.Join(home, ".cursor/projects", slug+"-missing", "agent-transcripts", "s2", "s2.jsonl")
+	writeTemp(t, unknown, `{"role":"user","message":{"content":[{"type":"text","text":"hello"}]}}`)
+	sess, _, err = IngestFile(unknown)
+	if err != nil || sess.Project != "cursor:"+slug+"-missing" {
+		t.Fatalf("unknown slug became an invented path: session=%+v err=%v", sess, err)
 	}
 }
