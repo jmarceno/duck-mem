@@ -2,6 +2,8 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -61,6 +63,21 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// OpenReadOnly opens the database without taking the write lock, so
+// query/related work while the daemon holds the file. Skips schema init:
+// a missing database is an error, not an empty store. This also enforces
+// the agents-read-only contract at the API level.
+func OpenReadOnly(path string) (*DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("database not found: %s (run ingest or daemon first)", path)
+	}
+	sdb, err := sql.Open("duckdb", path+"?access_mode=READ_ONLY")
+	if err != nil {
+		return nil, err
+	}
+	return &DB{sql: sdb}, nil
 }
 
 func (db *DB) init() error {

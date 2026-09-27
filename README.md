@@ -44,7 +44,19 @@ duck-mem ingest [--db PATH] [ROOT...]   # default roots cover all four stores ab
 duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>
 duck-mem index [--db PATH] [--min-df N] [--full] # incremental; --full rebuilds
 duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
+duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
 ```
+
+## Daemon
+
+`daemon` runs ingest + incremental index on a loop (default every 5
+minutes), logging one line per cycle to stdout. Foreground for now; the
+service unit comes later. Each cycle opens the database and closes it
+again: DuckDB allows one process at a time, so holding the file would
+block queries — CLI commands additionally retry through the brief
+mid-cycle lock. Stop with SIGINT/SIGTERM; the daemon finishes its line
+and exits (`daemon stop after N cycles`). No LLM is involved anywhere
+in this path.
 
 ## Topic relationships
 

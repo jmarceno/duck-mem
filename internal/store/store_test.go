@@ -76,6 +76,41 @@ func TestSearchFindsByKeywordFiltersAndDedupes(t *testing.T) {
 	}
 }
 
+func TestReadOnlyOpenReadsAndRefusesMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.duckdb")
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.UpsertSession(Session{ID: "s1", Source: "codex", Project: "p", Path: "f"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.InsertMessages([]Message{
+		{SessionID: "s1", Seq: 0, Source: "codex", Project: "p", Role: "user", Text: "readonly zephyrturbine read"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = writer.Close()
+	// Cross-process reads-while-daemon-writes are covered by live E2E
+	// (same-process second opens share one DuckDB instance); here the
+	// read-only DSN must connect and see committed rows.
+	reader, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	hits, err := reader.Search("zephyrturbine", "", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("got %d hits want 1", len(hits))
+	}
+	if _, err := OpenReadOnly(filepath.Join(t.TempDir(), "nope.duckdb")); err == nil {
+		t.Fatal("expected error for missing database")
+	}
+}
+
 func TestRelatedRanksDirectAndTwoHop(t *testing.T) {
 	db := openTemp(t)
 	if err := db.ReplaceEdges(map[ProjectEdge]int{

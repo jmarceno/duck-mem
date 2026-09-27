@@ -3,11 +3,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"duck-mem/internal/ingest"
 	"duck-mem/internal/store"
@@ -32,6 +36,8 @@ func main() {
 		indexCmd(os.Args[2:])
 	case "related":
 		relatedCmd(os.Args[2:])
+	case "daemon":
+		daemonCmd(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		usage()
@@ -45,6 +51,7 @@ func usage() {
   duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>
   duck-mem index [--db PATH] [--min-df N] rebuild the topic co-mention graph
   duck-mem related [--db PATH] [--depth 1|2] [--limit N] <term>
+  duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
 `)
 }
 
@@ -92,15 +99,84 @@ func ingestCmd(args []string) {
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o755); err != nil {
 		fatal(err)
 	}
-	db, err := store.Open(*dbPath)
+	db, err := openTolerant(*dbPath, false)
 	if err != nil {
 		fatal(err)
 	}
 	defer db.Close()
 
-	files := ingest.Discover(roots)
-	var nSess, nMsg, nSkip int
-	for _, f := range files {
+	files, nSess, nMsg, nSkip := runCycle(db, roots)
+	fmt.Printf("files=%d sessions=%d messages=%d skipped=%d db=%s\n", files, nSess, nMsg, nSkip, *dbPath)
+	newMsgs, newPairs, err := db.IndexNew(2)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("index: +%d messages, +%d pairs\n", newMsgs, newPairs)
+}
+
+func daemonCmd(args []string) {
+	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDB(), "DuckDB file")
+	every := fs.String("interval", "5m", "ingest cadence (Go duration: 30s, 5m, 1h)")
+	flagArgs, positional := splitArgs(args, map[string]bool{"--db": true, "--interval": true})
+	_ = fs.Parse(flagArgs)
+	fs.Parse(positional)
+	interval, err := time.ParseDuration(*every)
+	if err != nil || interval <= 0 {
+		fmt.Fprintln(os.Stderr, "daemon needs a positive --interval duration")
+		os.Exit(2)
+	}
+	roots := fs.Args()
+	if len(roots) == 0 {
+		home, _ := os.UserHomeDir()
+		roots = ingest.DefaultRoots(home)
+	}
+	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o755); err != nil {
+		fatal(err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fmt.Printf("%s daemon start db=%s interval=%s roots=%d\n",
+		time.Now().UTC().Format(time.RFC3339), *dbPath, interval, len(roots))
+	cycle := func(n int) {
+		// Open per cycle and close right after: DuckDB allows one
+		// process at a time, so holding the file would block queries
+		// for the daemon's whole lifetime.
+		db, err := store.Open(*dbPath)
+		if err != nil {
+			fmt.Printf("%s cycle=%d open error: %v\n", time.Now().UTC().Format(time.RFC3339), n, err)
+			return
+		}
+		files, nSess, nMsg, nSkip := runCycle(db, roots)
+		newMsgs, newPairs, err := db.IndexNew(2)
+		_ = db.Close()
+		if err != nil {
+			fmt.Printf("%s cycle=%d error: %v\n", time.Now().UTC().Format(time.RFC3339), n, err)
+			return
+		}
+		fmt.Printf("%s cycle=%d files=%d sessions=%d messages=%d skipped=%d indexed=+%d pairs=+%d\n",
+			time.Now().UTC().Format(time.RFC3339), n, files, nSess, nMsg, nSkip, newMsgs, newPairs)
+	}
+	cycle(0)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for n := 1; ; n++ {
+		select {
+		case <-ctx.Done():
+			fmt.Printf("%s daemon stop after %d cycles\n", time.Now().UTC().Format(time.RFC3339), n)
+			return
+		case <-ticker.C:
+			cycle(n)
+		}
+	}
+}
+
+// runCycle ingests every discoverable file. Inserts are idempotent and
+// IndexNew skips indexed messages, so repeated cycles only pay for what
+// changed (plus a directory walk).
+func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
+	for _, f := range ingest.Discover(roots) {
+		files++
 		sess, msgs, err := ingest.IngestFile(f)
 		if err != nil || sess.ID == "" {
 			nSkip++
@@ -117,12 +193,7 @@ func ingestCmd(args []string) {
 		nSess++
 		nMsg += len(msgs)
 	}
-	fmt.Printf("files=%d sessions=%d messages=%d skipped=%d db=%s\n", len(files), nSess, nMsg, nSkip, *dbPath)
-	newMsgs, newPairs, err := db.IndexNew(2)
-	if err != nil {
-		fatal(err)
-	}
-	fmt.Printf("index: +%d messages, +%d pairs\n", newMsgs, newPairs)
+	return files, nSess, nMsg, nSkip
 }
 
 func indexCmd(args []string) {
@@ -132,7 +203,7 @@ func indexCmd(args []string) {
 	full := fs.Bool("full", false, "full rebuild: exact thresholds, heals drift (run weekly)")
 	flagArgs, _ := splitArgs(args, map[string]bool{"--db": true, "--min-df": true, "--full": false})
 	_ = fs.Parse(flagArgs)
-	db, err := store.Open(*dbPath)
+	db, err := openTolerant(*dbPath, false)
 	if err != nil {
 		fatal(err)
 	}
@@ -165,7 +236,7 @@ func relatedCmd(args []string) {
 		fmt.Fprintln(os.Stderr, "related needs a term")
 		os.Exit(2)
 	}
-	db, err := store.Open(*dbPath)
+	db, err := openTolerant(*dbPath, true)
 	if err != nil {
 		fatal(err)
 	}
@@ -201,7 +272,7 @@ func queryCmd(args []string) {
 		fmt.Fprintln(os.Stderr, "query needs search text")
 		os.Exit(2)
 	}
-	db, err := store.Open(*dbPath)
+	db, err := openTolerant(*dbPath, true)
 	if err != nil {
 		fatal(err)
 	}
@@ -246,4 +317,27 @@ func oneLine(s string) string {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "error:", err)
 	os.Exit(1)
+}
+
+// openTolerant retries opens that fail only because another process
+// (usually the daemon mid-cycle) holds DuckDB's single-process lock.
+// Any other error returns immediately.
+func openTolerant(path string, readOnly bool) (*store.DB, error) {
+	var err error
+	var db *store.DB
+	for i := 0; i < 12; i++ {
+		if readOnly {
+			db, err = store.OpenReadOnly(path)
+		} else {
+			db, err = store.Open(path)
+		}
+		if err == nil {
+			return db, nil
+		}
+		if !strings.Contains(err.Error(), "Could not set lock") {
+			return nil, err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return nil, err
 }
