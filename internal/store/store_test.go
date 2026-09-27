@@ -3,9 +3,12 @@ package store
 import (
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"duck-mem/internal/embed"
 )
 
 func openTemp(t *testing.T) *DB {
@@ -18,15 +21,19 @@ func openTemp(t *testing.T) *DB {
 	return db
 }
 
-func TestSearchFindsByKeywordFiltersAndDedupes(t *testing.T) {
+func TestSearchFindsBySimilarityFiltersAndDedupes(t *testing.T) {
 	db := openTemp(t)
 	sess := Session{ID: "s1", Source: "codex", Project: "/home/u/organizer", Path: "f", StartedAt: time.Now()}
 	if err := db.UpsertSession(sess); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.UpsertSession(Session{ID: "s2", Source: "codex", Project: "/home/u/organizer", Path: "g"}); err != nil {
+		t.Fatal(err)
+	}
 	msgs := []Message{
 		{SessionID: "s1", Seq: 0, Source: "codex", Project: "/home/u/organizer", Role: "user", Text: "fix the redship bug"},
-		{SessionID: "s1", Seq: 1, Source: "codex", Project: "/home/u/organizer", Role: "assistant", Text: "redship fixed and deployed"},
+		{SessionID: "s1", Seq: 1, Source: "codex", Project: "/home/u/organizer", Role: "assistant", Text: "redship deployed"},
+		{SessionID: "s2", Seq: 0, Source: "codex", Project: "/home/u/organizer", Role: "user", Text: "unrelated quartermaster ledger"},
 	}
 	if err := db.InsertMessages(msgs); err != nil {
 		t.Fatal(err)
@@ -37,15 +44,20 @@ func TestSearchFindsByKeywordFiltersAndDedupes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(hits) != 2 {
-		t.Fatalf("got %d hits want 2", len(hits))
+		t.Fatalf("got %d hits want 2: %+v", len(hits), hits)
 	}
 
-	hits, err = db.Search("redship fixed", "", "", 10)
+	hits, err = db.Search("redship deployed", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hits) != 1 || hits[0].Seq != 1 {
-		t.Fatalf("AND-match failed: %+v", hits)
+	if len(hits) == 0 || hits[0].Seq != 1 || hits[0].SessionID != "s1" {
+		t.Fatalf("closest message should be the deployed one: %+v", hits)
+	}
+	for _, h := range hits {
+		if h.SessionID == "s2" {
+			t.Fatalf("unrelated message ranked as similar: %+v", hits)
+		}
 	}
 
 	hits, err = db.Search("redship", "omen", "", 10)
@@ -72,8 +84,25 @@ func TestSearchFindsByKeywordFiltersAndDedupes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 2 {
+	if n != 3 {
 		t.Fatalf("duplicate messages stored: n=%d", n)
+	}
+}
+
+func TestSearchPlanUsesHNSW(t *testing.T) {
+	db := openTemp(t)
+	insertMsg(t, db, "s", 0, "zephyrturbine spins")
+	vec := vectorLiteral(mustEmbed(t, "zephyrturbine"))
+	var key, plan string
+	err := db.sql.QueryRow(`EXPLAIN SELECT session_id FROM messages
+		WHERE embedding IS NOT NULL AND contains(lower(project), lower(?))
+		ORDER BY array_cosine_distance(embedding, ?::FLOAT[`+strconv.Itoa(embedDim())+`])
+		LIMIT 5`, "p", vec).Scan(&key, &plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, "HNSW_INDEX_SCAN") {
+		t.Fatalf("similarity search did not use the vss index:\n%s", plan)
 	}
 }
 
@@ -130,6 +159,11 @@ func TestReadOnlyOpenReadsAndRefusesMissing(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := writer.ReplaceEdges(map[ProjectEdge]int{
+		{Project: "p", A: "zephyrturbine", B: "read"}: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	_ = writer.Close()
 	// Cross-process reads-while-daemon-writes are covered by live E2E
 	// (same-process second opens share one DuckDB instance); here the
@@ -145,6 +179,10 @@ func TestReadOnlyOpenReadsAndRefusesMissing(t *testing.T) {
 	}
 	if len(hits) != 1 {
 		t.Fatalf("got %d hits want 1", len(hits))
+	}
+	related, err := reader.Related("zephyrturbine", "p", 1, 5)
+	if err != nil || len(related) != 1 || related[0].Term != "read" {
+		t.Fatalf("read-only graph traversal: %+v err=%v", related, err)
 	}
 	if _, err := OpenReadOnly(filepath.Join(t.TempDir(), "nope.duckdb")); err == nil {
 		t.Fatal("expected error for missing database")
@@ -203,6 +241,17 @@ func TestRelatedAggregatesAcrossProjects(t *testing.T) {
 	if len(hits) != 1 || hits[0].Term != "sentry" || hits[0].Weight != 5 {
 		t.Fatalf("expected aggregated weight 5, got %+v", hits)
 	}
+}
+
+func embedDim() int { return embed.Dim }
+
+func mustEmbed(t *testing.T, text string) []float32 {
+	t.Helper()
+	v := embed.Embed(text)
+	if v == nil {
+		t.Fatalf("no embedding for %q", text)
+	}
+	return v
 }
 
 func insertMsg(t *testing.T, db *DB, sid string, seq int, text string) {
@@ -386,6 +435,7 @@ func TestIndexMigratesOldGraphToDirectedEvidence(t *testing.T) {
 	db := openTemp(t)
 	insertMsg(t, db, "legacy", 0, "Bastion replaces Sentry.")
 	for _, q := range []string{
+		`DROP PROPERTY GRAPH IF EXISTS topic_graph`,
 		`DROP TABLE topic_edges`,
 		`CREATE TABLE topic_edges(project TEXT, term_a TEXT, term_b TEXT, weight INTEGER, kind TEXT,
 		 PRIMARY KEY(project, term_a, term_b, kind))`,

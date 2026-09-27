@@ -70,7 +70,7 @@ func usage() {
   duck-mem ingest [--db PATH] [ROOT...]   ingest session logs (default roots when omitted)
   duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>
   duck-mem index [--db PATH] [--min-df N] [--full] rebuild the topic graph
-  duck-mem related [--db PATH] [--depth 1|2] [--limit N] <term>
+  duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
   duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
 `)
 }

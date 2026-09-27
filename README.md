@@ -14,7 +14,7 @@ with an index, filtered via `WHERE project ILIKE '%<name>%'`.
 ```sql
 sessions(session_id TEXT PRIMARY KEY, source, project, started_at, path)
 messages(session_id, seq, source, project, role, text, created_at,
-         PRIMARY KEY(session_id, seq))
+         embedding FLOAT[384], PRIMARY KEY(session_id, seq))
 ```
 
 ## Kept vs dropped per source
@@ -51,7 +51,7 @@ duck-mem --uninstall --keep-data     # noninteractive equivalent
 duck-mem --uninstall --purge-data    # delete duck-mem data/config after stopping services
 
 duck-mem ingest [--db PATH] [ROOT...]   # default roots cover all five stores above
-duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>
+duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>  # cosine similarity (vss)
 duck-mem index [--db PATH] [--min-df N] [--full] # incremental; --full rebuilds
 duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
 duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
@@ -88,18 +88,27 @@ mid-cycle lock. Stop with SIGINT/SIGTERM; the daemon finishes its line
 and exits (`daemon stop after N cycles`). No LLM is involved anywhere
 in this path.
 
+## Search
+
+`query` embeds the words (content terms plus adjacent pairs, hashed into
+a unit vector) and asks DuckDB's `vss` HNSW index for the nearest messages
+by cosine distance. Project and source only filter that ranking. There is
+no keyword scan: a message comes back when its vector is close, and
+unrelated text stays out.
+
 ## Topic relationships
 
-`related` answers "what is discussed together with X" from a co-mention
-graph (`topic_edges`): two terms share an edge weighted by how many messages
-mention both. Depth 2 follows neighbors-of-neighbors (`term -via-> hit`),
-expanding only the 8 strongest direct links. Typed relations outrank
-bare co-mentions: rule extraction finds possessive `X's Y` (owns) and
-replacement verbs / "instead of" (replaces) per sentence, e.g.
-`bastion --owns--> turret` and `sentry --replaces--> dome`. Typed edges
-preserve direction and a source `session#seq` plus sentence in `related`
-output. The first index run after upgrading rebuilds the graph for this
-schema. Co-mentions remain undirected and do not assert causality.
+`related` answers "what is discussed together with X" by a `duckpgq`
+traversal of `topic_edges`. Two terms share an edge weighted by how many
+messages mention both. Depth 2 follows neighbors-of-neighbors
+(`term -via-> hit`), expanding only the 8 strongest direct links. Typed
+relations outrank bare co-mentions: rule extraction finds possessive
+`X's Y` (owns) and replacement verbs / "instead of" (replaces) per
+sentence, e.g. `bastion --owns--> turret` and `sentry --replaces--> dome`.
+Typed edges preserve direction and a source `session#seq` plus sentence
+in `related` output. The first index run after upgrading rebuilds the
+graph for this schema. Co-mentions are stored in both directions so the
+traversal can walk either way; they do not assert causality.
 
 ## Indexing: incremental by default, full weekly
 
@@ -136,18 +145,13 @@ pass rebuilds the graph to remove stale relationships.
 - **Weight-1 pruning.** ~83% of edges have weight 1. A flag to drop them at
   index or query time would cut the graph ~6x — at the cost of rare links
   like `bastion–turret`, so it stays opt-in.
-- **duckpgq path queries.** Multi-hop "how is Bastion connected to Cataclysm"
-  over `topic_edges` once the extension story is solid.
-- **VSS semantic search.** Keyword match misses synonyms/paraphrases; an
-  embedding column on `messages` plus `related`-style fusion is the fix.
-
 ## Tests
 
 Per AGENTS.md methodology (no E2E, no existence assertions, smallest set):
 
 - `internal/ingest/ingest_test.go` and `opencode_test.go` — conversation fixtures per source:
   user/assistant text kept, tool calls/outputs/reasoning dropped.
-- `internal/store/store_test.go` — keyword AND-match, project filter,
+- `internal/store/store_test.go` — cosine similarity, project filter,
   re-ingest dedupe, related ranking (typed-first, depth-2 via cap),
   incremental index idempotency, full-rebuild drift healing.
 - `internal/topics/topics_test.go` — term extraction, glue/stopword drops,

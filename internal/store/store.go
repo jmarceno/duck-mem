@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"strconv"
+
+	"duck-mem/internal/embed"
 	"duck-mem/internal/topics"
 
 	_ "github.com/marcboeker/go-duckdb/v2"
@@ -48,8 +51,13 @@ type Hit struct {
 	Score     float64
 }
 
-// DB wraps the DuckDB handle.
-type DB struct{ sql *sql.DB }
+// DB wraps the DuckDB handle. readOnly sessions attach the file from an
+// in-memory connection so duckpgq can build its property graph without
+// writing the memory file.
+type DB struct {
+	sql      *sql.DB
+	readOnly bool
+}
 
 // FileCheckpoint records the file state already reflected in messages.
 type FileCheckpoint struct {
@@ -64,13 +72,13 @@ type FileCheckpoint struct {
 }
 
 // Open creates/opens the DuckDB file and initializes the schema.
-// Already installed extensions load best-effort. Opening a database must not
-// download extensions: neither is needed by the current search or index.
+// vss and duckpgq are required: search and related do not run without them.
 func Open(path string) (*DB, error) {
 	sdb, err := sql.Open("duckdb", path)
 	if err != nil {
 		return nil, err
 	}
+	sdb.SetMaxOpenConns(1)
 	db := &DB{sql: sdb}
 	if err := db.init(); err != nil {
 		_ = sdb.Close()
@@ -79,33 +87,63 @@ func Open(path string) (*DB, error) {
 	return db, nil
 }
 
-// OpenReadOnly opens the database without taking the write lock, so
-// query/related work while the daemon holds the file. Skips schema init:
-// a missing database is an error, not an empty store. This also enforces
-// the agents-read-only contract at the API level.
+// OpenReadOnly attaches the database file read-only from an in-memory
+// DuckDB. Query and related then run vss and duckpgq against that file
+// without taking its write lock. A missing database is an error.
 func OpenReadOnly(path string) (*DB, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("database not found: %s (run ingest or daemon first)", path)
 	}
-	sdb, err := sql.Open("duckdb", path+"?access_mode=READ_ONLY")
+	sdb, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, err
 	}
-	// sql.Open is lazy. Force the connection now so callers can retry a
-	// transient writer lock instead of failing on their first query.
+	sdb.SetMaxOpenConns(1)
+	db := &DB{sql: sdb, readOnly: true}
+	if err := loadExtensions(sdb); err != nil {
+		_ = sdb.Close()
+		return nil, err
+	}
+	if _, err := sdb.Exec(fmt.Sprintf(`ATTACH '%s' AS src (READ_ONLY)`, strings.ReplaceAll(path, `'`, `''`))); err != nil {
+		_ = sdb.Close()
+		return nil, err
+	}
+	// The property graph lives on this connection. Creating it before USE
+	// writes duckpgq's catalog into memory, not into the attached file.
+	if err := db.ensurePropertyGraph(); err != nil {
+		_ = sdb.Close()
+		return nil, err
+	}
+	if _, err := sdb.Exec(`USE src`); err != nil {
+		_ = sdb.Close()
+		return nil, err
+	}
 	if err := sdb.Ping(); err != nil {
 		_ = sdb.Close()
 		return nil, err
 	}
-	return &DB{sql: sdb}, nil
+	return db, nil
+}
+
+func loadExtensions(sdb *sql.DB) error {
+	for _, q := range []string{
+		`INSTALL vss`,
+		`LOAD vss`,
+		`INSTALL duckpgq FROM community`,
+		`LOAD duckpgq`,
+		`SET hnsw_enable_experimental_persistence = true`,
+		`SET hnsw_ef_search = 256`,
+	} {
+		if _, err := sdb.Exec(q); err != nil {
+			return fmt.Errorf("%s: %w", q, err)
+		}
+	}
+	return nil
 }
 
 func (db *DB) init() error {
-	for _, q := range []string{
-		`LOAD vss`,
-		`LOAD duckpgq`,
-	} {
-		_, _ = db.sql.Exec(q)
+	if err := loadExtensions(db.sql); err != nil {
+		return err
 	}
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS sessions(
@@ -125,16 +163,6 @@ func (db *DB) init() error {
 			PRIMARY KEY(session_id, seq))`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source)`,
-		`CREATE TABLE IF NOT EXISTS topic_edges(
-			project TEXT NOT NULL DEFAULT '',
-			term_a TEXT NOT NULL,
-			term_b TEXT NOT NULL,
-			weight INTEGER NOT NULL,
-			kind TEXT NOT NULL DEFAULT 'co-mention',
-			from_term TEXT NOT NULL DEFAULT '',
-			to_term TEXT NOT NULL DEFAULT '',
-			evidence TEXT NOT NULL DEFAULT '',
-			PRIMARY KEY(project, term_a, term_b, kind, from_term, to_term))`,
 		// term_df holds per-project document frequencies so incremental
 		// runs make the same keep/drop decisions as a full rebuild.
 		`CREATE TABLE IF NOT EXISTS term_df(
@@ -166,21 +194,25 @@ func (db *DB) init() error {
 	// mismatch.
 	for _, q := range []string{
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS indexed INTEGER`,
-		`ALTER TABLE topic_edges ADD COLUMN IF NOT EXISTS kind TEXT`,
-		`ALTER TABLE topic_edges ADD COLUMN IF NOT EXISTS from_term TEXT`,
-		`ALTER TABLE topic_edges ADD COLUMN IF NOT EXISTS to_term TEXT`,
-		`ALTER TABLE topic_edges ADD COLUMN IF NOT EXISTS evidence TEXT`,
+		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS embedding FLOAT[` + strconv.Itoa(embed.Dim) + `]`,
 		`UPDATE messages SET indexed=1 WHERE indexed IS NULL`,
-		`UPDATE topic_edges SET kind='co-mention' WHERE kind IS NULL`,
-		`UPDATE topic_edges SET from_term='' WHERE from_term IS NULL`,
-		`UPDATE topic_edges SET to_term='' WHERE to_term IS NULL`,
-		`UPDATE topic_edges SET evidence='' WHERE evidence IS NULL`,
 	} {
 		if _, err := db.sql.Exec(q); err != nil {
 			return err
 		}
 	}
-	return nil
+	if err := db.ensureEdgesSchema(); err != nil {
+		return err
+	}
+	if err := db.ensureVectorIndex(); err != nil {
+		return err
+	}
+	return db.ensurePropertyGraph()
+}
+
+func (db *DB) ensureVectorIndex() error {
+	_, err := db.sql.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_hnsw ON messages USING HNSW (embedding) WITH (metric = 'cosine')`)
+	return err
 }
 
 // Close releases the handle.
@@ -306,8 +338,7 @@ func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
 		if m.SessionID != sessionID {
 			return fmt.Errorf("message session %q does not match %q", m.SessionID, sessionID)
 		}
-		if _, err := tx.Exec(`INSERT INTO messages(session_id, seq, source, project, role, text, created_at, indexed)
-			VALUES(?, ?, ?, ?, ?, ?, ?, 0)`, m.SessionID, m.Seq, m.Source, m.Project, m.Role, m.Text, nullableTime(m.CreatedAt)); err != nil {
+		if err := insertMessage(tx, m); err != nil {
 			return err
 		}
 	}
@@ -325,67 +356,74 @@ func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
 // (indexed=0) for the next incremental IndexNew run.
 func (db *DB) InsertMessages(msgs []Message) error {
 	for _, m := range msgs {
-		if _, err := db.sql.Exec(
-			`INSERT INTO messages(session_id, seq, source, project, role, text, created_at, indexed)
-			 VALUES(?, ?, ?, ?, ?, ?, ?, 0)
-			 ON CONFLICT(session_id, seq) DO NOTHING`,
-			m.SessionID, m.Seq, m.Source, m.Project, m.Role, m.Text, nullableTime(m.CreatedAt)); err != nil {
+		if err := insertMessage(db.sql, m); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// Search AND-matches whitespace-separated tokens case-insensitively
-// against message text. Empty project/source means no filter.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func insertMessage(ex execer, m Message) error {
+	vec := embed.Embed(m.Text)
+	if vec == nil {
+		_, err := ex.Exec(
+			`INSERT INTO messages(session_id, seq, source, project, role, text, created_at, indexed, embedding)
+			 VALUES(?, ?, ?, ?, ?, ?, ?, 0, NULL)
+			 ON CONFLICT(session_id, seq) DO NOTHING`,
+			m.SessionID, m.Seq, m.Source, m.Project, m.Role, m.Text, nullableTime(m.CreatedAt))
+		return err
+	}
+	_, err := ex.Exec(
+		`INSERT INTO messages(session_id, seq, source, project, role, text, created_at, indexed, embedding)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?::FLOAT[`+strconv.Itoa(embed.Dim)+`])
+		 ON CONFLICT(session_id, seq) DO NOTHING`,
+		m.SessionID, m.Seq, m.Source, m.Project, m.Role, m.Text, nullableTime(m.CreatedAt), vectorLiteral(vec))
+	return err
+}
+
+// maxCosineDistance drops neighbors that share essentially no terms.
+// array_cosine_distance is 0 for a match and about 1 for orthogonal vectors.
+const maxCosineDistance = 0.65
+
+// Search ranks messages by cosine distance on the HNSW index. project and
+// source only filter that ranking. There is no keyword scan.
 func (db *DB) Search(query, project, source string, limit int) ([]Hit, error) {
 	if limit < 1 {
 		return nil, fmt.Errorf("limit must be positive")
 	}
-	toks := strings.Fields(query)
-	var sb strings.Builder
-	args := []any{}
-	sb.WriteString(`SELECT session_id, seq, source, project, role, `)
-	if len(toks) > 0 {
-		// Anchor the snippet at a matched token, not the beginning of a
-		// potentially multi-megabyte message.
-		sb.WriteString(`substr(text, greatest(1, strpos(lower(text), lower(?))-80), 300)`)
-		args = append(args, toks[0])
-	} else {
-		sb.WriteString(`substr(text, 1, 300)`)
+	vec := embed.Embed(query)
+	if vec == nil {
+		return nil, fmt.Errorf("query has no searchable terms")
 	}
-	sb.WriteString(`, (`)
-	if len(toks) > 1 {
-		sb.WriteString(`CASE WHEN strpos(lower(text), lower(?)) > 0 THEN 100.0 ELSE 0.0 END + `)
-		args = append(args, query)
+	if err := db.requireHNSW(); err != nil {
+		return nil, err
 	}
-	if len(toks) == 0 {
-		sb.WriteString(`0.0`)
-	} else {
-		for i, t := range toks {
-			if i > 0 {
-				sb.WriteString(` + `)
-			}
-			sb.WriteString(`(length(text)-length(replace(lower(text), lower(?), ''))) * 10.0 / greatest(length(?), 1) / sqrt(greatest(length(text), 1))`)
-			args = append(args, t, t)
-		}
-	}
-	sb.WriteString(`) AS score FROM messages WHERE 1=1`)
-	for _, t := range toks {
-		sb.WriteString(` AND text ILIKE '%'||?||'%' ESCAPE '\'`)
-		args = append(args, escapeLike(t))
-	}
+	anchor := topics.Tokenize(query)[0]
+	q := `SELECT session_id, seq, source, project, role,
+		substr(text, greatest(1, strpos(lower(text), lower(?))-80), 300),
+		array_cosine_distance(embedding, ?::FLOAT[` + strconv.Itoa(embed.Dim) + `]) AS dist
+		FROM messages
+		WHERE embedding IS NOT NULL`
+	args := []any{anchor, vectorLiteral(vec)}
 	if project != "" {
-		sb.WriteString(` AND project ILIKE '%'||?||'%' ESCAPE '\'`)
-		args = append(args, escapeLike(project))
+		q += ` AND contains(lower(project), lower(?))`
+		args = append(args, project)
 	}
 	if source != "" {
-		sb.WriteString(` AND source = ?`)
+		q += ` AND source = ?`
 		args = append(args, source)
 	}
-	sb.WriteString(` ORDER BY score DESC, created_at DESC NULLS LAST, session_id, seq LIMIT ?`)
-	args = append(args, limit)
-	rows, err := db.sql.Query(sb.String(), args...)
+	q += ` ORDER BY dist LIMIT ?`
+	fetch := limit * 4
+	if fetch < limit {
+		fetch = limit
+	}
+	args = append(args, fetch)
+	rows, err := db.sql.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -393,12 +431,29 @@ func (db *DB) Search(query, project, source string, limit int) ([]Hit, error) {
 	var out []Hit
 	for rows.Next() {
 		var h Hit
-		if err := rows.Scan(&h.SessionID, &h.Seq, &h.Source, &h.Project, &h.Role, &h.Snippet, &h.Score); err != nil {
+		var dist float64
+		if err := rows.Scan(&h.SessionID, &h.Seq, &h.Source, &h.Project, &h.Role, &h.Snippet, &dist); err != nil {
 			return nil, err
 		}
+		if dist > maxCosineDistance {
+			continue
+		}
+		h.Score = 1 - dist
 		out = append(out, h)
+		if len(out) == limit {
+			break
+		}
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) requireHNSW() error {
+	var name string
+	err := db.sql.QueryRow(`SELECT index_name FROM duckdb_indexes() WHERE index_name = 'idx_messages_hnsw'`).Scan(&name)
+	if err == sql.ErrNoRows || name == "" {
+		return fmt.Errorf("vss HNSW index idx_messages_hnsw is missing")
+	}
+	return err
 }
 
 // TextDoc is one message text plus its project, for per-project indexing.
@@ -457,17 +512,15 @@ func (db *DB) ReplaceEdges(edges map[ProjectEdge]int) error {
 		return err
 	}
 	for e, w := range edges {
-		if _, err := tx.Exec(`INSERT INTO topic_edges(project, term_a, term_b, weight, kind, from_term, to_term) VALUES(?, ?, ?, ?, ?, ?, ?)`,
-			e.Project, e.A, e.B, w, e.kind(), e.From, e.To); err != nil {
+		if err := upsertEdge(tx, e, w, ""); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// v3 distinguishes opposite directions of typed relationships and stores
-// a source sentence with each edge.
-const edgesSchemaVersion = "3"
+// v4 stores directed endpoints so duckpgq can traverse topic_edges.
+const edgesSchemaVersion = "4"
 
 // ensureEdgesSchema recreates outdated topic_edges tables (which carry no
 // state worth migrating: a rebuild restores them).
@@ -483,8 +536,17 @@ func (db *DB) ensureEdgesSchema() error {
 	}
 	defer tx.Rollback()
 	for _, q := range []string{
+		`DROP PROPERTY GRAPH IF EXISTS topic_graph`,
 		`DROP TABLE IF EXISTS topic_edges`,
+		`DROP TABLE IF EXISTS topics`,
+		`CREATE TABLE topics(
+			topic_id TEXT PRIMARY KEY,
+			project TEXT NOT NULL,
+			term TEXT NOT NULL)`,
 		`CREATE TABLE topic_edges(
+			edge_id TEXT PRIMARY KEY,
+			src_id TEXT NOT NULL REFERENCES topics(topic_id),
+			dst_id TEXT NOT NULL REFERENCES topics(topic_id),
 			project TEXT NOT NULL DEFAULT '',
 			term_a TEXT NOT NULL,
 			term_b TEXT NOT NULL,
@@ -492,9 +554,8 @@ func (db *DB) ensureEdgesSchema() error {
 			kind TEXT NOT NULL DEFAULT 'co-mention',
 			from_term TEXT NOT NULL DEFAULT '',
 			to_term TEXT NOT NULL DEFAULT '',
-			evidence TEXT NOT NULL DEFAULT '',
-			PRIMARY KEY(project, term_a, term_b, kind, from_term, to_term))`,
-		`INSERT INTO meta(key, value) VALUES('edges_schema', '3')
+			evidence TEXT NOT NULL DEFAULT '')`,
+		`INSERT INTO meta(key, value) VALUES('edges_schema', '4')
 		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
 		// The graph was just dropped: every message needs indexing again.
 		`UPDATE messages SET indexed=0`,
@@ -504,7 +565,10 @@ func (db *DB) ensureEdgesSchema() error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return db.ensurePropertyGraph()
 }
 
 // IndexNew indexes only messages not yet indexed and advances the graph
@@ -605,12 +669,7 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 	}
 	defer tx.Rollback()
 	for e, n := range pairDelta {
-		if _, err := tx.Exec(
-			`INSERT INTO topic_edges(project, term_a, term_b, weight, kind, from_term, to_term, evidence)
-				 VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-				 ON CONFLICT(project, term_a, term_b, kind, from_term, to_term)
-				 DO UPDATE SET weight=topic_edges.weight+excluded.weight`,
-			e.Project, e.A, e.B, n, e.kind(), e.From, e.To, evidence[e]); err != nil {
+		if err := upsertEdge(tx, e, n, evidence[e]); err != nil {
 			return 0, 0, err
 		}
 	}
@@ -623,7 +682,7 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 		}
 	}
 	for _, d := range docs {
-		if _, err := tx.Exec(`UPDATE messages SET indexed=1 WHERE session_id=? AND seq=?`, d.sid, d.seq); err != nil {
+		if err := markIndexed(tx, d.sid, d.seq, d.text); err != nil {
 			return 0, 0, err
 		}
 	}
@@ -680,10 +739,7 @@ func (db *DB) IndexFull(minDF int) error {
 			}
 		}
 		for e, w := range edgeW {
-			if _, err := tx.Exec(
-				`INSERT INTO topic_edges(project, term_a, term_b, weight, kind, from_term, to_term, evidence)
-				 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-				proj, e.A, e.B, w, e.kind(), e.From, e.To, evidence[e]); err != nil {
+			if err := upsertEdge(tx, e, w, evidence[e]); err != nil {
 				return err
 			}
 		}
@@ -694,6 +750,9 @@ func (db *DB) IndexFull(minDF int) error {
 		}
 	}
 	if _, err := tx.Exec(`UPDATE messages SET indexed=1`); err != nil {
+		return err
+	}
+	if err := backfillEmbeddings(tx); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM meta WHERE key='graph_dirty'`); err != nil {
@@ -763,43 +822,21 @@ type RelatedHit struct {
 	Evidence string
 }
 
-// Related returns topics co-mentioned with term. Empty project searches
-// all projects; otherwise edges are filtered by project substring match.
-// Depth 1 ranks direct neighbors by co-mention count; depth 2 adds
+// Related returns topics reached from term by a duckpgq traversal.
+// Empty project searches all projects; otherwise vertices are filtered
+// by project substring. Depth 1 ranks direct neighbors; depth 2 adds
 // neighbors-of-neighbors, scored by the two-hop weight sum.
 func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, error) {
 	if limit < 1 || (depth != 1 && depth != 2) {
 		return nil, fmt.Errorf("related needs a positive limit and depth 1 or 2")
 	}
-	term = strings.ToLower(term)
-	neighbors := func(t string) ([]RelatedHit, error) {
-		q := `SELECT CASE WHEN term_a=? THEN term_b ELSE term_a END AS other,
-			 sum(weight), kind, from_term, to_term, min(evidence)
-			 FROM topic_edges WHERE (term_a=? OR term_b=?)`
-		args := []any{t, t, t}
-		if project != "" {
-			q += ` AND project ILIKE '%'||?||'%' ESCAPE '\'`
-			args = append(args, escapeLike(project))
-		}
-		q += ` GROUP BY other, kind, from_term, to_term`
-		rows, err := db.sql.Query(q, args...)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		var out []RelatedHit
-		for rows.Next() {
-			var h RelatedHit
-			if err := rows.Scan(&h.Term, &h.Weight, &h.Kind, &h.From, &h.To, &h.Evidence); err != nil {
-				return nil, err
-			}
-			out = append(out, h)
-		}
-		return out, rows.Err()
+	term = strings.ToLower(strings.TrimSpace(term))
+	if term == "" {
+		return nil, fmt.Errorf("related needs a term")
 	}
 	seen := map[string]RelatedHit{}
 	direct := map[string]int{}
-	first, err := neighbors(term)
+	first, err := db.graphNeighbors(term, project)
 	if err != nil {
 		return nil, err
 	}
@@ -824,25 +861,26 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 		if len(ordered) > maxVia {
 			ordered = ordered[:maxVia]
 		}
+		vias := map[string]int{}
 		for _, v := range ordered {
-			via, w1 := v.Term, v.Weight
-			second, err := neighbors(via)
-			if err != nil {
-				return nil, err
+			vias[v.Term] = v.Weight
+		}
+		second, err := db.graphTwoHop(term, project)
+		if err != nil {
+			return nil, err
+		}
+		for _, h := range second {
+			w1, ok := vias[h.Via]
+			if !ok || h.Term == term {
+				continue
 			}
-			for _, h := range second {
-				if h.Term == term {
-					continue
-				}
-				key := relatedKey(h)
-				if directKeys[key] {
-					continue
-				}
-				if cur, ok := seen[key]; !ok || w1+h.Weight > cur.Weight {
-					h.Weight += w1
-					h.Via = via
-					seen[key] = h
-				}
+			key := relatedKey(h)
+			if directKeys[key] {
+				continue
+			}
+			h.Weight += w1
+			if cur, ok := seen[key]; !ok || h.Weight > cur.Weight {
+				seen[key] = h
 			}
 		}
 	}
@@ -855,6 +893,79 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (db *DB) graphNeighbors(term, project string) ([]RelatedHit, error) {
+	q := `SELECT g.term, sum(g.weight)::INTEGER, g.kind, g.from_term, g.to_term, min(g.evidence) FROM (
+		SELECT * FROM GRAPH_TABLE (topic_graph
+			MATCH (a:topics)-[e:Rel]->(b:topics)
+			COLUMNS (
+				a.term AS src,
+				a.project AS project,
+				b.term AS term,
+				e.weight AS weight,
+				e.kind AS kind,
+				e.from_term AS from_term,
+				e.to_term AS to_term,
+				e.evidence AS evidence
+			)
+		)
+	) g WHERE g.src = ` + sqlString(term)
+	if project != "" {
+		q += ` AND contains(lower(g.project), lower(` + sqlString(project) + `))`
+	}
+	q += ` GROUP BY g.term, g.kind, g.from_term, g.to_term`
+	rows, err := db.sql.Query(q)
+	if err != nil {
+		return nil, fmt.Errorf("duckpgq traversal: %w", err)
+	}
+	defer rows.Close()
+	var out []RelatedHit
+	for rows.Next() {
+		var h RelatedHit
+		if err := rows.Scan(&h.Term, &h.Weight, &h.Kind, &h.From, &h.To, &h.Evidence); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) graphTwoHop(term, project string) ([]RelatedHit, error) {
+	q := `SELECT g.via, g.term, sum(g.weight)::INTEGER, g.kind, g.from_term, g.to_term, min(g.evidence) FROM (
+		SELECT * FROM GRAPH_TABLE (topic_graph
+			MATCH (a:topics)-[e1:Rel]->(hop:topics)-[e2:Rel]->(b:topics)
+			COLUMNS (
+				a.term AS src,
+				a.project AS project,
+				hop.term AS via,
+				b.term AS term,
+				e2.weight AS weight,
+				e2.kind AS kind,
+				e2.from_term AS from_term,
+				e2.to_term AS to_term,
+				e2.evidence AS evidence
+			)
+		)
+	) g WHERE g.src = ` + sqlString(term) + ` AND g.term <> ` + sqlString(term)
+	if project != "" {
+		q += ` AND contains(lower(g.project), lower(` + sqlString(project) + `))`
+	}
+	q += ` GROUP BY g.via, g.term, g.kind, g.from_term, g.to_term`
+	rows, err := db.sql.Query(q)
+	if err != nil {
+		return nil, fmt.Errorf("duckpgq traversal: %w", err)
+	}
+	defer rows.Close()
+	var out []RelatedHit
+	for rows.Next() {
+		var h RelatedHit
+		if err := rows.Scan(&h.Via, &h.Term, &h.Weight, &h.Kind, &h.From, &h.To, &h.Evidence); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }
 
 // maxVia bounds depth-2 expansion to the strongest direct neighbors.
@@ -901,9 +1012,123 @@ func (db *DB) Count() (sessions, messages int, err error) {
 	return
 }
 
-func escapeLike(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(s)
+func topicID(project, term string) string {
+	return project + "\x1f" + term
+}
+
+func edgeID(src, dst, kind, from, to string) string {
+	return src + "\x1e" + dst + "\x1e" + kind + "\x1e" + from + "\x1e" + to
+}
+
+func upsertEdge(tx execer, e ProjectEdge, weight int, evidence string) error {
+	if evidence == "" {
+		evidence = ""
+	}
+	ends := [][2]string{{e.A, e.B}, {e.B, e.A}}
+	for _, end := range ends {
+		src, dst := topicID(e.Project, end[0]), topicID(e.Project, end[1])
+		for _, id := range []struct{ id, term string }{{src, end[0]}, {dst, end[1]}} {
+			if _, err := tx.Exec(
+				`INSERT INTO topics(topic_id, project, term) VALUES(?, ?, ?)
+				 ON CONFLICT(topic_id) DO NOTHING`,
+				id.id, e.Project, id.term); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO topic_edges(edge_id, src_id, dst_id, project, term_a, term_b, weight, kind, from_term, to_term, evidence)
+			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(edge_id) DO UPDATE SET weight = topic_edges.weight + excluded.weight`,
+			edgeID(src, dst, e.kind(), e.From, e.To), src, dst, e.Project, e.A, e.B, weight, e.kind(), e.From, e.To, evidence); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func markIndexed(tx execer, sessionID string, seq int, text string) error {
+	vec := embed.Embed(text)
+	if vec == nil {
+		_, err := tx.Exec(`UPDATE messages SET indexed=1, embedding=NULL WHERE session_id=? AND seq=?`, sessionID, seq)
+		return err
+	}
+	_, err := tx.Exec(
+		`UPDATE messages SET indexed=1, embedding=?::FLOAT[`+strconv.Itoa(embed.Dim)+`] WHERE session_id=? AND seq=?`,
+		vectorLiteral(vec), sessionID, seq)
+	return err
+}
+
+func backfillEmbeddings(tx *sql.Tx) error {
+	rows, err := tx.Query(`SELECT session_id, seq, text FROM messages WHERE embedding IS NULL`)
+	if err != nil {
+		return err
+	}
+	type row struct {
+		sid, text string
+		seq       int
+	}
+	var pending []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.sid, &r.seq, &r.text); err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range pending {
+		vec := embed.Embed(r.text)
+		if vec == nil {
+			continue
+		}
+		if _, err := tx.Exec(
+			`UPDATE messages SET embedding=?::FLOAT[`+strconv.Itoa(embed.Dim)+`] WHERE session_id=? AND seq=?`,
+			vectorLiteral(vec), r.sid, r.seq); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) ensurePropertyGraph() error {
+	topics, edges := "topics", "topic_edges"
+	if db.readOnly {
+		topics, edges = "src.topics", "src.topic_edges"
+	}
+	_, err := db.sql.Exec(fmt.Sprintf(`CREATE OR REPLACE PROPERTY GRAPH topic_graph
+		VERTEX TABLES (%s)
+		EDGE TABLES (
+			%s
+				SOURCE KEY (src_id) REFERENCES %s (topic_id)
+				DESTINATION KEY (dst_id) REFERENCES %s (topic_id)
+				LABEL Rel
+		)`, topics, edges, topics, topics))
+	if err != nil {
+		return fmt.Errorf("duckpgq property graph: %w", err)
+	}
+	return nil
+}
+
+func vectorLiteral(v []float32) string {
+	var b strings.Builder
+	b.Grow(len(v) * 8)
+	b.WriteByte('[')
+	for i, x := range v {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.FormatFloat(float64(x), 'f', 6, 32))
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+func sqlString(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 func nullableTime(t time.Time) any {

@@ -1,11 +1,8 @@
 // Package topics derives topic relationships from stored messages.
 //
-// Iteration: co-mention graph. Two terms are related when they appear in
-// the same message; the edge weight is the number of messages where they
-// co-occur. This is lexical, not semantic: "bastion-sentry" means the two
-// are discussed together, not that one owns the other. Semantic relations
-// (owns, replaces, fixes) are future work on top of this table, e.g. via
-// duckpgq traversals or an extractor model.
+// Co-mention edges record terms discussed in the same message. Typed edges
+// (owns, replaces) come from rules. Traversal of those edges is duckpgq's
+// job in the store, not a second walk over the rows.
 package topics
 
 import (
@@ -65,8 +62,9 @@ var stopwords = map[string]bool{
 // hub words ("turn", "user", "agent") connect everything to everything.
 const MaxDFRatio = 0.25
 
-// Terms extracts ordered unique content terms from text.
-func Terms(text string) []string {
+// Tokenize returns content tokens in order, keeping repeats so adjacent
+// phrases stay visible to the embedder.
+func Tokenize(text string) []string {
 	var raw []string
 	var cur strings.Builder
 	flush := func() {
@@ -88,9 +86,14 @@ func Terms(text string) []string {
 		}
 	}
 	flush()
+	return raw
+}
+
+// Terms extracts ordered unique content terms from text.
+func Terms(text string) []string {
 	seen := map[string]bool{}
-	out := []string{}
-	for _, w := range raw {
+	var out []string
+	for _, w := range Tokenize(text) {
 		if !seen[w] {
 			seen[w] = true
 			out = append(out, w)

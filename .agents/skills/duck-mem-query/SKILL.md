@@ -18,13 +18,16 @@ gotchas, and context instead of re-deriving them.
 - Default database: `~/.local/share/duck-mem/memory.duckdb`. Pass `--db`
   only if the user points you at another file.
 
-## query: find past utterances
+## query: find similar utterances
 
 ```bash
 duck-mem query [--project P] [--source S] [--limit N] <words...>
 ```
 
-- Words AND-match against message text (case-insensitive substring).
+- Ranks messages by cosine similarity (DuckDB `vss` HNSW). The words are
+  embedded as terms and adjacent phrases; closest messages come first.
+- This is not a keyword AND filter. Unrelated messages stay out. Wording
+  that shares no terms with the query can still miss.
 - `--project` filters by project path substring (e.g. `omen-the-game`).
 - `--source` is one of `codex`, `claude`, `cursor`, `muse`, `opencode`.
 - Flags may come before or after the words.
@@ -51,7 +54,8 @@ before acting on it.
 duck-mem related [--project P] [--depth 1|2] [--limit N] <term>
 ```
 
-- Lists topics discussed together with the term, most relevant first.
+- Traverses the topic graph (`duckpgq`) for topics discussed together
+  with the term, most relevant first.
 - Typed relations (`owns`, `replaces`) show direction and evidence, e.g.
   `sentry (replaces: sentry -> dome, 3) [source...]`. They outrank bare
   co-mentions like `turret (3)`.
@@ -79,7 +83,7 @@ decision text.
 - The CLI retries brief daemon write cycles automatically. Initial imports
   and full re-indexes can hold the database longer; on a lock conflict,
   check the tray's last-sync status and retry after indexing completes.
-- Keyword match only: synonyms and paraphrases can miss. If a query comes
-  back empty, retry with different words from the same topic.
+- Similarity uses term and phrase vectors, not a neural model. If a query
+  comes back empty, retry with different words from the same topic.
 - Snippets are memory, not truth: files may have changed since. Confirm
   before acting.
