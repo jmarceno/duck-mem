@@ -96,6 +96,12 @@ func TestExtractTypedFindsOwnsAndReplaces(t *testing.T) {
 	}
 }
 
+func TestExtractTypedSkipsModifierEndpoints(t *testing.T) {
+	if got := ExtractTyped("Damage uses the barricade's actual shape."); len(got) != 0 {
+		t.Fatalf("modifier taken as relation endpoint: %+v", got)
+	}
+}
+
 func TestExtractTypedReversesPassiveReplacement(t *testing.T) {
 	got := ExtractTyped("The dome was replaced by the sentry.")
 	if len(got) != 1 || got[0].From != "sentry" || got[0].To != "dome" || got[0].Kind != KindReplaces {

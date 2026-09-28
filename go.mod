@@ -1,4 +1,4 @@
-module duck-mem
+module github.com/jmarceno/duck-mem
 
 go 1.24.0
 

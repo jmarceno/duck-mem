@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"duck-mem/internal/store"
+	"github.com/jmarceno/duck-mem/internal/store"
 
 	_ "github.com/mattn/go-sqlite3"
 )

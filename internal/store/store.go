@@ -10,8 +10,8 @@ import (
 
 	"strconv"
 
-	"duck-mem/internal/embed"
-	"duck-mem/internal/topics"
+	"github.com/jmarceno/duck-mem/internal/embed"
+	"github.com/jmarceno/duck-mem/internal/topics"
 
 	duckdb "github.com/marcboeker/go-duckdb/v2"
 )
@@ -38,17 +38,6 @@ type Session struct {
 	Project   string
 	Path      string
 	StartedAt time.Time
-}
-
-// Hit is one search result.
-type Hit struct {
-	SessionID string
-	Seq       int
-	Source    string
-	Project   string
-	Role      string
-	Snippet   string
-	Score     float64
 }
 
 // DB wraps the DuckDB handle. readOnly sessions attach the file from an
@@ -130,6 +119,8 @@ func loadExtensions(sdb *sql.DB) error {
 		`INSTALL vss`,
 		`LOAD vss`,
 		`INSTALL duckpgq FROM community`,
+		`INSTALL fts`,
+		`LOAD fts`,
 		`LOAD duckpgq`,
 		`SET hnsw_enable_experimental_persistence = true`,
 		`SET hnsw_ef_search = 256`,
@@ -173,6 +164,13 @@ func (db *DB) init() error {
 		`CREATE TABLE IF NOT EXISTS meta(
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL)`,
+		// msg_terms is the BM25 posting list: stemmed term frequencies
+		// per message, maintained with the messages themselves.
+		`CREATE TABLE IF NOT EXISTS msg_terms(
+			session_id TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			term TEXT NOT NULL,
+			tf INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS file_checkpoints(
 			path TEXT PRIMARY KEY,
 			size BIGINT NOT NULL,
@@ -204,10 +202,35 @@ func (db *DB) init() error {
 	if err := db.ensureEdgesSchema(); err != nil {
 		return err
 	}
+	if err := db.ensureTermsSchema(); err != nil {
+		return err
+	}
 	if err := db.ensureVectorIndex(); err != nil {
 		return err
 	}
 	return db.ensurePropertyGraph()
+}
+
+const termsSchemaVersion = "1"
+
+// ensureTermsSchema backfills the posting list for databases created
+// before keyword search, or rebuilt after a tokenizer change.
+func (db *DB) ensureTermsSchema() error {
+	var v string
+	_ = db.sql.QueryRow(`SELECT value FROM meta WHERE key='terms_schema'`).Scan(&v)
+	if v == termsSchemaVersion {
+		return nil
+	}
+	return db.withTx(func(conn *duckdb.Conn) error {
+		if err := execConn(conn, `DELETE FROM msg_terms`); err != nil {
+			return err
+		}
+		if err := execConn(conn, insertTermsSQL(`SELECT session_id, seq, text FROM messages`)); err != nil {
+			return err
+		}
+		return execConn(conn, `INSERT INTO meta(key, value) VALUES('terms_schema', '`+termsSchemaVersion+`')
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+	})
 }
 
 func (db *DB) ensureVectorIndex() error {
@@ -283,8 +306,9 @@ func (db *DB) UpsertSession(s Session) error {
 }
 
 // SyncMessages replaces a session's stored snapshot only when its content
-// changed. Reparsed sessions can gain, lose, or reorder messages; indexed
-// edges from the old snapshot then require a full rebuild.
+// changed. Reparsed sessions can gain, lose, or reorder messages; the old
+// snapshot's graph contributions are then subtracted and the new rows
+// index incrementally, so a rewrite costs one session, not the corpus.
 func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
 	rows, err := db.sql.Query(`SELECT seq, source, project, role, text FROM messages WHERE session_id=? ORDER BY seq`, sessionID)
 	if err != nil {
@@ -330,21 +354,25 @@ func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
 		}
 	}
 	fresh := msgs[start:]
-	dirty := len(old) > 0 && !prefixMatches
+	var undo graphUndo
+	if !prefixMatches && len(old) > 0 {
+		if undo, err = db.sessionContribution(sessionID); err != nil {
+			return err
+		}
+	}
 	return db.withTx(func(conn *duckdb.Conn) error {
 		if !prefixMatches {
+			if err := undo.apply(conn, sessionID); err != nil {
+				return err
+			}
 			if err := execConn(conn, `DELETE FROM messages WHERE session_id=`+sqlString(sessionID)); err != nil {
 				return err
 			}
+			if err := execConn(conn, `DELETE FROM msg_terms WHERE session_id=`+sqlString(sessionID)); err != nil {
+				return err
+			}
 		}
-		if err := copyMessages(conn, stageMessages(fresh, false), false); err != nil {
-			return err
-		}
-		if dirty {
-			return execConn(conn, `INSERT INTO meta(key, value) VALUES('graph_dirty', '1')
-				ON CONFLICT(key) DO UPDATE SET value='1'`)
-		}
-		return nil
+		return copyMessages(conn, stageMessages(fresh, false), false)
 	})
 }
 
@@ -359,68 +387,6 @@ func (db *DB) InsertMessages(msgs []Message) error {
 	return db.withTx(func(conn *duckdb.Conn) error {
 		return copyMessages(conn, rows, true)
 	})
-}
-
-// maxCosineDistance drops neighbors that share essentially no terms.
-// array_cosine_distance is 0 for a match and about 1 for orthogonal vectors.
-const maxCosineDistance = 0.65
-
-// Search ranks messages by cosine distance on the HNSW index. project and
-// source only filter that ranking. There is no keyword scan.
-func (db *DB) Search(query, project, source string, limit int) ([]Hit, error) {
-	if limit < 1 {
-		return nil, fmt.Errorf("limit must be positive")
-	}
-	vec := embed.Embed(query)
-	if vec == nil {
-		return nil, fmt.Errorf("query has no searchable terms")
-	}
-	if err := db.requireHNSW(); err != nil {
-		return nil, err
-	}
-	anchor := topics.Tokenize(query)[0]
-	q := `SELECT session_id, seq, source, project, role,
-		substr(text, greatest(1, strpos(lower(text), lower(?))-80), 300),
-		array_cosine_distance(embedding, ?::FLOAT[` + strconv.Itoa(embed.Dim) + `]) AS dist
-		FROM messages
-		WHERE embedding IS NOT NULL`
-	args := []any{anchor, vectorLiteral(vec)}
-	if project != "" {
-		q += ` AND contains(lower(project), lower(?))`
-		args = append(args, project)
-	}
-	if source != "" {
-		q += ` AND source = ?`
-		args = append(args, source)
-	}
-	q += ` ORDER BY dist LIMIT ?`
-	fetch := limit * 4
-	if fetch < limit {
-		fetch = limit
-	}
-	args = append(args, fetch)
-	rows, err := db.sql.Query(q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Hit
-	for rows.Next() {
-		var h Hit
-		var dist float64
-		if err := rows.Scan(&h.SessionID, &h.Seq, &h.Source, &h.Project, &h.Role, &h.Snippet, &dist); err != nil {
-			return nil, err
-		}
-		if dist > maxCosineDistance {
-			continue
-		}
-		h.Score = 1 - dist
-		out = append(out, h)
-		if len(out) == limit {
-			break
-		}
-	}
-	return out, rows.Err()
 }
 
 func (db *DB) requireHNSW() error {
@@ -474,12 +440,13 @@ func (db *DB) AllTexts() ([]TextDoc, error) {
 	return out, rows.Err()
 }
 
-// ReplaceEdges rebuilds the co-occurrence graph wholesale.
+// ReplaceEdges rebuilds the co-occurrence graph wholesale. Terms are graph
+// terms: Porter stems, as IndexNew and IndexFull store them.
 func (db *DB) ReplaceEdges(edges map[ProjectEdge]int) error {
 	if err := db.ensureEdgesSchema(); err != nil {
 		return err
 	}
-	topics, staged := collectEdges(edges, nil)
+	topics, staged := collectEdges(edges, nil, nil)
 	return db.withTx(func(conn *duckdb.Conn) error {
 		if err := resetGraphTables(conn); err != nil {
 			return err
@@ -492,7 +459,7 @@ func (db *DB) ReplaceEdges(edges map[ProjectEdge]int) error {
 }
 
 // v4 stores directed endpoints so duckpgq can traverse topic_edges.
-const edgesSchemaVersion = "4"
+const edgesSchemaVersion = "6"
 
 // ensureEdgesSchema recreates outdated topic_edges tables (which carry no
 // state worth migrating: a rebuild restores them).
@@ -514,7 +481,8 @@ func (db *DB) ensureEdgesSchema() error {
 		`CREATE TABLE topics(
 			topic_id TEXT PRIMARY KEY,
 			project TEXT NOT NULL,
-			term TEXT NOT NULL)`,
+			term TEXT NOT NULL,
+			label TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE topic_edges(
 			edge_id TEXT PRIMARY KEY,
 			src_id TEXT NOT NULL REFERENCES topics(topic_id),
@@ -527,8 +495,20 @@ func (db *DB) ensureEdgesSchema() error {
 			from_term TEXT NOT NULL DEFAULT '',
 			to_term TEXT NOT NULL DEFAULT '',
 			evidence TEXT NOT NULL DEFAULT '')`,
-		`INSERT INTO meta(key, value) VALUES('edges_schema', '4')
+		`INSERT INTO meta(key, value) VALUES('edges_schema', '` + edgesSchemaVersion + `')
 		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		`DROP TABLE IF EXISTS msg_edges`,
+		// msg_edges logs each edge contribution per message (weight 1 per
+		// row), so a rewritten session can be subtracted exactly.
+		`CREATE TABLE msg_edges(
+			session_id TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			project TEXT NOT NULL,
+			term_a TEXT NOT NULL,
+			term_b TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			from_term TEXT NOT NULL,
+			to_term TEXT NOT NULL)`,
 		// The graph was just dropped: every message needs indexing again.
 		`UPDATE messages SET indexed=0`,
 		`DELETE FROM term_df`,
@@ -604,6 +584,10 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 		missing[i] = d.missing
 	}
 	scanned, vecs := prepareMessages(texts, missing)
+	labels, err := db.stemDocs(scanned)
+	if err != nil {
+		return 0, 0, err
+	}
 	// Per-project df views over the shared flat map.
 	projDF := map[string]map[string]int{}
 	getDF := func(proj string) map[string]int {
@@ -627,20 +611,24 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 	}
 	pairDelta := map[ProjectEdge]int{}
 	evidence := map[ProjectEdge]string{}
+	var log []edgeLogRow
 	for i, d := range docs {
 		maxDF := topics.HubCap(totals[d.proj], minDF)
 		for _, e := range topics.SelectPairsFromTerms(scanned[i].Terms, getDF(d.proj), minDF, maxDF) {
-			pairDelta[ProjectEdge{Project: d.proj, A: e[0], B: e[1]}]++
+			pe := ProjectEdge{Project: d.proj, A: e[0], B: e[1]}
+			pairDelta[pe]++
+			log = append(log, edgeLogRow{d.sid, d.seq, pe})
 		}
 		for _, t := range scanned[i].Typed {
 			e := ProjectEdge{Project: d.proj, A: t.A, B: t.B, From: t.From, To: t.To, Kind: t.Kind}
 			pairDelta[e]++
+			log = append(log, edgeLogRow{d.sid, d.seq, e})
 			if evidence[e] == "" {
 				evidence[e] = fmt.Sprintf("%s#%d: %s", d.sid, d.seq, t.Evidence)
 			}
 		}
 	}
-	topicRows, edgeRows := collectEdges(pairDelta, evidence)
+	topicRows, edgeRows := collectEdges(pairDelta, evidence, labels)
 	dfRows := make([]stagedDF, 0, len(dfDelta))
 	for pt, n := range dfDelta {
 		dfRows = append(dfRows, stagedDF{project: pt[0], term: pt[1], msgs: int32(n)})
@@ -656,6 +644,9 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 			return err
 		}
 		if err := copyTermDF(conn, dfRows, true); err != nil {
+			return err
+		}
+		if err := appendEdgeLog(conn, log); err != nil {
 			return err
 		}
 		if err := copyEmbeddings(conn, embRows); err != nil {
@@ -691,9 +682,14 @@ func (db *DB) IndexFull(minDF int) error {
 		_, missing[i] = missingSet[msgKey{d.SessionID, d.Seq}]
 	}
 	scanned, vecs := prepareMessages(texts, missing)
+	labels, err := db.stemDocs(scanned)
+	if err != nil {
+		return err
+	}
 	edgeW := map[ProjectEdge]int{}
 	evidence := map[ProjectEdge]string{}
 	var dfRows []stagedDF
+	var log []edgeLogRow
 	for proj, idxs := range groups {
 		df := map[string]int{}
 		for _, i := range idxs {
@@ -705,11 +701,14 @@ func (db *DB) IndexFull(minDF int) error {
 		for _, i := range idxs {
 			d := docs[i]
 			for _, e := range topics.SelectPairsFromTerms(scanned[i].Terms, df, minDF, maxDF) {
-				edgeW[ProjectEdge{Project: proj, A: e[0], B: e[1]}]++
+				pe := ProjectEdge{Project: proj, A: e[0], B: e[1]}
+				edgeW[pe]++
+				log = append(log, edgeLogRow{d.SessionID, d.Seq, pe})
 			}
 			for _, tp := range scanned[i].Typed {
 				e := ProjectEdge{Project: proj, A: tp.A, B: tp.B, From: tp.From, To: tp.To, Kind: tp.Kind}
 				edgeW[e]++
+				log = append(log, edgeLogRow{d.SessionID, d.Seq, e})
 				if evidence[e] == "" {
 					evidence[e] = fmt.Sprintf("%s#%d: %s", d.SessionID, d.Seq, tp.Evidence)
 				}
@@ -719,7 +718,7 @@ func (db *DB) IndexFull(minDF int) error {
 			dfRows = append(dfRows, stagedDF{project: proj, term: w, msgs: int32(n)})
 		}
 	}
-	topicRows, edgeRows := collectEdges(edgeW, evidence)
+	topicRows, edgeRows := collectEdges(edgeW, evidence, labels)
 	var embRows []stagedEmb
 	for i, d := range docs {
 		if vecs[i] != nil {
@@ -731,6 +730,12 @@ func (db *DB) IndexFull(minDF int) error {
 			return err
 		}
 		if err := execConn(conn, `DELETE FROM term_df`); err != nil {
+			return err
+		}
+		if err := execConn(conn, `DELETE FROM msg_edges`); err != nil {
+			return err
+		}
+		if err := appendEdgeLog(conn, log); err != nil {
 			return err
 		}
 		if err := copyTopicsAndEdges(conn, topicRows, edgeRows, false); err != nil {
@@ -847,6 +852,12 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 	if term == "" {
 		return nil, fmt.Errorf("related needs a term")
 	}
+	// Graph nodes are Porter stems; look up the stem of what was typed.
+	stems, err := db.stemWords([]string{term})
+	if err != nil {
+		return nil, err
+	}
+	term = stems[term]
 	seen := map[string]RelatedHit{}
 	direct := map[string]int{}
 	first, err := db.graphNeighbors(term, project)
@@ -905,7 +916,7 @@ func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, err
 	if len(out) > limit {
 		out = out[:limit]
 	}
-	return out, nil
+	return out, db.labelHits(out)
 }
 
 func (db *DB) graphNeighbors(term, project string) ([]RelatedHit, error) {
@@ -988,12 +999,18 @@ func relatedKey(h RelatedHit) string {
 	return h.Term + "\x00" + h.Kind + "\x00" + h.From + "\x00" + h.To
 }
 
-// sortHits ranks typed relations above co-mentions, then by weight: a
-// rule-extracted link outranks any number of bare co-mentions.
+// minTypedWeight is how often a rule-extracted relation must recur before
+// it outranks co-mentions. A single possessive or "replace" sentence is
+// too often a misparse to lead the list.
+const minTypedWeight = 2
+
+// sortHits ranks recurring typed relations above co-mentions, then by
+// weight. One-off typed relations rank by weight like co-mentions.
 func sortHits(h []RelatedHit) {
 	sort.Slice(h, func(i, j int) bool {
 		a, b := h[i], h[j]
-		ta, tb := a.Kind != "" && a.Kind != "co-mention", b.Kind != "" && b.Kind != "co-mention"
+		ta := a.Kind != "" && a.Kind != "co-mention" && a.Weight >= minTypedWeight
+		tb := b.Kind != "" && b.Kind != "co-mention" && b.Weight >= minTypedWeight
 		if ta != tb {
 			return ta
 		}

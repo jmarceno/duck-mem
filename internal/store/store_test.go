@@ -3,12 +3,13 @@ package store
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"duck-mem/internal/embed"
+	"github.com/jmarceno/duck-mem/internal/embed"
 )
 
 func openTemp(t *testing.T) *DB {
@@ -145,6 +146,92 @@ func TestSearchRanksPhraseAndFocusedMessageFirst(t *testing.T) {
 	}
 }
 
+// A long message that uses other word forms than the query shares too
+// few hashed features for the vector ranking; BM25 over stems finds it.
+func TestSearchFindsWordFormsInLongMessage(t *testing.T) {
+	db := openTemp(t)
+	insertMsg(t, db, "report", 0, strings.Repeat("padding words here ", 60)+
+		"then the enemies simply disengaged as if the player vanished "+strings.Repeat("more filler text ", 60))
+	insertMsg(t, db, "other", 0, "quartermaster ledger totals")
+	hits, err := db.Search("enemy disengage", "", "", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].SessionID != "report" || !strings.Contains(hits[0].Snippet, "enemies simply disengaged") {
+		t.Fatalf("word forms in long message not found: %+v", hits)
+	}
+}
+
+func TestRecallGroupsBySessionWithTitle(t *testing.T) {
+	db := openTemp(t)
+	add := func(sid string, texts ...string) {
+		if err := db.UpsertSession(Session{ID: sid, Source: "claude", Project: "p", Path: sid + ".jsonl"}); err != nil {
+			t.Fatal(err)
+		}
+		var msgs []Message
+		for i, text := range texts {
+			msgs = append(msgs, Message{SessionID: sid, Seq: i, Source: "claude", Project: "p", Role: "user", Text: text})
+		}
+		if err := db.InsertMessages(msgs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("aaa-1", "<environment_context>cwd</environment_context>", "the barricade blocks enemy sight",
+		"barricade sight plan", "barricade sight plan", "unrelated")
+	add("aaa-2", "barricade")
+	results, _, err := db.Recall("barricade sight", "", "", 5, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].Session.ID != "aaa-1" {
+		t.Fatalf("sessions not grouped best first: %+v", results)
+	}
+	first := results[0]
+	if first.Title != "the barricade blocks enemy sight" || first.Messages != 5 || first.Session.Path != "aaa-1.jsonl" {
+		t.Fatalf("session description wrong: %+v", first)
+	}
+	if len(first.Hits) != 2 || first.Hits[0].Snippet == first.Hits[1].Snippet {
+		t.Fatalf("hits not capped and deduplicated: %+v", first.Hits)
+	}
+
+	if _, err := db.ResolveSession("aaa"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous prefix resolved: %v", err)
+	}
+	s, err := db.ResolveSession("aaa-1")
+	if err != nil || s.Messages != 5 {
+		t.Fatalf("resolve: %+v err=%v", s, err)
+	}
+	window, err := db.Window(s.Session.ID, 1, 2)
+	if err != nil || len(window) != 2 || window[0].Seq != 1 || window[1].Seq != 2 {
+		t.Fatalf("window: %+v err=%v", window, err)
+	}
+}
+
+// Databases from before keyword search get their posting list on open.
+func TestOpenBackfillsKeywordIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.duckdb")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertMsg(t, db, "old", 0, "zephyrturbine spins")
+	for _, q := range []string{`DELETE FROM msg_terms`, `DELETE FROM meta WHERE key='terms_schema'`} {
+		if _, err := db.sql.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = db.Close()
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM msg_terms WHERE term = 'zephyrturbin'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("posting list not backfilled: n=%d err=%v", n, err)
+	}
+}
+
 func TestReadOnlyOpenReadsAndRefusesMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.duckdb")
 	writer, err := Open(path)
@@ -160,7 +247,7 @@ func TestReadOnlyOpenReadsAndRefusesMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := writer.ReplaceEdges(map[ProjectEdge]int{
-		{Project: "p", A: "zephyrturbine", B: "read"}: 2,
+		{Project: "p", A: "zephyr", B: "read"}: 2,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +267,7 @@ func TestReadOnlyOpenReadsAndRefusesMissing(t *testing.T) {
 	if len(hits) != 1 {
 		t.Fatalf("got %d hits want 1", len(hits))
 	}
-	related, err := reader.Related("zephyrturbine", "p", 1, 5)
+	related, err := reader.Related("zephyr", "p", 1, 5)
 	if err != nil || len(related) != 1 || related[0].Term != "read" {
 		t.Fatalf("read-only graph traversal: %+v err=%v", related, err)
 	}
@@ -266,10 +353,19 @@ func insertMsg(t *testing.T, db *DB, sid string, seq int, text string) {
 	}
 }
 
+// edgeWeight reads the co-mention weight between two words' graph nodes.
 func edgeWeight(t *testing.T, db *DB, a, b string) int {
 	t.Helper()
+	stems, err := db.stemWords([]string{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b = stems[a], stems[b]
+	if a > b {
+		a, b = b, a
+	}
 	var w int
-	err := db.sql.QueryRow(`SELECT weight FROM topic_edges WHERE term_a=? AND term_b=?`, a, b).Scan(&w)
+	err = db.sql.QueryRow(`SELECT weight FROM topic_edges WHERE term_a=? AND term_b=? AND kind='co-mention' LIMIT 1`, a, b).Scan(&w)
 	if err != nil {
 		return -1
 	}
@@ -325,6 +421,12 @@ func TestSyncMessagesRefreshesEditedSessionAndGraph(t *testing.T) {
 	message := func(seq int, text, project string) Message {
 		return Message{SessionID: s.ID, Seq: seq, Source: s.Source, Project: project, Role: "user", Text: text}
 	}
+	if err := db.UpsertSession(Session{ID: "other", Source: "codex", Project: "keep", Path: "g"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SyncMessages("other", []Message{{SessionID: "other", Source: "codex", Project: "keep", Role: "user", Text: "bastion aegis"}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.SyncMessages(s.ID, []Message{message(0, "bastion sentry", "old")}); err != nil {
 		t.Fatal(err)
 	}
@@ -344,8 +446,13 @@ func TestSyncMessagesRefreshesEditedSessionAndGraph(t *testing.T) {
 	if err := db.SyncMessages(s.ID, []Message{message(0, "bastion turret", "new"), message(1, "bastion turret", "new")}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := db.IndexNew(1); err != nil {
-		t.Fatal(err)
+	// The rewrite is subtracted in place: no full rebuild is queued.
+	var dirty int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM meta WHERE key='graph_dirty'`).Scan(&dirty); err != nil || dirty != 0 {
+		t.Fatalf("rewrite queued a full rebuild: dirty=%d err=%v", dirty, err)
+	}
+	if n, _, err := db.IndexNew(1); err != nil || n != 2 {
+		t.Fatalf("rewritten rows not indexed incrementally: n=%d err=%v", n, err)
 	}
 	old, err := db.Search("sentry", "", "", 10)
 	if err != nil || len(old) != 0 {
@@ -359,6 +466,10 @@ func TestSyncMessagesRefreshesEditedSessionAndGraph(t *testing.T) {
 	if err != nil || len(hits) != 0 {
 		t.Fatalf("stale graph remained: hits=%+v err=%v", hits, err)
 	}
+	hits, err = db.Related("bastion", "keep", 1, 10)
+	if err != nil || len(hits) != 1 || hits[0].Term != "aegis" || hits[0].Weight != 1 {
+		t.Fatalf("other session's graph changed: hits=%+v err=%v", hits, err)
+	}
 	if err := db.SyncMessages(s.ID, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +477,7 @@ func TestSyncMessagesRefreshesEditedSessionAndGraph(t *testing.T) {
 		t.Fatal(err)
 	}
 	hits, err = db.Related("bastion", "", 1, 10)
-	if err != nil || len(hits) != 0 {
+	if err != nil || len(hits) != 1 || hits[0].Term != "aegis" {
 		t.Fatalf("deleted session still indexed: hits=%+v err=%v", hits, err)
 	}
 }
@@ -388,11 +499,55 @@ func TestIndexFullHealsThresholdDrift(t *testing.T) {
 	}
 }
 
-func TestTypedEdgesOutrankCoMention(t *testing.T) {
+// A typed relation seen twice outranks co-mentions; a one-off, often a
+// misparse like "barricade's actual shape", ranks by weight like them.
+// Word forms share one graph node, shown by its most common surface word.
+func TestGraphMergesWordFormsUnderOneLabel(t *testing.T) {
+	db := openTemp(t)
+	insertMsg(t, db, "a", 0, "enemies roam")
+	insertMsg(t, db, "b", 0, "the enemy roams")
+	insertMsg(t, db, "c", 0, "enemies roam")
+	if _, _, err := db.IndexNew(1); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := db.Related("enemy", "p", 1, 10)
+	if err != nil || len(hits) != 1 || hits[0].Term != "roam" || hits[0].Weight != 3 {
+		t.Fatalf("word forms not merged: %+v err=%v", hits, err)
+	}
+}
+
+// Graph neighbours only fill slots the query's own matches leave open,
+// after them, and marked.
+func TestRecallFillsFromGraphNeighboursAfterDirectMatches(t *testing.T) {
+	db := openTemp(t)
+	insertMsg(t, db, "direct", 0, "enemies disengage and roam")
+	insertMsg(t, db, "neighbour", 0, "patrols roam the campaign")
+	insertMsg(t, db, "unrelated", 0, "quartermaster ledger totals")
+	if _, _, err := db.IndexNew(1); err != nil {
+		t.Fatal(err)
+	}
+	results, related, err := db.Recall("disengage", "", "", 5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].Session.ID != "direct" || results[0].ViaGraph ||
+		results[1].Session.ID != "neighbour" || !results[1].ViaGraph {
+		t.Fatalf("graph fill wrong: %+v", results)
+	}
+	if !slices.ContainsFunc(related, func(t Topic) bool { return t.Label == "roam" }) {
+		t.Fatalf("neighbour not reported: %+v", related)
+	}
+	if full, _, err := db.Recall("disengage", "", "", 1, 1); err != nil || len(full) != 1 || full[0].ViaGraph {
+		t.Fatalf("graph filled a slot a direct match needed: %+v err=%v", full, err)
+	}
+}
+
+func TestRecurringTypedEdgesOutrankCoMention(t *testing.T) {
 	db := openTemp(t)
 	if err := db.ReplaceEdges(map[ProjectEdge]int{
 		{Project: "p", A: "bastion", B: "noise"}:                    9,
-		{Project: "p", A: "bastion", B: "sentry", Kind: "replaces"}: 1,
+		{Project: "p", A: "bastion", B: "sentry", Kind: "replaces"}: 2,
+		{Project: "p", A: "actual", B: "bastion", Kind: "owns"}:     1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -400,8 +555,8 @@ func TestTypedEdgesOutrankCoMention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hits) != 2 || hits[0].Term != "sentry" || hits[0].Kind != "replaces" {
-		t.Fatalf("typed edge should rank first: %+v", hits)
+	if len(hits) != 3 || hits[0].Term != "sentry" || hits[1].Term != "noise" || hits[2].Term != "actual" {
+		t.Fatalf("typed ranking wrong: %+v", hits)
 	}
 }
 

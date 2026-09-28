@@ -5,8 +5,8 @@ import (
 	"database/sql/driver"
 	"fmt"
 
-	"duck-mem/internal/embed"
-	"duck-mem/internal/topics"
+	"github.com/jmarceno/duck-mem/internal/embed"
+	"github.com/jmarceno/duck-mem/internal/topics"
 
 	duckdb "github.com/marcboeker/go-duckdb/v2"
 )
@@ -114,6 +114,12 @@ func copyMessages(conn *duckdb.Conn, rows []stagedMessage, ignoreConflict bool) 
 	if err := appendTable(conn, "stage_messages", vals); err != nil {
 		return err
 	}
+	// Postings first, while the anti-join can still tell new rows from
+	// re-ingested ones.
+	if err := execConn(conn, insertTermsSQL(`SELECT s.session_id, s.seq, s.text FROM stage_messages s
+		ANTI JOIN messages m ON m.session_id = s.session_id AND m.seq = s.seq`)); err != nil {
+		return err
+	}
 	q := `INSERT INTO messages(session_id, seq, source, project, role, text, created_at, indexed, embedding)
 		SELECT session_id, seq, source, project, role, text, created_at, indexed,
 			CASE WHEN embedding IS NULL THEN NULL ELSE embedding::FLOAT[` + fmt.Sprint(embed.Dim) + `] END
@@ -125,7 +131,7 @@ func copyMessages(conn *duckdb.Conn, rows []stagedMessage, ignoreConflict bool) 
 }
 
 type stagedTopic struct {
-	id, project, term string
+	id, project, term, label string
 }
 
 type stagedEdge struct {
@@ -133,7 +139,15 @@ type stagedEdge struct {
 	weight                                                int32
 }
 
-func collectEdges(edges map[ProjectEdge]int, evidence map[ProjectEdge]string) ([]stagedTopic, []stagedEdge) {
+// collectEdges stages both directions of each edge. labels maps a stemmed
+// term to the surface word shown for it; a missing label shows the term.
+func collectEdges(edges map[ProjectEdge]int, evidence map[ProjectEdge]string, labels map[string]string) ([]stagedTopic, []stagedEdge) {
+	label := func(term string) string {
+		if l := labels[term]; l != "" {
+			return l
+		}
+		return term
+	}
 	topicsSeen := map[string]stagedTopic{}
 	var out []stagedEdge
 	for e, w := range edges {
@@ -144,8 +158,8 @@ func collectEdges(edges map[ProjectEdge]int, evidence map[ProjectEdge]string) ([
 		ends := [][2]string{{e.A, e.B}, {e.B, e.A}}
 		for _, end := range ends {
 			src, dst := topicID(e.Project, end[0]), topicID(e.Project, end[1])
-			topicsSeen[src] = stagedTopic{src, e.Project, end[0]}
-			topicsSeen[dst] = stagedTopic{dst, e.Project, end[1]}
+			topicsSeen[src] = stagedTopic{src, e.Project, end[0], label(end[0])}
+			topicsSeen[dst] = stagedTopic{dst, e.Project, end[1], label(end[1])}
 			out = append(out, stagedEdge{
 				id: edgeID(src, dst, e.kind(), e.From, e.To), src: src, dst: dst,
 				project: e.Project, a: e.A, b: e.B, weight: int32(w), kind: e.kind(),
@@ -168,7 +182,8 @@ func resetGraphTables(conn *duckdb.Conn) error {
 		`CREATE TABLE topics(
 			topic_id TEXT PRIMARY KEY,
 			project TEXT NOT NULL,
-			term TEXT NOT NULL)`,
+			term TEXT NOT NULL,
+			label TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE topic_edges(
 			edge_id TEXT PRIMARY KEY,
 			src_id TEXT NOT NULL REFERENCES topics(topic_id),
@@ -196,7 +211,7 @@ func copyTopicsAndEdges(conn *duckdb.Conn, topics []stagedTopic, edges []stagedE
 	if err := execConn(conn, `DROP TABLE IF EXISTS stage_edges`); err != nil {
 		return err
 	}
-	if err := execConn(conn, `CREATE TEMP TABLE stage_topics(topic_id TEXT, project TEXT, term TEXT)`); err != nil {
+	if err := execConn(conn, `CREATE TEMP TABLE stage_topics(topic_id TEXT, project TEXT, term TEXT, label TEXT)`); err != nil {
 		return err
 	}
 	if err := execConn(conn, `CREATE TEMP TABLE stage_edges(
@@ -206,7 +221,7 @@ func copyTopicsAndEdges(conn *duckdb.Conn, topics []stagedTopic, edges []stagedE
 	}
 	topicVals := make([][]driver.Value, len(topics))
 	for i, t := range topics {
-		topicVals[i] = []driver.Value{t.id, t.project, t.term}
+		topicVals[i] = []driver.Value{t.id, t.project, t.term, t.label}
 	}
 	if err := appendTable(conn, "stage_topics", topicVals); err != nil {
 		return err
@@ -218,7 +233,7 @@ func copyTopicsAndEdges(conn *duckdb.Conn, topics []stagedTopic, edges []stagedE
 	if err := appendTable(conn, "stage_edges", edgeVals); err != nil {
 		return err
 	}
-	topicSQL := `INSERT INTO topics(topic_id, project, term) SELECT topic_id, project, term FROM stage_topics`
+	topicSQL := `INSERT INTO topics(topic_id, project, term, label) SELECT topic_id, project, term, label FROM stage_topics`
 	edgeSQL := `INSERT INTO topic_edges(edge_id, src_id, dst_id, project, term_a, term_b, weight, kind, from_term, to_term, evidence)
 		SELECT edge_id, src_id, dst_id, project, term_a, term_b, weight, kind, from_term, to_term, evidence FROM stage_edges`
 	if addWeight {

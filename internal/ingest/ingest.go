@@ -14,7 +14,7 @@ import (
 	"time"
 	"unicode"
 
-	"duck-mem/internal/store"
+	"github.com/jmarceno/duck-mem/internal/store"
 )
 
 // toolBlock excises inline tool-call dumps embedded in newer Codex message

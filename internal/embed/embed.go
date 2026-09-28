@@ -10,7 +10,7 @@ import (
 	"hash/fnv"
 	"math"
 
-	"duck-mem/internal/topics"
+	"github.com/jmarceno/duck-mem/internal/topics"
 )
 
 // Dim is the FLOAT[N] width of every stored embedding and of the HNSW index.

@@ -59,6 +59,13 @@ var stopwords = map[string]bool{
 	"failed": true, "pass": true, "case": true, "part": true, "end": true,
 	"start": true, "started": true, "game": true, "dev": true, "team": true,
 	"server": true, "client": true, "app": true, "feature": true, "system": true,
+	// Adverbs attach to any topic, so as graph neighbours they say nothing.
+	"anymore": true, "simply": true, "certain": true, "actually": true, "basically": true,
+	"probably": true, "currently": true, "already": true, "exactly": true, "properly": true,
+	"instead": true, "otherwise": true, "anyway": true, "likely": true, "usually": true,
+	"especially": true, "entirely": true, "completely": true, "fully": true, "mostly": true,
+	"mainly": true, "clearly": true, "directly": true, "immediately": true, "correctly": true,
+	"possibly": true, "possible": true, "almost": true, "enough": true, "again": true,
 }
 
 // MaxDFRatio drops terms appearing in more than this fraction of messages:
@@ -239,6 +246,30 @@ var replaceVerbs = map[string]bool{
 	"supersede": true, "supersedes": true, "superseded": true, "superseding": true,
 }
 
+// weakEndpoints are modifiers that follow a possessive or sit next to a
+// replacement verb without naming a thing: "barricade's actual shape",
+// "the enemy's own materials", "game-side code to be replaced".
+var weakEndpoints = map[string]bool{
+	"actual": true, "own": true, "standard": true, "side": true, "first": true,
+	"last": true, "next": true, "current": true, "main": true, "whole": true,
+	"full": true, "real": true, "old": true, "entire": true, "overall": true,
+	"best": true, "general": true, "specific": true, "proper": true, "original": true,
+	"previous": true, "final": true, "little": true, "big": true, "small": true,
+	"large": true, "good": true, "bad": true, "great": true, "top": true,
+	"bottom": true, "left": true, "right": true, "internal": true, "external": true,
+	"existing": true, "various": true, "certain": true, "several": true, "different": true,
+	"similar": true, "latest": true, "earlier": true, "later": true, "single": true,
+	"multiple": true, "total": true, "primary": true, "secondary": true, "simple": true,
+	"basic": true, "common": true, "exact": true, "correct": true, "wrong": true,
+	"second": true, "third": true, "initial": true, "default": true, "usual": true,
+	"entry": true, "whatever": true, "everyone": true, "nobody": true, "somewhere": true,
+}
+
+// isEndpoint reports whether w can name one end of a typed relation.
+func isEndpoint(w string) bool {
+	return isContent(w) && !weakEndpoints[w]
+}
+
 func isContent(w string) bool {
 	return len(w) >= 3 && !stopwords[w] && !isDigits(w)
 }
@@ -284,7 +315,7 @@ func contentTokens(text string) []string {
 
 // ExtractTyped finds rule-based relations in text, sentence by sentence:
 // possessive "X's Y" -> owns, replacement verbs and "instead of" ->
-// replaces. Both endpoints must be content words.
+// replaces. Both endpoints must be content words that name a thing.
 func ExtractTyped(text string) []TypedPair {
 	return Analyze(text).Typed
 }
@@ -305,7 +336,7 @@ func extractSent(toks []string, evidence string) []TypedPair {
 	var out []TypedPair
 	// Possessive: X ' s Y.
 	for i := 0; i+3 < len(toks); i++ {
-		if toks[i+1] == "'" && toks[i+2] == "s" && isContent(toks[i]) && isContent(toks[i+3]) {
+		if toks[i+1] == "'" && toks[i+2] == "s" && isEndpoint(toks[i]) && isEndpoint(toks[i+3]) {
 			out = append(out, typedPair(toks[i], toks[i+3], KindOwns, evidence))
 		}
 	}
@@ -334,6 +365,11 @@ func extractSent(toks []string, evidence string) []TypedPair {
 				obj = toks[j]
 				break
 			}
+		}
+		// The nearest content word decides; a weak one means no relation,
+		// not a reach for a farther word.
+		if !isEndpoint(subj) || !isEndpoint(obj) {
+			continue
 		}
 		if subj == "" || obj == "" || subj == obj {
 			continue

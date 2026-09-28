@@ -12,12 +12,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
-	"duck-mem/internal/ingest"
-	"duck-mem/internal/store"
+	"github.com/jmarceno/duck-mem/internal/ingest"
+	"github.com/jmarceno/duck-mem/internal/store"
 )
 
 const parserVersion = 1
@@ -50,6 +52,8 @@ func main() {
 		ingestCmd(os.Args[2:])
 	case "query":
 		queryCmd(os.Args[2:])
+	case "show":
+		showCmd(os.Args[2:])
 	case "index":
 		indexCmd(os.Args[2:])
 	case "related":
@@ -68,7 +72,10 @@ func usage() {
   duck-mem --install                    install CLI, daemon, and tray for this user
   duck-mem --uninstall [--keep-data|--purge-data]
   duck-mem ingest [--db PATH] [ROOT...]   ingest session logs (default roots when omitted)
-  duck-mem query [--db PATH] [--project P] [--source S] [--limit N] <text...>
+  duck-mem query [--db PATH] [--project P] [--source S] [--limit N] [--hits N] <text...>
+                                        best-matching sessions, each with its matching messages
+  duck-mem show [--db PATH] [--context N] [--from A] [--to B] [--full] <session>[#seq]
+                                        read a session's messages around a hit
   duck-mem index [--db PATH] [--min-df N] [--full] rebuild the topic graph
   duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
   duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
@@ -443,7 +450,7 @@ func relatedCmd(args []string) {
 		fatal(err)
 	}
 	defer db.Close()
-	hits, err := db.Related(joinArgs(fs.Args()), *project, *depth, *limit)
+	hits, err := db.Related(strings.Join(fs.Args(), " "), *project, *depth, *limit)
 	if err != nil {
 		fatal(err)
 	}
@@ -458,7 +465,7 @@ func relatedCmd(args []string) {
 			fmt.Printf("%s (%s, via %s)", h.Term, rel, h.Via)
 		}
 		if h.Evidence != "" {
-			fmt.Printf(" [%s]", oneLine(h.Evidence))
+			fmt.Printf(" [%s]", clip(h.Evidence, 240))
 		}
 		fmt.Println()
 	}
@@ -467,10 +474,11 @@ func relatedCmd(args []string) {
 func queryCmd(args []string) {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
 	dbPath := fs.String("db", defaultDB(), "DuckDB file")
-	project := fs.String("project", "", "filter by project (substring match)")
+	project := fs.String("project", "", "filter by project path (substring match)")
 	source := fs.String("source", "", "filter by source: codex|claude|cursor|muse|opencode")
-	limit := fs.Int("limit", 20, "max results")
-	known := map[string]bool{"--db": true, "--project": true, "--source": true, "--limit": true}
+	limit := fs.Int("limit", 5, "max sessions")
+	perSession := fs.Int("hits", 3, "max matching messages shown per session")
+	known := map[string]bool{"--db": true, "--project": true, "--source": true, "--limit": true, "--hits": true}
 	flagArgs, positional := splitArgs(args, known)
 	_ = fs.Parse(flagArgs)
 	fs.Parse(positional)
@@ -484,40 +492,194 @@ func queryCmd(args []string) {
 	}
 	defer db.Close()
 
-	q := joinArgs(fs.Args())
-	hits, err := db.Search(q, *project, *source, *limit)
+	q := strings.Join(fs.Args(), " ")
+	results, related, err := db.Recall(q, *project, *source, *limit, *perSession)
 	if err != nil {
 		fatal(err)
 	}
-	for _, h := range hits {
-		fmt.Printf("[%s] %s %s#%d (%s): %s\n", h.Source, h.Project, h.SessionID, h.Seq, h.Role, oneLine(h.Snippet))
+	scope := ""
+	if *project != "" {
+		scope += " in projects matching " + strconv.Quote(*project)
+	}
+	if *source != "" {
+		scope += " from " + *source
+	}
+	if len(results) == 0 {
+		fmt.Printf("no matches for %q%s\n", q, scope)
+		if *project != "" {
+			if others, _, err := db.Recall(q, "", *source, 5, 1); err == nil && len(others) > 0 {
+				var projects []string
+				seen := map[string]bool{}
+				for _, r := range others {
+					if !seen[r.Session.Project] {
+						seen[r.Session.Project] = true
+						projects = append(projects, r.Session.Project)
+					}
+				}
+				fmt.Printf("matches exist in other projects: %s (drop --project to see them)\n", strings.Join(projects, ", "))
+			}
+		}
+		fmt.Println("tip: use a few distinctive words (names, identifiers, error text); word forms are matched (enemy/enemies)")
+		return
+	}
+	fmt.Printf("%d sessions for %q%s, best first. Messages are numbered #seq.\n\n", len(results), q, scope)
+	for i, r := range results {
+		fmt.Printf("[%d] %s  %s · %s · %d msgs · %s\n", i+1, r.Session.ID, r.Session.Source,
+			dateRange(r.Session.StartedAt, r.LastAt), r.Messages, r.Session.Project)
+		if r.ViaGraph {
+			fmt.Println("    (no query words here; found through the topic-graph neighbours below)")
+		}
+		if r.Title != "" {
+			fmt.Printf("    opened with: %q\n", clip(r.Title, 160))
+		}
+		for _, h := range r.Hits {
+			fmt.Printf("    #%d %s%s: %s\n", h.Seq, h.Role, stamp(" ", h.CreatedAt), h.Snippet)
+		}
+		fmt.Println()
+	}
+	if len(related) > 0 {
+		words := make([]string, len(related))
+		for i, t := range related {
+			words[i] = fmt.Sprintf("%s (%d)", t.Label, t.Weight)
+		}
+		fmt.Printf("Topic graph: often discussed with these words: %s\n", strings.Join(words, ", "))
+		fmt.Println("  Add one to the query to widen it, or map the area: duck-mem related " + projectFlag(*project) + related[0].Label)
+	}
+	top := results[0]
+	fmt.Printf("Read a hit with the messages around it: duck-mem show %s#%d\n", top.Session.ID, top.Hits[0].Seq)
+}
+
+func showCmd(args []string) {
+	fs := flag.NewFlagSet("show", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDB(), "DuckDB file")
+	ctxN := fs.Int("context", 3, "messages before and after #seq")
+	from := fs.Int("from", -1, "first message #seq to show")
+	to := fs.Int("to", -1, "last message #seq to show")
+	full := fs.Bool("full", false, "print whole messages instead of truncating long ones")
+	known := map[string]bool{"--db": true, "--context": true, "--from": true, "--to": true, "--full": false}
+	flagArgs, positional := splitArgs(args, known)
+	_ = fs.Parse(flagArgs)
+	fs.Parse(positional)
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "show needs one session reference: <session-id>[#seq] (an ID prefix works)")
+		os.Exit(2)
+	}
+	ref, target := fs.Arg(0), -1
+	if i := strings.LastIndexByte(ref, '#'); i >= 0 {
+		n, err := strconv.Atoi(ref[i+1:])
+		if err != nil || n < 0 {
+			fmt.Fprintf(os.Stderr, "bad message number in %q: want <session-id>#<seq>\n", ref)
+			os.Exit(2)
+		}
+		ref, target = ref[:i], n
+	}
+	db, err := openTolerant(*dbPath, true)
+	if err != nil {
+		fatal(err)
+	}
+	defer db.Close()
+	s, err := db.ResolveSession(ref)
+	if err != nil {
+		fatal(err)
+	}
+	lo, hi := showWindow(target, *ctxN, *from, *to, s.Messages)
+	msgs, err := db.Window(s.Session.ID, lo, hi)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("session %s · %s · %s\n", s.Session.ID, s.Session.Source, s.Session.Project)
+	fmt.Printf("%s · %d messages (#0–#%d) · log %s\n", dateRange(s.Session.StartedAt, s.LastAt), s.Messages, s.Messages-1, s.Session.Path)
+	if len(msgs) == 0 {
+		fmt.Printf("no messages in #%d–#%d\n", lo, hi)
+		return
+	}
+	var more []string
+	if lo > 0 {
+		more = append(more, fmt.Sprintf("earlier: --from %d --to %d", max(0, lo-(hi-lo+1)), lo-1))
+	}
+	if hi < s.Messages-1 {
+		more = append(more, fmt.Sprintf("later: --from %d --to %d", hi+1, min(s.Messages-1, hi+(hi-lo+1))))
+	}
+	if !*full {
+		more = append(more, "whole messages: --full")
+	}
+	fmt.Printf("showing #%d–#%d; %s\n", msgs[0].Seq, msgs[len(msgs)-1].Seq, strings.Join(more, "; "))
+	for _, m := range msgs {
+		mark := ""
+		if m.Seq == target {
+			mark = "  <- hit"
+		}
+		fmt.Printf("\n--- #%d %s%s%s\n", m.Seq, m.Role, stamp(" · ", m.CreatedAt), mark)
+		text := strings.TrimSpace(m.Text)
+		limit := 1500
+		if m.Seq == target {
+			limit = 4000
+		}
+		if !*full && utf8.RuneCountInString(text) > limit {
+			cut := []rune(text)
+			text = string(cut[:limit]) + fmt.Sprintf(" … [+%d chars; --full]", len(cut)-limit)
+		}
+		fmt.Println(text)
 	}
 }
 
-func joinArgs(a []string) string {
-	out := ""
-	for i, s := range a {
-		if i > 0 {
-			out += " "
+// showWindow picks the #seq range: explicit --from/--to first, then
+// --context around the hit, else the session's opening messages.
+func showWindow(target, context, from, to, total int) (int, int) {
+	lo, hi := 0, 19
+	if target >= 0 {
+		lo, hi = target-context, target+context
+	}
+	if from >= 0 {
+		lo = from
+		if to < 0 {
+			hi = from + 19
 		}
-		out += s
+	}
+	if to >= 0 {
+		hi = to
+		if from < 0 && target < 0 {
+			lo = to - 19
+		}
+	}
+	return max(0, lo), min(hi, max(0, total-1))
+}
+
+func projectFlag(project string) string {
+	if project == "" {
+		return ""
+	}
+	return "--project " + project + " "
+}
+
+func dateRange(start, last time.Time) string {
+	if start.IsZero() {
+		start = last
+	}
+	if start.IsZero() {
+		return "undated"
+	}
+	out := start.Local().Format("2006-01-02")
+	if !last.IsZero() && last.Local().Format("2006-01-02") != out {
+		out += " → " + last.Local().Format("2006-01-02")
 	}
 	return out
 }
 
-func oneLine(s string) string {
-	out := ""
-	for _, r := range s {
-		if r == '\n' || r == '\r' || r == '\t' {
-			out += " "
-		} else {
-			out += string(r)
-		}
-		if len(out) > 240 {
-			return out + "…"
-		}
+func stamp(sep string, t time.Time) string {
+	if t.IsZero() {
+		return ""
 	}
-	return out
+	return sep + t.Local().Format("2006-01-02 15:04")
+}
+
+// clip collapses whitespace and cuts s to n runes.
+func clip(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n]) + "…"
 }
 
 func fatal(err error) {
