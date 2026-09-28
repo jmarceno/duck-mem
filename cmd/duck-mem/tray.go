@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -59,6 +58,7 @@ type menuEvent struct {
 type trayApp struct {
 	conn  *dbus.Conn
 	props *prop.Properties
+	icons trayIcons
 	mu    sync.Mutex
 	state traySnapshot
 }
@@ -83,7 +83,11 @@ func runTray() error {
 	if err != nil || reply != dbus.RequestNameReplyPrimaryOwner {
 		return fmt.Errorf("request SNI bus name: %v (reply %d)", err, reply)
 	}
-	app := &trayApp{conn: conn}
+	icons, err := newTrayIcons()
+	if err != nil {
+		return fmt.Errorf("tray icon: %w", err)
+	}
+	app := &trayApp{conn: conn, icons: icons}
 	app.refresh()
 	if err := conn.Export(app, sniPath, sniInterface); err != nil {
 		return err
@@ -136,7 +140,6 @@ func registerTray(conn *dbus.Conn, name string) error {
 
 func (a *trayApp) exportProperties() error {
 	s := a.snapshot()
-	pixmap := trayIcon(s.running, s.busy, 24)
 	props, err := prop.Export(a.conn, sniPath, prop.Map{sniInterface: {
 		"Category":            {Value: "SystemServices", Emit: prop.EmitConst},
 		"Id":                  {Value: "duck-mem", Emit: prop.EmitConst},
@@ -144,13 +147,13 @@ func (a *trayApp) exportProperties() error {
 		"Status":              {Value: "Active", Emit: prop.EmitConst},
 		"WindowId":            {Value: uint32(0), Emit: prop.EmitConst},
 		"IconName":            {Value: "", Emit: prop.EmitConst},
-		"IconPixmap":          {Value: []iconPixmap{pixmap, trayIcon(s.running, s.busy, 48)}, Emit: prop.EmitTrue},
+		"IconPixmap":          {Value: a.icons.logo, Emit: prop.EmitTrue},
 		"OverlayIconName":     {Value: "", Emit: prop.EmitConst},
-		"OverlayIconPixmap":   {Value: []iconPixmap{}, Emit: prop.EmitConst},
+		"OverlayIconPixmap":   {Value: a.icons.overlay(s), Emit: prop.EmitTrue},
 		"AttentionIconName":   {Value: "", Emit: prop.EmitConst},
 		"AttentionIconPixmap": {Value: []iconPixmap{}, Emit: prop.EmitConst},
 		"AttentionMovieName":  {Value: "", Emit: prop.EmitConst},
-		"ToolTip":             {Value: trayTooltip{"", []iconPixmap{pixmap}, "duck-mem", a.lastSyncLabel(s)}, Emit: prop.EmitTrue},
+		"ToolTip":             {Value: a.tooltip(s), Emit: prop.EmitTrue},
 		"Menu":                {Value: menuPath, Emit: prop.EmitConst},
 		"ItemIsMenu":          {Value: true, Emit: prop.EmitConst},
 	}})
@@ -192,12 +195,19 @@ func (a *trayApp) refresh() bool {
 }
 
 func (a *trayApp) publish(s traySnapshot) {
-	pixmap := trayIcon(s.running, s.busy, 24)
-	a.props.SetMust(sniInterface, "IconPixmap", []iconPixmap{pixmap, trayIcon(s.running, s.busy, 48)})
-	a.props.SetMust(sniInterface, "ToolTip", trayTooltip{"", []iconPixmap{pixmap}, "duck-mem", a.lastSyncLabel(s)})
+	a.props.SetMust(sniInterface, "IconPixmap", a.icons.logo)
+	a.props.SetMust(sniInterface, "OverlayIconPixmap", a.icons.overlay(s))
+	a.props.SetMust(sniInterface, "ToolTip", a.tooltip(s))
 	_ = a.conn.Emit(sniPath, sniInterface+".NewIcon")
 	_ = a.conn.Emit(sniPath, sniInterface+".NewToolTip")
 	_ = a.conn.Emit(menuPath, menuInterface+".LayoutUpdated", s.revision, int32(0))
+}
+
+// tooltip carries the logo next to the last-sync line; hosts that only render
+// the tooltip icon still show something recognisable.
+func (a *trayApp) tooltip(s traySnapshot) trayTooltip {
+	logo := pickPixmap(a.icons.logo, 24)
+	return trayTooltip{"", []iconPixmap{logo}, "duck-mem", a.lastSyncLabel(s)}
 }
 
 func (a *trayApp) beginAction(action string) bool {
@@ -408,34 +418,6 @@ func (a *trayApp) fullReindex(wasRunning bool) {
 	} else {
 		log.Printf("full re-index complete")
 	}
-}
-
-func trayIcon(running, busy bool, size int) iconPixmap {
-	color := [3]byte{112, 126, 138}
-	if running {
-		color = [3]byte{35, 196, 143}
-	}
-	if busy {
-		color = [3]byte{245, 174, 62}
-	}
-	data := make([]byte, size*size*4)
-	for y := 0; y < size; y++ {
-		for x := 0; x < size; x++ {
-			fx, fy := float64(x)/float64(size), float64(y)/float64(size)
-			body := fx >= .18 && fx <= .82 && fy >= .27 && fy <= .73
-			top := math.Pow((fx-.5)/.32, 2)+math.Pow((fy-.27)/.12, 2) <= 1
-			bottom := math.Pow((fx-.5)/.32, 2)+math.Pow((fy-.73)/.12, 2) <= 1
-			if !body && !top && !bottom {
-				continue
-			}
-			p := (y*size + x) * 4
-			data[p], data[p+1], data[p+2], data[p+3] = 255, color[0], color[1], color[2]
-			if fy > .43 && fy < .49 || fy > .60 && fy < .66 {
-				data[p+1], data[p+2], data[p+3] = color[0]/2, color[1]/2, color[2]/2
-			}
-		}
-	}
-	return iconPixmap{int32(size), int32(size), data}
 }
 
 func exportTrayIntrospection(conn *dbus.Conn) error {
