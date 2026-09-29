@@ -90,6 +90,29 @@ func TestSearchFindsBySimilarityFiltersAndDedupes(t *testing.T) {
 	}
 }
 
+func TestSyncMessagesWhenEveryRowHasAnEmbedding(t *testing.T) {
+	db := openTemp(t)
+	if err := db.UpsertSession(Session{ID: "s", Source: "codex", Project: "p", Path: "f"}); err != nil {
+		t.Fatal(err)
+	}
+	msgs := []Message{
+		{SessionID: "s", Seq: 0, Source: "codex", Project: "p", Role: "user", Text: "alpha bravo"},
+		{SessionID: "s", Seq: 1, Source: "codex", Project: "p", Role: "assistant", Text: "charlie delta"},
+	}
+	if err := db.SyncMessages("s", msgs); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertSession(Session{ID: "empty", Source: "codex", Project: "p", Path: "g"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SyncMessages("empty", []Message{
+		{SessionID: "empty", Seq: 0, Source: "codex", Project: "p", Role: "user", Text: "..."},
+		{SessionID: "empty", Seq: 1, Source: "codex", Project: "p", Role: "assistant", Text: "echo foxtrot"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSearchPlanUsesHNSW(t *testing.T) {
 	db := openTemp(t)
 	insertMsg(t, db, "s", 0, "zephyrturbine spins")

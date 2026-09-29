@@ -120,9 +120,12 @@ func copyMessages(conn *duckdb.Conn, rows []stagedMessage, ignoreConflict bool) 
 		ANTI JOIN messages m ON m.session_id = s.session_id AND m.seq = s.seq`)); err != nil {
 		return err
 	}
+	// A direct cast keeps both NULL and FLOAT[384]. CASE cannot match a
+	// fixed-size array, which is what the appender stores when every row
+	// in the batch has an embedding.
 	q := `INSERT INTO messages(session_id, seq, source, project, role, text, created_at, indexed, embedding)
 		SELECT session_id, seq, source, project, role, text, created_at, indexed,
-			CASE WHEN embedding IS NULL THEN NULL ELSE embedding::FLOAT[` + fmt.Sprint(embed.Dim) + `] END
+			embedding::FLOAT[` + fmt.Sprint(embed.Dim) + `]
 		FROM stage_messages`
 	if ignoreConflict {
 		q += ` ON CONFLICT(session_id, seq) DO NOTHING`
