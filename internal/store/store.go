@@ -63,7 +63,10 @@ type FileCheckpoint struct {
 // Open creates/opens the DuckDB file and initializes the schema.
 // vss and duckpgq are required: search and related do not run without them.
 func Open(path string) (*DB, error) {
-	sdb, err := sql.Open("duckdb", path)
+	if err := upgradeStorage(path); err != nil {
+		return nil, err
+	}
+	sdb, err := sql.Open("duckdb", dsn(path))
 	if err != nil {
 		return nil, err
 	}

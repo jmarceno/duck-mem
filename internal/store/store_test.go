@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -660,5 +661,50 @@ func TestDepth2ExpandsStrongestViasOnly(t *testing.T) {
 		if h.Term == "far" {
 			t.Fatalf("weak-via two-hop leaked (maxVia=%d): %+v", maxVia, hits)
 		}
+	}
+}
+
+func TestOpenRewritesOldStorageWithZstd(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.duckdb")
+	old, err := sql.Open("duckdb", path+"?storage_compatibility_version=v1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`CREATE TABLE sessions(session_id TEXT PRIMARY KEY, source TEXT NOT NULL, project TEXT NOT NULL DEFAULT '', started_at TIMESTAMPTZ, path TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE messages(session_id TEXT NOT NULL REFERENCES sessions(session_id), seq INTEGER NOT NULL, source TEXT NOT NULL, project TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, text TEXT NOT NULL, created_at TIMESTAMPTZ, PRIMARY KEY(session_id, seq))`,
+		`INSERT INTO sessions VALUES('s1', 'codex', 'p', NULL, 'f')`,
+		`INSERT INTO messages SELECT 's1', i, 'codex', 'p', 'user', 'message body ' || i || repeat(' filler', 50), NULL FROM range(5000) t(i)`,
+	} {
+		if _, err := old.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM messages`).Scan(&n); err != nil || n != 5000 {
+		t.Fatalf("rows after upgrade: %d %v", n, err)
+	}
+	var compressions []string
+	rows, err := db.sql.Query(`SELECT DISTINCT compression FROM pragma_storage_info('messages') WHERE column_name='text' AND segment_type='VARCHAR'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var c string
+		_ = rows.Scan(&c)
+		compressions = append(compressions, c)
+	}
+	rows.Close()
+	if !slices.Equal(compressions, []string{"ZSTD"}) {
+		t.Fatalf("text column compression %v, want only ZSTD", compressions)
 	}
 }
