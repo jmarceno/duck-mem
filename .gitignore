@@ -29,3 +29,6 @@ go.work
 .vscode/
 .DS_Store
 .directory
+
+# Misc
+others/
