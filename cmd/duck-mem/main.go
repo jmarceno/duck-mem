@@ -250,8 +250,9 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 			defer func() {
 				if failure != nil {
 					entry.Result, entry.Reason, entry.Detail = "failure", reason, failure.Error()
+					entry.Path = f
 				}
-				key := entry.Harness + "\x00" + entry.Reason + "\x00" + entry.Detail
+				key := entry.Harness + "\x00" + entry.Reason + "\x00" + entry.Detail + "\x00" + entry.Path
 				previous := entries[key]
 				entry.Sessions += previous.Sessions
 				entry.Lines += previous.Lines

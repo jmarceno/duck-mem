@@ -57,8 +57,8 @@ func TestTrayIconPixmapsMatchTheirDeclaredSize(t *testing.T) {
 
 func TestOverlayOnlyMarksTheStoppedOrBusyStates(t *testing.T) {
 	set := trayIcons{failed: []iconPixmap{{Width: 2}}, busy: []iconPixmap{{Width: 1}}, stopped: []iconPixmap{{Width: 1}}}
-	if got := set.overlay(traySnapshot{running: true, busy: true, failure: true}); len(got) != 1 || got[0].Width != 2 {
-		t.Errorf("unread failure overlay = %v, want red badge even while busy", got)
+	if got := set.overlay(traySnapshot{running: true, busy: true, failure: true}); len(got) != 0 {
+		t.Errorf("failure already drawn in main icon: got %d overlays", len(got))
 	}
 	if got := set.overlay(traySnapshot{running: true}); len(got) != 0 {
 		t.Errorf("running overlay = %d pixmaps, want none", len(got))
@@ -68,5 +68,29 @@ func TestOverlayOnlyMarksTheStoppedOrBusyStates(t *testing.T) {
 	}
 	if got := set.overlay(traySnapshot{}); len(got) != 1 || got[0].Width != 1 {
 		t.Errorf("stopped overlay = %v, want the stopped badge", got)
+	}
+}
+
+func TestFailureDotIsVisibleInMainIcon(t *testing.T) {
+	set, err := newTrayIcons()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []traySnapshot{{running: true, failure: true}, {busy: true, failure: true}, {failure: true}} {
+		p := pickPixmap(set.icon(state), 22)
+		// The centre of the upper-right badge must be opaque red even when
+		// the host renders only IconPixmap and ignores overlays.
+		o := (5*int(p.Width) + 16) * 4
+		if p.Data[o] != 255 || p.Data[o+1] != failedColor.R || p.Data[o+2] != failedColor.G || p.Data[o+3] != failedColor.B {
+			t.Fatalf("failure dot missing for %+v: pixel=%v", state, p.Data[o:o+4])
+		}
+		// The duck artwork remains in the main icon outside the badge.
+		logo := pickPixmap(set.icon(traySnapshot{running: true}), 22)
+		o = (15*int(p.Width) + 10) * 4
+		for i := 0; i < 4; i++ {
+			if p.Data[o+i] != logo.Data[o+i] {
+				t.Fatal("failure icon changed artwork outside the badge")
+			}
+		}
 	}
 }

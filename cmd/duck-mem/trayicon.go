@@ -20,6 +20,7 @@ var traySizes = []int{22, 24, 36, 48, 64, 128}
 var (
 	busyColor    = color.NRGBA{R: 245, G: 174, B: 62, A: 255}
 	stoppedColor = color.NRGBA{R: 128, G: 128, B: 128, A: 255}
+	failedColor  = color.NRGBA{R: 220, G: 50, B: 50, A: 255}
 )
 
 // trayIcons holds the logo and the status badges pre-rendered at every tray
@@ -38,20 +39,29 @@ func newTrayIcons() (trayIcons, error) {
 	}
 	var set trayIcons
 	for _, size := range traySizes {
-		set.logo = append(set.logo, pixmap(resampleArea(src, size)))
+		logo := resampleArea(src, size)
+		set.logo = append(set.logo, pixmap(logo))
 		set.busy = append(set.busy, pixmap(statusBadge(size, busyColor)))
-		set.failed = append(set.failed, pixmap(statusBadge(size, color.NRGBA{R: 220, G: 50, B: 50, A: 255})))
+		set.failed = append(set.failed, pixmap(failureIcon(logo)))
 		set.stopped = append(set.stopped, pixmap(statusBadge(size, stoppedColor)))
 	}
 	return set, nil
 }
 
-// overlay returns the badge for the current state: none while the indexer
-// runs, red for unread sync failures, amber while busy, grey while stopped.
+// icon includes the failure badge in the main pixmap so hosts that ignore
+// OverlayIconPixmap still display unread errors.
+func (i trayIcons) icon(s traySnapshot) []iconPixmap {
+	if s.failure {
+		return i.failed
+	}
+	return i.logo
+}
+
+// Failure takes precedence over the busy and stopped overlays.
 func (i trayIcons) overlay(s traySnapshot) []iconPixmap {
 	switch {
 	case s.failure:
-		return i.failed
+		return []iconPixmap{}
 	case s.busy:
 		return i.busy
 	case !s.running:
@@ -59,6 +69,16 @@ func (i trayIcons) overlay(s traySnapshot) []iconPixmap {
 	default:
 		return []iconPixmap{}
 	}
+}
+
+func failureIcon(logo *image.NRGBA) *image.NRGBA {
+	size := logo.Bounds().Dx()
+	img := image.NewNRGBA(logo.Bounds())
+	draw.Draw(img, img.Bounds(), logo, logo.Bounds().Min, draw.Src)
+	badgeSize := size / 2
+	badge := statusBadge(badgeSize, failedColor)
+	draw.Draw(img, image.Rect(size-badgeSize, 0, size, badgeSize), badge, image.Point{}, draw.Over)
+	return img
 }
 
 var (

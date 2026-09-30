@@ -148,7 +148,7 @@ func (a *trayApp) exportProperties() error {
 		"Status":              {Value: "Active", Emit: prop.EmitConst},
 		"WindowId":            {Value: uint32(0), Emit: prop.EmitConst},
 		"IconName":            {Value: "", Emit: prop.EmitConst},
-		"IconPixmap":          {Value: a.icons.logo, Emit: prop.EmitTrue},
+		"IconPixmap":          {Value: a.icons.icon(s), Emit: prop.EmitTrue},
 		"OverlayIconName":     {Value: "", Emit: prop.EmitConst},
 		"OverlayIconPixmap":   {Value: a.icons.overlay(s), Emit: prop.EmitTrue},
 		"AttentionIconName":   {Value: "", Emit: prop.EmitConst},
@@ -198,7 +198,7 @@ func (a *trayApp) refresh() bool {
 }
 
 func (a *trayApp) publish(s traySnapshot) {
-	a.props.SetMust(sniInterface, "IconPixmap", a.icons.logo)
+	a.props.SetMust(sniInterface, "IconPixmap", a.icons.icon(s))
 	a.props.SetMust(sniInterface, "OverlayIconPixmap", a.icons.overlay(s))
 	a.props.SetMust(sniInterface, "ToolTip", a.tooltip(s))
 	_ = a.conn.Emit(sniPath, sniInterface+".NewIcon")
@@ -210,8 +210,12 @@ func (a *trayApp) publish(s traySnapshot) {
 // tooltip carries the logo next to the last-sync line; hosts that only render
 // the tooltip icon still show something recognisable.
 func (a *trayApp) tooltip(s traySnapshot) trayTooltip {
-	logo := pickPixmap(a.icons.logo, 24)
-	return trayTooltip{"", []iconPixmap{logo}, "duck-mem", a.lastSyncLabel(s)}
+	logo := pickPixmap(a.icons.icon(s), 24)
+	text := a.lastSyncLabel(s)
+	if s.failure {
+		text += "\nUnacknowledged sync errors: view logs for details"
+	}
+	return trayTooltip{"", []iconPixmap{logo}, "duck-mem", text}
 }
 
 func (a *trayApp) beginAction(action string) bool {
@@ -283,6 +287,7 @@ func (a *trayApp) menuItems(s traySnapshot) []menuLayout {
 		menuItem(5, "Stop daemon", s.running && !s.busy),
 		menuItem(6, "Full re-index", !s.busy),
 		menuItem(7, "View logs", true),
+		menuItem(8, "Acknowledge errors", s.failure),
 	}
 }
 
@@ -358,7 +363,6 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 	s := a.snapshot()
 	switch id {
 	case 7:
-		marker, _ := os.ReadFile(failurePath())
 		if err := os.MkdirAll(logDir(), 0o700); err != nil {
 			return dbus.MakeFailedError(err)
 		}
@@ -371,6 +375,11 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 				log.Printf("open sync logs: %v", err)
 			}
 		}()
+	case 8:
+		marker, err := os.ReadFile(failurePath())
+		if err != nil {
+			return dbus.MakeFailedError(err)
+		}
 		if err := acknowledgeSyncFailure(marker); err != nil {
 			return dbus.MakeFailedError(err)
 		}

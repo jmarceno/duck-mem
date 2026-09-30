@@ -10,7 +10,7 @@ import (
 
 func TestSyncHistoryAndFailureAcknowledgement(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	failure := syncLogEntry{Harness: "codex", Result: "failure", Reason: "Unexpected format", Detail: "unrecognized record envelope"}
+	failure := syncLogEntry{Harness: "cursor", Result: "failure", Reason: "Unexpected format", Detail: "unrecognized record envelope", Path: "/cursor/thread.jsonl"}
 	if err := appendSyncLog(failure); err != nil {
 		t.Fatal(err)
 	}
@@ -22,6 +22,9 @@ func TestSyncHistoryAndFailureAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := appendSyncLog(syncLogEntry{Harness: "claude", Sessions: 2, Lines: 7, Result: "success"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendSyncLog(syncLogEntry{Harness: "cursor", Sessions: 1, Lines: 3, Result: "success"}); err != nil {
 		t.Fatal(err)
 	}
 	if !unreadSyncFailure() {
@@ -52,10 +55,16 @@ func TestSyncHistoryAndFailureAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) != 3 {
+	if len(lines) != 4 {
 		t.Fatalf("history has %d entries", len(lines))
 	}
 	var entry syncLogEntry
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.Path != failure.Path {
+		t.Fatalf("failure file path lost: %+v", entry)
+	}
 	if err := json.Unmarshal([]byte(lines[1]), &entry); err != nil {
 		t.Fatal(err)
 	}

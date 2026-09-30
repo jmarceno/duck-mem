@@ -19,6 +19,7 @@ type syncLogEntry struct {
 	Result   string    `json:"result"`
 	Reason   string    `json:"reason,omitempty"`
 	Detail   string    `json:"detail,omitempty"`
+	Path     string    `json:"path,omitempty"`
 }
 
 func logDir() string           { return filepath.Join(stateDir(), "logs") }

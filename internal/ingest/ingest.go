@@ -229,10 +229,11 @@ func readLinesFrom(path string, offset int64, fn func(map[string]any)) error {
 		case KindMuse:
 			valid = o["payload"] != nil || o["retained_frame"] != nil
 		case KindCursorTranscript:
-			valid = str(o, "role") != "" && o["message"] != nil
+			// Cursor interleaves turn lifecycle records with conversation messages.
+			valid = (str(o, "role") != "" && o["message"] != nil) || str(o, "type") == "turn_ended"
 		}
 		if !valid {
-			return fmt.Errorf("%w: unrecognized record envelope", ErrUnexpectedFormat)
+			return fmt.Errorf("%w: unrecognized record envelope at byte %d", ErrUnexpectedFormat, offset)
 		}
 		fn(o)
 		offset += int64(len(data))
