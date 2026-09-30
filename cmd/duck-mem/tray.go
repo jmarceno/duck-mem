@@ -213,7 +213,7 @@ func (a *trayApp) tooltip(s traySnapshot) trayTooltip {
 	logo := pickPixmap(a.icons.icon(s), 24)
 	text := a.lastSyncLabel(s)
 	if s.failure {
-		text += "\nUnacknowledged sync errors: view logs for details"
+		text += "\nSync errors: view logs for details"
 	}
 	return trayTooltip{"", []iconPixmap{logo}, "duck-mem", text}
 }
@@ -287,7 +287,6 @@ func (a *trayApp) menuItems(s traySnapshot) []menuLayout {
 		menuItem(5, "Stop daemon", s.running && !s.busy),
 		menuItem(6, "Full re-index", !s.busy),
 		menuItem(7, "View logs", true),
-		menuItem(8, "Acknowledge errors", s.failure),
 	}
 }
 
@@ -363,6 +362,7 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 	s := a.snapshot()
 	switch id {
 	case 7:
+		marker, _ := os.ReadFile(failurePath())
 		if err := os.MkdirAll(logDir(), 0o700); err != nil {
 			return dbus.MakeFailedError(err)
 		}
@@ -375,11 +375,6 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 				log.Printf("open sync logs: %v", err)
 			}
 		}()
-	case 8:
-		marker, err := os.ReadFile(failurePath())
-		if err != nil {
-			return dbus.MakeFailedError(err)
-		}
 		if err := acknowledgeSyncFailure(marker); err != nil {
 			return dbus.MakeFailedError(err)
 		}

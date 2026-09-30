@@ -258,11 +258,11 @@ failure. Failures include `Unexpected format`, `Database error`, or `Other`
 and available error details; cycle-wide errors use harness `all`. No session
 text is stored in these logs. Logs are retained without automatic deletion.
 
-**View logs** opens this directory in the default file manager. Failures include
-the affected file path and show a red dot drawn directly into the tray icon,
-retained across successful syncs, viewing logs, and tray restarts. Use
-**Acknowledge errors** to clear it; a later failure sets it again. Busy and stopped
-states use amber and grey dots respectively. The tray refreshes every ten seconds.
+**View logs** opens this directory in the default file manager and clears the
+indicator for existing failures. Failures include the affected file path and
+show a red dot drawn directly into the tray icon, retained across successful
+syncs and tray restarts; a later failure sets it again. Busy and stopped states
+use amber and grey dots respectively. The tray refreshes every ten seconds.
 
 The tray is optional — `duck-mem ingest`, `query` and the rest work without it.
 
