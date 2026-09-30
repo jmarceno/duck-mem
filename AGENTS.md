@@ -1,8 +1,9 @@
-# Agent memory system usin DuckDB with duckpgq and vss
+# Agent memory system usin DuckDB with duckpgq
 
 ## Tech Stack
 - Go Lang
-- DuckDB + duckpgq + vss
+- DuckDB + duckpgq
+- Vector search is an exact cosine scan; do not add a persisted vss/HNSW index (its checkpoints leak blocks, see README)
 
 ## Automated Test Methodology
 - No E2E Tests

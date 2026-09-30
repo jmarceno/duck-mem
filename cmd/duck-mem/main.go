@@ -62,6 +62,8 @@ func main() {
 		relatedCmd(os.Args[2:])
 	case "daemon":
 		daemonCmd(os.Args[2:])
+	case "repack":
+		repackCmd(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		usage()
@@ -81,6 +83,7 @@ func usage() {
   duck-mem index [--db PATH] [--min-df N] [--full] rebuild the topic graph
   duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
   duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
+  duck-mem repack [--db PATH] --out PATH  write a verified ZSTD copy; source remains unchanged
 `)
 }
 

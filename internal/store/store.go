@@ -61,7 +61,7 @@ type FileCheckpoint struct {
 }
 
 // Open creates/opens the DuckDB file and initializes the schema.
-// vss and duckpgq are required: search and related do not run without them.
+// duckpgq is required: related does not run without it.
 func Open(path string) (*DB, error) {
 	if err := upgradeStorage(path); err != nil {
 		return nil, err
@@ -80,7 +80,7 @@ func Open(path string) (*DB, error) {
 }
 
 // OpenReadOnly attaches the database file read-only from an in-memory
-// DuckDB. Query and related then run vss and duckpgq against that file
+// DuckDB. Query and related then run duckpgq against that file
 // without taking its write lock. A missing database is an error.
 func OpenReadOnly(path string) (*DB, error) {
 	if _, err := os.Stat(path); err != nil {
@@ -119,14 +119,10 @@ func OpenReadOnly(path string) (*DB, error) {
 
 func loadExtensions(sdb *sql.DB) error {
 	for _, q := range []string{
-		`INSTALL vss`,
-		`LOAD vss`,
 		`INSTALL duckpgq FROM community`,
 		`INSTALL fts`,
 		`LOAD fts`,
 		`LOAD duckpgq`,
-		`SET hnsw_enable_experimental_persistence = true`,
-		`SET hnsw_ef_search = 256`,
 	} {
 		if _, err := sdb.Exec(q); err != nil {
 			return fmt.Errorf("%s: %w", q, err)
@@ -208,7 +204,7 @@ func (db *DB) init() error {
 	if err := db.ensureTermsSchema(); err != nil {
 		return err
 	}
-	if err := db.ensureVectorIndex(); err != nil {
+	if err := db.dropLegacyVectorIndex(); err != nil {
 		return err
 	}
 	return db.ensurePropertyGraph()
@@ -236,9 +232,22 @@ func (db *DB) ensureTermsSchema() error {
 	})
 }
 
-func (db *DB) ensureVectorIndex() error {
-	_, err := db.sql.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_hnsw ON messages USING HNSW (embedding) WITH (metric = 'cosine')`)
-	return err
+// dropLegacyVectorIndex removes the vss HNSW index older databases carry.
+// Its persistence kept every checkpoint's index blocks, so the file grew
+// without bound; an exact cosine scan over the embeddings replaces it.
+// DuckDB drops an index of unknown type without vss loaded, and the
+// checkpoint returns its blocks to the free list (repack shrinks the file).
+func (db *DB) dropLegacyVectorIndex() error {
+	var n int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx_messages_hnsw'`).Scan(&n); err != nil || n == 0 {
+		return err
+	}
+	for _, q := range []string{`DROP INDEX idx_messages_hnsw`, `CHECKPOINT`} {
+		if _, err := db.sql.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Close releases the handle.
@@ -390,15 +399,6 @@ func (db *DB) InsertMessages(msgs []Message) error {
 	return db.withTx(func(conn *duckdb.Conn) error {
 		return copyMessages(conn, rows, true)
 	})
-}
-
-func (db *DB) requireHNSW() error {
-	var name string
-	err := db.sql.QueryRow(`SELECT index_name FROM duckdb_indexes() WHERE index_name = 'idx_messages_hnsw'`).Scan(&name)
-	if err == sql.ErrNoRows || name == "" {
-		return fmt.Errorf("vss HNSW index idx_messages_hnsw is missing")
-	}
-	return err
 }
 
 // TextDoc is one message text plus its project, for per-project indexing.

@@ -64,7 +64,7 @@ messages after a user request to see what was done and how it ended.
   the ranking, so filler ("then", "again", "walk away") dilutes it.
   Good: `enemy disengage barricade`. Bad: `melee enemy attack then disengage walk away then attack again`.
 - Prefer names, identifiers, file names, and error text: `EnemyDef`,
-  `enemyanim.ts`, `HNSW index missing`.
+  `enemyanim.ts`, `Could not set lock`.
 - Word forms match: `enemy` also finds `enemies`, `disengage` finds `disengaged`.
 - `--project` is a substring of the project path. Use the repo directory
   name. Leave it off to search every project. If a filtered search finds

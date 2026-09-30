@@ -288,10 +288,6 @@ func copyEmbeddings(conn *duckdb.Conn, rows []stagedEmb) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	// Rebuilding the HNSW index once beats updating it per row.
-	if err := execConn(conn, `DROP INDEX IF EXISTS idx_messages_hnsw`); err != nil {
-		return err
-	}
 	if err := execConn(conn, `DROP TABLE IF EXISTS stage_emb`); err != nil {
 		return err
 	}
@@ -310,7 +306,7 @@ func copyEmbeddings(conn *duckdb.Conn, rows []stagedEmb) error {
 		WHERE messages.session_id = stage_emb.session_id AND messages.seq = stage_emb.seq`); err != nil {
 		return err
 	}
-	return execConn(conn, `CREATE INDEX idx_messages_hnsw ON messages USING HNSW (embedding) WITH (metric = 'cosine')`)
+	return nil
 }
 
 func prepareMessages(texts []string, missing []bool) ([]topics.Doc, [][]float32) {

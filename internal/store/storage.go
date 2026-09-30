@@ -24,8 +24,8 @@ func dsn(path string) string { return path + "?" + storageConfig }
 // upgradeStorage rewrites a database file created with a storage version
 // that cannot hold ZSTD segments. Every table is copied into a new file
 // with forced ZSTD, row counts are checked, and the new file replaces the
-// old one. Indexes are not copied: init recreates them, and the catalog
-// SQL of the HNSW index has lost its metric option. A missing file or one
+// old one. Indexes are not copied: init recreates them, which also leaves
+// a legacy HNSW index behind. A missing file or one
 // already on a ZSTD-capable version is left untouched.
 func upgradeStorage(path string) error {
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
@@ -37,7 +37,6 @@ func upgradeStorage(path string) error {
 	}
 	sdb.SetMaxOpenConns(1)
 	defer sdb.Close()
-	// vss must be loaded so the HNSW index can be copied.
 	if err := loadExtensions(sdb); err != nil {
 		return err
 	}

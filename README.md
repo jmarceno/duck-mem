@@ -100,6 +100,7 @@ duck-mem index [--db PATH] [--min-df N] [--full]
                                         incremental (or full) topic-graph index
 duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
                                         the ingest loop the service runs
+duck-mem repack [--db PATH] --out PATH  verified ZSTD copy; source is read-only
 ```
 
 Flags may come before or after the text. The database defaults to
@@ -172,7 +173,7 @@ part in every query.
   word forms match, and a long message that mentions the terms still ranks.
   Postings are written in the same transaction as their messages.
 - **Vector similarity** over hashed term and phrase vectors (384 dimensions,
-  HNSW in DuckDB, cosine). It rewards messages that reuse the query's adjacent
+  exact cosine scan in DuckDB). It rewards messages that reuse the query's adjacent
   word pairs, and it only reorders the BM25 candidates, so a hash collision
   between two unrelated short messages cannot promote one of them.
 - **The topic graph** contributes one hop of co-mention neighbours to the
@@ -193,6 +194,19 @@ use counts as of each run, a periodic full rebuild heals the small drift:
 DuckDB allows a single writer process at a time, so the daemon opens the
 database per cycle and closes it again, and CLI commands retry through the
 brief lock a cycle can hold. Nothing is left locked between runs.
+
+Vector search deliberately uses no approximate index. The vss HNSW index that
+earlier versions persisted kept every checkpoint's index blocks, so the file
+grew by roughly 100 MB per changed cycle with almost no new data. An exact scan
+of ~60k embeddings costs ~40 ms warm and finds every true neighbor (the HNSW
+index returned about 60–75% of them). Opening an older database drops that
+index; its blocks become reusable but the file only shrinks after a repack.
+
+`duck-mem repack --db SOURCE --out NEW_FILE` writes a separate compressed copy,
+verifies every table's row count and complete-row hash, preserves sequence
+positions, and rebuilds indexes. The destination must not exist; the command
+never replaces the source or stops services. Stop the services, repack, then
+swap the new file in place of the old one.
 
 ### What gets indexed
 

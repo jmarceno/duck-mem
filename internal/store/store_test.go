@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -114,20 +113,48 @@ func TestSyncMessagesWhenEveryRowHasAnEmbedding(t *testing.T) {
 	}
 }
 
-func TestSearchPlanUsesHNSW(t *testing.T) {
-	db := openTemp(t)
-	insertMsg(t, db, "s", 0, "zephyrturbine spins")
-	vec := vectorLiteral(mustEmbed(t, "zephyrturbine"))
-	var key, plan string
-	err := db.sql.QueryRow(`EXPLAIN SELECT session_id FROM messages
-		WHERE embedding IS NOT NULL AND contains(lower(project), lower(?))
-		ORDER BY array_cosine_distance(embedding, ?::FLOAT[`+strconv.Itoa(embedDim())+`])
-		LIMIT 5`, "p", vec).Scan(&key, &plan)
+// Databases written by the vss version carry a persisted HNSW index whose
+// checkpoints leaked blocks. Open must drop it without vss loaded, since a
+// table with an unknown index type refuses writes.
+func TestOpenDropsLegacyHNSWIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.duckdb")
+	db, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(plan, "HNSW_INDEX_SCAN") {
-		t.Fatalf("similarity search did not use the vss index:\n%s", plan)
+	insertMsg(t, db, "s", 0, "zephyrturbine spins")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := sql.Open("duckdb", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`LOAD vss`); err != nil {
+		legacy.Close()
+		t.Skipf("vss extension unavailable: %v", err)
+	}
+	if _, err := legacy.Exec(`SET hnsw_enable_experimental_persistence = true;
+		CREATE INDEX idx_messages_hnsw ON messages USING HNSW (embedding) WITH (metric = 'cosine')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx_messages_hnsw'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("legacy index still present: %d %v", n, err)
+	}
+	insertMsg(t, db, "s", 1, "zephyrturbine stalls")
+	hits, err := db.Search("zephyrturbine", "", "", 5)
+	if err != nil || len(hits) == 0 {
+		t.Fatalf("search after migration: %v %v", hits, err)
 	}
 }
 

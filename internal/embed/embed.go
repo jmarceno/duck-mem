@@ -1,4 +1,4 @@
-// Package embed builds the fixed-width vectors stored for vss search.
+// Package embed builds the fixed-width vectors stored for similarity search.
 //
 // Each message becomes one unit vector: content terms and adjacent term
 // pairs are feature-hashed into Dim floats. Cosine distance then ranks
@@ -13,7 +13,7 @@ import (
 	"github.com/jmarceno/duck-mem/internal/topics"
 )
 
-// Dim is the FLOAT[N] width of every stored embedding and of the HNSW index.
+// Dim is the FLOAT[N] width of every stored embedding.
 const Dim = 384
 
 // Embed returns an L2-normalized vector, or nil when text has no content terms.

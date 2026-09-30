@@ -72,7 +72,7 @@ const (
 // rank fuses two rankings with reciprocal rank fusion:
 //   - BM25 over stemmed terms (recall, word variants, long messages),
 //     plus any expansion terms at expansionWeight;
-//   - cosine distance on the vss HNSW index (phrase closeness). The
+//   - exact cosine distance over the embeddings (phrase closeness). The
 //     vectors are hashed terms, so a true neighbor always shares a word:
 //     the vector ranking only reorders BM25 candidates, which drops hash
 //     collisions between unrelated short messages.
@@ -242,11 +242,10 @@ func positional(q string, start int) string {
 	return b.String()
 }
 
-// vectorRank asks the HNSW index for the nearest messages.
+// vectorRank scans every embedding for the exact nearest messages. At tens
+// of thousands of 384-wide vectors this costs tens of milliseconds and, unlike
+// the approximate vss index it replaced, never misses a true neighbor.
 func (db *DB) vectorRank(vec []float32, project, source string, limit int) ([]scored, error) {
-	if err := db.requireHNSW(); err != nil {
-		return nil, err
-	}
 	filter, args := filterSQL("messages", project, source, []any{vectorLiteral(vec)})
 	q := `SELECT session_id, seq, array_cosine_distance(embedding, ?::FLOAT[` + strconv.Itoa(embed.Dim) + `]) AS dist
 		FROM messages WHERE embedding IS NOT NULL` + filter + ` ORDER BY dist LIMIT ?`
