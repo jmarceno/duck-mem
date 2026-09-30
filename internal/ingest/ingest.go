@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/jmarceno/duck-mem/internal/store"
 )
+
+var ErrUnexpectedFormat = errors.New("unexpected session format")
 
 // toolBlock excises inline tool-call dumps embedded in newer Codex message
 // text: [external_agent_tool_call: Name] ... [/external_agent_tool_call].
@@ -68,10 +71,21 @@ func DefaultRoots(home string) []string {
 
 // Discover returns every ingestible file under roots.
 func Discover(roots []string) []string {
+	return DiscoverWithErrors(roots, nil)
+}
+
+// DiscoverWithErrors reports inaccessible stores while allowing absent optional harnesses.
+func DiscoverWithErrors(roots []string, report func(string, error)) []string {
 	var out []string
 	for _, r := range roots {
 		_ = filepath.Walk(r, func(p string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
+			if err != nil {
+				if !os.IsNotExist(err) && report != nil {
+					report(p, err)
+				}
+				return nil
+			}
+			if info.IsDir() {
 				return nil
 			}
 			if Classify(p) != KindUnknown {
@@ -199,9 +213,29 @@ func readLinesFrom(path string, offset int64, fn func(map[string]any)) error {
 			continue
 		}
 		var o map[string]any
-		if err := json.Unmarshal(line, &o); err == nil {
-			fn(o)
+		if err := json.Unmarshal(line, &o); err != nil {
+			// A writer may still be appending its last JSON record.
+			if readErr == io.EOF && !bytes.HasSuffix(data, []byte("\n")) && strings.Contains(err.Error(), "unexpected end of JSON input") {
+				return nil
+			}
+			return fmt.Errorf("%w: invalid JSON at byte %d", ErrUnexpectedFormat, offset)
 		}
+		valid := false
+		switch Classify(path) {
+		case KindCodex:
+			valid = str(o, "type") != "" && o["payload"] != nil
+		case KindClaude:
+			valid = str(o, "type") != ""
+		case KindMuse:
+			valid = o["payload"] != nil || o["retained_frame"] != nil
+		case KindCursorTranscript:
+			valid = str(o, "role") != "" && o["message"] != nil
+		}
+		if !valid {
+			return fmt.Errorf("%w: unrecognized record envelope", ErrUnexpectedFormat)
+		}
+		fn(o)
+		offset += int64(len(data))
 		if readErr == io.EOF {
 			return nil
 		}

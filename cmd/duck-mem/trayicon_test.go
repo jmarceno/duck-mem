@@ -28,7 +28,7 @@ func TestTrayIconPixmapsMatchTheirDeclaredSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render tray icons: %v", err)
 	}
-	for name, list := range map[string][]iconPixmap{"logo": set.logo, "busy": set.busy, "stopped": set.stopped} {
+	for name, list := range map[string][]iconPixmap{"logo": set.logo, "busy": set.busy, "stopped": set.stopped, "failed": set.failed} {
 		if len(list) == 0 {
 			t.Fatalf("%s: no pixmaps", name)
 		}
@@ -56,7 +56,10 @@ func TestTrayIconPixmapsMatchTheirDeclaredSize(t *testing.T) {
 }
 
 func TestOverlayOnlyMarksTheStoppedOrBusyStates(t *testing.T) {
-	set := trayIcons{busy: []iconPixmap{{Width: 1}}, stopped: []iconPixmap{{Width: 1}}}
+	set := trayIcons{failed: []iconPixmap{{Width: 2}}, busy: []iconPixmap{{Width: 1}}, stopped: []iconPixmap{{Width: 1}}}
+	if got := set.overlay(traySnapshot{running: true, busy: true, failure: true}); len(got) != 1 || got[0].Width != 2 {
+		t.Errorf("unread failure overlay = %v, want red badge even while busy", got)
+	}
 	if got := set.overlay(traySnapshot{running: true}); len(got) != 0 {
 		t.Errorf("running overlay = %d pixmaps, want none", len(got))
 	}

@@ -19,7 +19,7 @@ var traySizes = []int{22, 24, 36, 48, 64, 128}
 // The status badge the host layers over the logo.
 var (
 	busyColor    = color.NRGBA{R: 245, G: 174, B: 62, A: 255}
-	stoppedColor = color.NRGBA{R: 208, G: 72, B: 72, A: 255}
+	stoppedColor = color.NRGBA{R: 128, G: 128, B: 128, A: 255}
 )
 
 // trayIcons holds the logo and the status badges pre-rendered at every tray
@@ -28,6 +28,7 @@ type trayIcons struct {
 	logo    []iconPixmap
 	busy    []iconPixmap
 	stopped []iconPixmap
+	failed  []iconPixmap
 }
 
 func newTrayIcons() (trayIcons, error) {
@@ -39,15 +40,18 @@ func newTrayIcons() (trayIcons, error) {
 	for _, size := range traySizes {
 		set.logo = append(set.logo, pixmap(resampleArea(src, size)))
 		set.busy = append(set.busy, pixmap(statusBadge(size, busyColor)))
+		set.failed = append(set.failed, pixmap(statusBadge(size, color.NRGBA{R: 220, G: 50, B: 50, A: 255})))
 		set.stopped = append(set.stopped, pixmap(statusBadge(size, stoppedColor)))
 	}
 	return set, nil
 }
 
 // overlay returns the badge for the current state: none while the indexer
-// runs, a dot while an action is in flight or while it is stopped.
+// runs, red for unread sync failures, amber while busy, grey while stopped.
 func (i trayIcons) overlay(s traySnapshot) []iconPixmap {
 	switch {
+	case s.failure:
+		return i.failed
 	case s.busy:
 		return i.busy
 	case !s.running:

@@ -6,12 +6,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -124,22 +126,30 @@ func ingestCmd(args []string) {
 		roots = ingest.DefaultRoots(home)
 	}
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o755); err != nil {
+		logSyncFailure("all", "Database error", err)
 		fatal(err)
 	}
 	db, err := openTolerant(*dbPath, false)
 	if err != nil {
+		logSyncFailure("all", "Database error", err)
 		fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			logSyncFailure("all", "Database error", err)
+		}
+	}()
 
 	files, nSess, nMsg, nSkip := runCycle(db, roots)
 	fmt.Printf("files=%d sessions=%d messages=%d skipped=%d db=%s\n", files, nSess, nMsg, nSkip, *dbPath)
 	newMsgs, newPairs, err := db.IndexNew(2)
 	if err != nil {
+		logSyncFailure("all", "Database error", err)
 		fatal(err)
 	}
 	fmt.Printf("index: +%d messages, +%d pairs\n", newMsgs, newPairs)
 	if err := writeSyncStatus(*dbPath, syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}); err != nil {
+		logSyncFailure("all", "Other", err)
 		fmt.Fprintln(os.Stderr, "sync status:", err)
 	}
 }
@@ -162,6 +172,7 @@ func daemonCmd(args []string) {
 		roots = ingest.DefaultRoots(home)
 	}
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o755); err != nil {
+		logSyncFailure("all", "Database error", err)
 		fatal(err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -174,17 +185,20 @@ func daemonCmd(args []string) {
 		// for the daemon's whole lifetime.
 		db, err := store.Open(*dbPath)
 		if err != nil {
+			logSyncFailure("all", "Database error", err)
 			fmt.Printf("%s cycle=%d open error: %v\n", time.Now().UTC().Format(time.RFC3339), n, err)
 			return
 		}
 		files, nSess, nMsg, nSkip := runCycle(db, roots)
 		newMsgs, newPairs, err := db.IndexNew(2)
-		_ = db.Close()
+		err = errors.Join(err, db.Close())
 		if err != nil {
+			logSyncFailure("all", "Database error", err)
 			fmt.Printf("%s cycle=%d error: %v\n", time.Now().UTC().Format(time.RFC3339), n, err)
 			return
 		}
 		if err := writeSyncStatus(*dbPath, syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}); err != nil {
+			logSyncFailure("all", "Other", err)
 			fmt.Printf("%s cycle=%d status error: %v\n", time.Now().UTC().Format(time.RFC3339), n, err)
 		}
 		fmt.Printf("%s cycle=%d files=%d sessions=%d messages=%d skipped=%d indexed=+%d pairs=+%d\n",
@@ -208,91 +222,152 @@ func daemonCmd(args []string) {
 // append-only JSONL files. Rewrites take the full reconciliation path.
 func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 	cursorProjects := map[string]map[string]string{}
-	for _, f := range ingest.Discover(roots) {
+	entries := map[string]syncLogEntry{}
+	defer func() {
+		keys := make([]string, 0, len(entries))
+		for key := range entries {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if err := appendSyncLog(entries[key]); err != nil {
+				fmt.Fprintln(os.Stderr, "sync log:", err)
+			}
+		}
+	}()
+	for _, f := range ingest.DiscoverWithErrors(roots, func(path string, err error) {
+		logSyncFailure("all", "Other", fmt.Errorf("discover %s: %w", path, err))
+		nSkip++
+	}) {
 		files++
-		if ingest.Classify(f) == ingest.KindOpenCode {
-			sessions, messages, err := ingestOpenCode(db, f)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "skip %s: %v\n", f, err)
-				nSkip++
-			} else {
+		func() {
+			entry := syncLogEntry{Harness: harnessName(ingest.Classify(f)), Result: "success"}
+			reason := "Other"
+			var failure error
+			defer func() {
+				if failure != nil {
+					entry.Result, entry.Reason, entry.Detail = "failure", reason, failure.Error()
+				}
+				key := entry.Harness + "\x00" + entry.Reason + "\x00" + entry.Detail
+				previous := entries[key]
+				entry.Sessions += previous.Sessions
+				entry.Lines += previous.Lines
+				entries[key] = entry
+			}()
+			if ingest.Classify(f) == ingest.KindOpenCode {
+				sessions, messages, err := ingestOpenCode(db, f)
+				entry.Sessions, entry.Lines = sessions, messages
 				nSess += sessions
 				nMsg += messages
+				if err != nil {
+					failure, reason = err, extractionReason(err)
+					var dbErr *syncDatabaseError
+					if errors.As(err, &dbErr) {
+						reason = "Database error"
+					}
+					fmt.Fprintf(os.Stderr, "skip %s: %v\n", f, err)
+					nSkip++
+				}
+				return
 			}
-			continue
-		}
-		info, err := os.Stat(f)
-		if err != nil {
-			nSkip++
-			continue
-		}
-		var projects map[string]string
-		kind := ingest.Classify(f)
-		if kind == ingest.KindCursorTranscript {
-			home := ingest.CursorHome(f)
-			var ok bool
-			projects, ok = cursorProjects[home]
-			if !ok {
-				projects = ingest.LoadCursorProjects(home)
-				cursorProjects[home] = projects
+			info, err := os.Stat(f)
+			if err != nil {
+				failure = err
+				nSkip++
+				return
 			}
-		}
-		checkpoint, err := db.GetCheckpoint(f)
-		if err != nil {
-			nSkip++
-			continue
-		}
-		projectMatches := kind != ingest.KindCursorTranscript ||
-			(checkpoint != nil && checkpoint.Project == ingest.CursorProject(f, projects))
-		if checkpoint != nil && checkpoint.ParserVersion == parserVersion && projectMatches &&
-			checkpoint.Size == info.Size() && checkpoint.ModTimeNS == info.ModTime().UnixNano() {
-			continue
-		}
-		var sess store.Session
-		var msgs []store.Message
-		appended := false
-		if checkpoint != nil && checkpoint.ParserVersion == parserVersion && projectMatches &&
-			kind != ingest.KindCursorPlan && checkpoint.EndsLine && info.Size() > checkpoint.Size {
-			if oldHash, err := hashTail(f, checkpoint.Size); err == nil && oldHash == checkpoint.TailHash {
-				previous, err := db.GetSession(checkpoint.SessionID)
-				if err == nil {
-					last, err := db.LastMessage(checkpoint.SessionID)
+			var projects map[string]string
+			kind := ingest.Classify(f)
+			if kind == ingest.KindCursorTranscript {
+				home := ingest.CursorHome(f)
+				var ok bool
+				projects, ok = cursorProjects[home]
+				if !ok {
+					projects = ingest.LoadCursorProjects(home)
+					cursorProjects[home] = projects
+				}
+			}
+			reason = "Database error"
+			checkpoint, err := db.GetCheckpoint(f)
+			if err != nil {
+				failure = err
+				nSkip++
+				return
+			}
+			projectMatches := kind != ingest.KindCursorTranscript ||
+				(checkpoint != nil && checkpoint.Project == ingest.CursorProject(f, projects))
+			if checkpoint != nil && checkpoint.ParserVersion == parserVersion && projectMatches &&
+				checkpoint.Size == info.Size() && checkpoint.ModTimeNS == info.ModTime().UnixNano() {
+				return
+			}
+			var sess store.Session
+			var msgs []store.Message
+			appended := false
+			if checkpoint != nil && checkpoint.ParserVersion == parserVersion && projectMatches &&
+				kind != ingest.KindCursorPlan && checkpoint.EndsLine && info.Size() > checkpoint.Size {
+				if oldHash, err := hashTail(f, checkpoint.Size); err == nil && oldHash == checkpoint.TailHash {
+					previous, err := db.GetSession(checkpoint.SessionID)
+					if err != nil {
+						logSyncFailure(entry.Harness, "Database error", err)
+					}
 					if err == nil {
-						sess, msgs, err = ingest.IngestAppended(f, checkpoint.Size, previous, last, projects)
-						appended = err == nil && sess.ID == checkpoint.SessionID && sess.Project == checkpoint.Project
+						last, err := db.LastMessage(checkpoint.SessionID)
+						if err != nil {
+							logSyncFailure(entry.Harness, "Database error", err)
+						}
+						if err == nil {
+							sess, msgs, err = ingest.IngestAppended(f, checkpoint.Size, previous, last, projects)
+							appended = err == nil && sess.ID == checkpoint.SessionID && sess.Project == checkpoint.Project
+						}
 					}
 				}
 			}
-		}
-		if !appended {
-			sess, msgs, err = ingest.IngestFileWithCursorProjects(f, projects)
-		}
-		if err != nil || sess.ID == "" {
-			nSkip++
-			continue
-		}
-		if err := db.UpsertSession(sess); err != nil {
-			nSkip++
-			continue
-		}
-		if appended {
-			err = db.InsertMessages(msgs)
-		} else {
-			err = db.SyncMessages(sess.ID, msgs)
-		}
-		if err != nil {
-			nSkip++
-			continue
-		}
-		state, err := fileState(f)
-		if err == nil && state.Size == info.Size() && state.ModTimeNS == info.ModTime().UnixNano() {
-			state.SessionID, state.Project, state.ParserVersion = sess.ID, sess.Project, parserVersion
-			if err := db.SaveCheckpoint(state); err != nil {
+			reason = "Other"
+			if !appended {
+				sess, msgs, err = ingest.IngestFileWithCursorProjects(f, projects)
+			}
+			if err == nil && sess.ID == "" {
+				err = ingest.ErrUnexpectedFormat
+			}
+			if err != nil || sess.ID == "" {
+				reason = extractionReason(err)
+				failure = err
+				nSkip++
+				return
+			}
+			reason = "Database error"
+			if err := db.UpsertSession(sess); err != nil {
+				failure = err
+				nSkip++
+				return
+			}
+			if appended {
+				err = db.InsertMessages(msgs)
+			} else {
+				err = db.SyncMessages(sess.ID, msgs)
+			}
+			if err != nil {
+				failure = err
+				nSkip++
+				return
+			}
+			reason = "Other"
+			state, err := fileState(f)
+			if err != nil {
+				failure = err
 				nSkip++
 			}
-		}
-		nSess++
-		nMsg += len(msgs)
+			if err == nil && state.Size == info.Size() && state.ModTimeNS == info.ModTime().UnixNano() {
+				state.SessionID, state.Project, state.ParserVersion = sess.ID, sess.Project, parserVersion
+				if err := db.SaveCheckpoint(state); err != nil {
+					failure, reason = err, "Database error"
+					nSkip++
+				}
+			}
+			entry.Sessions, entry.Lines = 1, len(msgs)
+			nSess++
+			nMsg += len(msgs)
+		}()
 	}
 	return files, nSess, nMsg, nSkip
 }
@@ -304,7 +379,7 @@ func ingestOpenCode(db *store.DB, path string) (int, int, error) {
 	}
 	checkpoint, err := db.GetCheckpoint(path)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, &syncDatabaseError{err}
 	}
 	if checkpoint != nil && checkpoint.ParserVersion == openCodeParserVersion &&
 		checkpoint.Size == before.Size && checkpoint.ModTimeNS == before.ModTimeNS &&
@@ -313,23 +388,30 @@ func ingestOpenCode(db *store.DB, path string) (int, int, error) {
 	}
 	sessions, err := ingest.IngestOpenCode(path)
 	if err != nil {
-		return 0, 0, err
+		if errors.Is(err, ingest.ErrUnexpectedFormat) {
+			return 0, 0, err
+		}
+		return 0, 0, &syncDatabaseError{err}
 	}
-	count := 0
+	count, completed := 0, 0
 	for _, s := range sessions {
 		if err := db.UpsertSession(s.Session); err != nil {
-			return 0, 0, err
+			return completed, count, &syncDatabaseError{err}
 		}
 		if err := db.SyncMessages(s.Session.ID, s.Messages); err != nil {
-			return 0, 0, err
+			return completed, count, &syncDatabaseError{err}
 		}
 		count += len(s.Messages)
+		completed++
 	}
 	after, err := sqliteState(path)
+	if err != nil {
+		return completed, count, err
+	}
 	if err == nil && before.Size == after.Size && before.ModTimeNS == after.ModTimeNS && before.TailHash == after.TailHash {
 		after.ParserVersion = openCodeParserVersion
 		if err := db.SaveCheckpoint(after); err != nil {
-			return 0, 0, err
+			return completed, count, &syncDatabaseError{err}
 		}
 	}
 	return len(sessions), count, nil

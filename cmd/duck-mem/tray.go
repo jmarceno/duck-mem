@@ -64,6 +64,7 @@ type trayApp struct {
 }
 
 type traySnapshot struct {
+	failure  bool
 	running  bool
 	busy     bool
 	action   string
@@ -180,9 +181,11 @@ func (a *trayApp) refresh() bool {
 	running := exec.Command("systemctl", "--user", "is-active", "--quiet", serviceName).Run() == nil
 	last, err := readSyncStatus()
 	seen := err == nil && !last.CompletedAt.IsZero()
+	failure := unreadSyncFailure()
 	a.mu.Lock()
-	changed := a.state.running != running || a.state.lastSeen != seen || a.state.last != last
+	changed := a.state.failure != failure || a.state.running != running || a.state.lastSeen != seen || a.state.last != last
 	a.state.running, a.state.last, a.state.lastSeen = running, last, seen
+	a.state.failure = failure
 	if changed {
 		a.state.revision++
 	}
@@ -200,6 +203,7 @@ func (a *trayApp) publish(s traySnapshot) {
 	a.props.SetMust(sniInterface, "ToolTip", a.tooltip(s))
 	_ = a.conn.Emit(sniPath, sniInterface+".NewIcon")
 	_ = a.conn.Emit(sniPath, sniInterface+".NewToolTip")
+	_ = a.conn.Emit(sniPath, sniInterface+".NewOverlayIcon")
 	_ = a.conn.Emit(menuPath, menuInterface+".LayoutUpdated", s.revision, int32(0))
 }
 
@@ -278,6 +282,7 @@ func (a *trayApp) menuItems(s traySnapshot) []menuLayout {
 		menuItem(4, "Start daemon", !s.running && !s.busy),
 		menuItem(5, "Stop daemon", s.running && !s.busy),
 		menuItem(6, "Full re-index", !s.busy),
+		menuItem(7, "View logs", true),
 	}
 }
 
@@ -352,6 +357,24 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 	a.refresh()
 	s := a.snapshot()
 	switch id {
+	case 7:
+		marker, _ := os.ReadFile(failurePath())
+		if err := os.MkdirAll(logDir(), 0o700); err != nil {
+			return dbus.MakeFailedError(err)
+		}
+		cmd := exec.Command("xdg-open", logDir())
+		if err := cmd.Start(); err != nil {
+			return dbus.MakeFailedError(err)
+		}
+		go func() {
+			if err := cmd.Wait(); err != nil {
+				log.Printf("open sync logs: %v", err)
+			}
+		}()
+		if err := acknowledgeSyncFailure(marker); err != nil {
+			return dbus.MakeFailedError(err)
+		}
+		a.refresh()
 	case 4:
 		if !s.running && a.beginAction("starting") {
 			go a.runSystemctl("start")

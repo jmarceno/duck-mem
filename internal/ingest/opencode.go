@@ -3,14 +3,14 @@ package ingest
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/jmarceno/duck-mem/internal/store"
-
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 )
 
 // OpenCodeSession is one conversation from OpenCode's multi-session SQLite store.
@@ -42,7 +42,7 @@ func IngestOpenCode(path string) ([]OpenCodeSession, error) {
 	rows, err := tx.Query(`SELECT s.id, COALESCE(NULLIF(s.directory, ''), p.worktree, ''), s.time_created
 		FROM session_v2 s LEFT JOIN project p ON p.id = s.project_id ORDER BY s.time_created, s.id`)
 	if err != nil {
-		return nil, fmt.Errorf("read OpenCode sessions: %w", err)
+		return nil, openCodeReadError("read OpenCode sessions", err)
 	}
 	var sessions []OpenCodeSession
 	for rows.Next() {
@@ -69,7 +69,7 @@ func IngestOpenCode(path string) ([]OpenCodeSession, error) {
 		rows, err := tx.Query(`SELECT type, data, time_created FROM session_message
 			WHERE session_id = ? ORDER BY seq, id`, id)
 		if err != nil {
-			return nil, fmt.Errorf("read OpenCode messages: %w", err)
+			return nil, openCodeReadError("read OpenCode messages", err)
 		}
 		for rows.Next() {
 			var kind, data string
@@ -84,7 +84,7 @@ func IngestOpenCode(path string) ([]OpenCodeSession, error) {
 			text, err := openCodeText(kind, data)
 			if err != nil {
 				rows.Close()
-				return nil, fmt.Errorf("decode OpenCode message in %s: %w", s.Session.ID, err)
+				return nil, fmt.Errorf("%w: decode OpenCode message in %s", ErrUnexpectedFormat, s.Session.ID)
 			}
 			if text == "" {
 				continue
@@ -148,4 +148,12 @@ func openCodeText(kind, data string) (string, error) {
 		}
 	}
 	return strings.Join(parts, "\n"), nil
+}
+
+func openCodeReadError(operation string, err error) error {
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrError && (strings.Contains(err.Error(), "no such table") || strings.Contains(err.Error(), "no such column")) {
+		return fmt.Errorf("%w: %s: %v", ErrUnexpectedFormat, operation, err)
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }

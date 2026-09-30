@@ -237,6 +237,18 @@ the project logo. The menu shows the indexer's state and the last completed
 sync, and can start or stop the indexer or force a full re-index. A dot appears
 over the icon while an action is running or when the indexer is down.
 
+Sync history is retained as monthly JSONL files in
+`~/.local/state/duck-mem/logs/`. Each cycle records the harness, time, session
+and extracted message counts (including zero when unchanged), and success or
+failure. Failures include `Unexpected format`, `Database error`, or `Other`
+and available error details; cycle-wide errors use harness `all`. No session
+text is stored in these logs. Logs are retained without automatic deletion.
+
+**View logs** opens this directory in the default file manager and acknowledges
+existing failures. Unread failures show a red tray dot, retained across successful
+syncs and tray restarts; a later failure sets it again. Busy and stopped states
+use amber and grey dots respectively. The tray refreshes every ten seconds.
+
 The tray is optional — `duck-mem ingest`, `query` and the rest work without it.
 
 ## Agent skill
