@@ -58,24 +58,36 @@ duck-mem query --project omen-the-game enemy disengage barricade
     opened with: "We have some issues with the enemy AI. They are too passive…"
     #0 user 2026-09-27 11:57: …once the player spawns a barricade enemies lose sight and they promptly disengage…
     #4 assistant 2026-09-27 11:59: …barricade breaching (ranged shoot it, melee/exploders attack it)…
+    ended with:
+      #10 assistant 2026-09-27 12:20: Enemies now attack the barricade instead of disengaging…
 
 [2] ...
 
-Topic graph: often discussed with these words: capsule (10), aggro (5), melee (15), untouched (4), fixing (6), shot (9)
-  Add one to the query to widen it, or map the area: duck-mem related --project omen-the-game capsule
 Read a hit with the messages around it: duck-mem show faf44a7a-c1fa-4603-831d-095cb89dc375#0
 ```
 
 Each block is one past conversation: its ID, tool, dates, size, project,
-the prompt that started it, and the matching messages (`#seq`, role, time,
-snippet). Often this is enough to answer the question.
+the prompt that started it, the matching messages (`#seq`, role, time,
+snippet) in time order, and an `ended with:` list: the last user prompt,
+the last assistant reply, and a `note` when the last turn got no reply
+(for example `turn failed: You've hit your usage limit…` or
+`turn aborted: interrupted`), with the log path. Often this is enough to
+answer the question.
 
-The **Topic graph** line lists words that past sessions often used together
-with your query words. It is the quickest way to find the project's own
-vocabulary for a problem. If your words match fewer sessions than
-`--limit`, those neighbours fill the empty slots. Such sessions are marked
+The **Topic graph** line appears only when your words match fewer sessions
+than `--limit`. It lists words that past sessions often used together with
+your query words, the project's own vocabulary for a problem. Those
+neighbours fill the empty slots. Such sessions are marked
 `(no query words here; found through the topic-graph neighbours below)`.
 Treat them as leads, not matches.
+
+**Picking up another agent's thread:** put its session ID (or the first 8
+characters) in the query: `duck-mem query --project <repo> 01a0f755 attachment limit`.
+That session comes first, marked `(this session's ID is in the query)`.
+Read its `ended with:` lines to see where it stopped, then
+`duck-mem show <id>#<last seq>` for the last messages. Indexed text has
+no tool calls, so check the repo (`git status`, `git diff`) for the work
+itself.
 
 **2. Read the conversation:** `duck-mem show <session-id>#<seq>`
 
@@ -86,10 +98,13 @@ duck-mem show faf44a7a-c1fa-4603-831d-095cb89dc375#4
 This prints the hit plus 3 messages on each side, full text (long messages
 truncated), and the exact flags to page earlier or later. Look at the
 messages after a user request to see what was done and how it ended.
+Host context (system prompts, AGENTS.md, IDE state) is collapsed to one
+`hidden` line.
 
 - `--context N`: N messages on each side (default 3)
 - `--from A --to B`: an explicit `#seq` range
 - `--full`: do not truncate long messages
+- `--system`: also print the hidden host context
 - An ID prefix works if it is unique: `duck-mem show faf44a7a#4`
 
 ## Writing queries

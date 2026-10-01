@@ -27,13 +27,19 @@ func TestCodexKeepsLargeAndRepeatedMessages(t *testing.T) {
 		`{"timestamp":"2026-09-27T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"retry"}]}}`,
 		`{"timestamp":"2026-09-27T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"retry"}]}}`,
 		`{"timestamp":"2026-09-27T00:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+		`{"timestamp":"2026-09-27T00:00:05Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":null}}`,
+		`{"timestamp":"2026-09-27T00:00:06Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}`,
+		`{"timestamp":"2026-09-27T00:00:07Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":null,"error":{"message":"usage limit"}}}`,
 	}, "\n"))
 	_, msgs, err := IngestFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(msgs) != 4 || msgs[0].Text != large || msgs[1].Text != "retry" || msgs[2].Text != "retry" || msgs[3].Text != "done" {
+	if len(msgs) != 6 || msgs[0].Text != large || msgs[1].Text != "retry" || msgs[2].Text != "retry" || msgs[3].Text != "done" {
 		t.Fatalf("large or repeated utterance lost: count=%d", len(msgs))
+	}
+	if msgs[4].Role != "note" || msgs[4].Text != "turn aborted: interrupted" || msgs[5].Text != "turn failed: usage limit" {
+		t.Fatalf("turns that ended without a reply not recorded: %+v", msgs[4:])
 	}
 }
 

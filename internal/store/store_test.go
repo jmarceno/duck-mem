@@ -252,9 +252,51 @@ func TestRecallGroupsBySessionWithTitle(t *testing.T) {
 	if err != nil || s.Messages != 5 {
 		t.Fatalf("resolve: %+v err=%v", s, err)
 	}
-	window, err := db.Window(s.Session.ID, 1, 2)
+	window, err := db.Window(s.Session.ID, 0, 2, -1, false)
 	if err != nil || len(window) != 2 || window[0].Seq != 1 || window[1].Seq != 2 {
-		t.Fatalf("window: %+v err=%v", window, err)
+		t.Fatalf("window should hide host context: %+v err=%v", window, err)
+	}
+	if window, err = db.Window(s.Session.ID, 0, 2, 0, false); err != nil || len(window) != 3 {
+		t.Fatalf("window should keep the requested message: %+v err=%v", window, err)
+	}
+}
+
+// Handoffs name the session to resume: it comes first even when another
+// session matches the other words better, and its card shows how it ended.
+func TestRecallPinsNamedSessionWithItsEnding(t *testing.T) {
+	db := openTemp(t)
+	add := func(sid string, msgs ...[2]string) {
+		if err := db.UpsertSession(Session{ID: sid, Source: "codex", Project: "p", Path: sid + ".jsonl"}); err != nil {
+			t.Fatal(err)
+		}
+		var rows []Message
+		for i, m := range msgs {
+			rows = append(rows, Message{SessionID: sid, Seq: i, Source: "codex", Project: "p", Role: m[0], Text: m[1]})
+		}
+		if err := db.InsertMessages(rows); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("019fbf94-aaaa", [2]string{"user", "attachment limit attachment limit prefetch"})
+	add("01a0f755-bbbb",
+		[2]string{"user", "raise the attachment limit"},
+		[2]string{"assistant", "I'll trace the attachment checks"},
+		[2]string{"user", "<environment_context>cwd</environment_context>"},
+		[2]string{"assistant", "tests fail on multipart headers"},
+		[2]string{"note", "turn failed: usage limit"})
+	results, _, err := db.Recall("01a0f755 attachment limit", "", "", 5, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].Session.ID != "01a0f755-bbbb" || !results[0].Named || results[1].Named {
+		t.Fatalf("named session not first: %+v", results)
+	}
+	var ending []int
+	for _, h := range results[0].Ending {
+		ending = append(ending, h.Seq)
+	}
+	if !slices.Equal(ending, []int{0, 3, 4}) {
+		t.Fatalf("ending should be last prompt, last reply, trailing note: %v", ending)
 	}
 }
 

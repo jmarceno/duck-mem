@@ -164,6 +164,15 @@ func newCollector(sess store.Session, last *store.Message) *collector {
 	return c
 }
 
+// turnEnded words the note left where a turn stopped without a reply, so
+// a reader of the conversation (or of its last messages) sees why it ended.
+func turnEnded(status, reason string) string {
+	if reason == "" {
+		return "turn " + status
+	}
+	return "turn " + status + ": " + reason
+}
+
 func (c *collector) add(role, text string, at time.Time) {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -325,7 +334,20 @@ func parseCodexFrom(path string, offset int64, sess store.Session, last *store.M
 			// UserMessage items; Reasoning / CommandExecution / FileChange /
 			// McpToolCall / ... are reasoning or tool calls: dropped.
 			p, _ := o["payload"].(map[string]any)
-			if p == nil || p["type"] != "item_completed" {
+			if p == nil {
+				return
+			}
+			switch p["type"] {
+			case "task_complete":
+				if msg := str(p, "error", "message"); msg != "" {
+					c.add("note", turnEnded("failed", msg), at)
+				}
+				return
+			case "turn_aborted":
+				c.add("note", turnEnded("aborted", str(p, "reason")), at)
+				return
+			case "item_completed":
+			default:
 				return
 			}
 			item, _ := p["item"].(map[string]any)
@@ -610,6 +632,12 @@ func parseCursorTranscript(path string, projects map[string]string) (store.Sessi
 func parseCursorTranscriptFrom(path string, offset int64, sess store.Session, last *store.Message, projects map[string]string) (store.Session, []store.Message, error) {
 	c := newCollector(sess, last)
 	err := readLinesFrom(path, offset, func(o map[string]any) {
+		if str(o, "type") == "turn_ended" {
+			if status := str(o, "status"); status != "success" && status != "completed" {
+				c.add("note", turnEnded(status, str(o, "error")), time.Time{})
+			}
+			return
+		}
 		role, _ := o["role"].(string)
 		if role != "user" && role != "assistant" {
 			return

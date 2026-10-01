@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,7 +25,8 @@ import (
 	"github.com/jmarceno/duck-mem/internal/store"
 )
 
-const parserVersion = 1
+// parserVersion 2 records failed and aborted turns as notes.
+const parserVersion = 2
 const openCodeParserVersion = 1
 
 func defaultDB() string {
@@ -78,7 +80,7 @@ func usage() {
   duck-mem ingest [--db PATH] [ROOT...]   ingest session logs (default roots when omitted)
   duck-mem query [--db PATH] [--project P] [--source S] [--limit N] [--hits N] <text...>
                                         best-matching sessions, each with its matching messages
-  duck-mem show [--db PATH] [--context N] [--from A] [--to B] [--full] <session>[#seq]
+  duck-mem show [--db PATH] [--context N] [--from A] [--to B] [--full] [--system] <session>[#seq]
                                         read a session's messages around a hit
   duck-mem index [--db PATH] [--min-df N] [--full] rebuild the topic graph
   duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
@@ -609,21 +611,34 @@ func queryCmd(args []string) {
 		return
 	}
 	fmt.Printf("%d sessions for %q%s, best first. Messages are numbered #seq.\n\n", len(results), q, scope)
+	viaGraph := false
 	for i, r := range results {
 		fmt.Printf("[%d] %s  %s · %s · %d msgs · %s\n", i+1, r.Session.ID, r.Session.Source,
 			dateRange(r.Session.StartedAt, r.LastAt), r.Messages, r.Session.Project)
+		if r.Named {
+			fmt.Println("    (this session's ID is in the query)")
+		}
 		if r.ViaGraph {
+			viaGraph = true
 			fmt.Println("    (no query words here; found through the topic-graph neighbours below)")
 		}
 		if r.Title != "" {
 			fmt.Printf("    opened with: %q\n", clip(r.Title, 160))
 		}
-		for _, h := range r.Hits {
+		// Hits and ending read as one timeline.
+		hits := slices.Clone(r.Hits)
+		sort.Slice(hits, func(i, j int) bool { return hits[i].Seq < hits[j].Seq })
+		shown := map[int]bool{}
+		for _, h := range hits {
+			shown[h.Seq] = true
 			fmt.Printf("    #%d %s%s: %s\n", h.Seq, h.Role, stamp(" ", h.CreatedAt), h.Snippet)
 		}
+		printEnding(r, shown)
 		fmt.Println()
 	}
-	if len(related) > 0 {
+	// The graph line only helps when it explains graph results or the
+	// query's own words left slots empty.
+	if len(related) > 0 && (viaGraph || len(results) < *limit) {
 		words := make([]string, len(related))
 		for i, t := range related {
 			words[i] = fmt.Sprintf("%s (%d)", t.Label, t.Weight)
@@ -632,7 +647,35 @@ func queryCmd(args []string) {
 		fmt.Println("  Add one to the query to widen it, or map the area: duck-mem related " + projectFlag(*project) + related[0].Label)
 	}
 	top := results[0]
-	fmt.Printf("Read a hit with the messages around it: duck-mem show %s#%d\n", top.Session.ID, top.Hits[0].Seq)
+	if len(top.Hits) > 0 {
+		fmt.Printf("Read a hit with the messages around it: duck-mem show %s#%d\n", top.Session.ID, top.Hits[0].Seq)
+	} else {
+		fmt.Printf("Read how it ended: duck-mem show %s#%d\n", top.Session.ID, top.Messages-1)
+	}
+}
+
+// printEnding shows where a session stopped, skipping messages already
+// printed as hits. A trailing note means the last turn got no reply;
+// the details (tool calls, errors) are only in the original log.
+func printEnding(r store.SessionResult, shown map[int]bool) {
+	var lines []string
+	for _, h := range r.Ending {
+		if shown[h.Seq] || (h.Role == "user" && h.Snippet == r.Title) {
+			continue
+		}
+		line := fmt.Sprintf("#%d %s%s: %s", h.Seq, h.Role, stamp(" ", h.CreatedAt), clip(h.Snippet, 240))
+		if h.Role == "note" && r.Session.Path != "" {
+			line += " · log " + r.Session.Path
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) == 0 {
+		return
+	}
+	fmt.Println("    ended with:")
+	for _, l := range lines {
+		fmt.Println("      " + l)
+	}
 }
 
 func showCmd(args []string) {
@@ -642,7 +685,8 @@ func showCmd(args []string) {
 	from := fs.Int("from", -1, "first message #seq to show")
 	to := fs.Int("to", -1, "last message #seq to show")
 	full := fs.Bool("full", false, "print whole messages instead of truncating long ones")
-	known := map[string]bool{"--db": true, "--context": true, "--from": true, "--to": true, "--full": false}
+	system := fs.Bool("system", false, "also print host context: system prompts, AGENTS.md, IDE state")
+	known := map[string]bool{"--db": true, "--context": true, "--from": true, "--to": true, "--full": false, "--system": false}
 	flagArgs, positional := splitArgs(args, known)
 	_ = fs.Parse(flagArgs)
 	fs.Parse(positional)
@@ -669,14 +713,14 @@ func showCmd(args []string) {
 		fatal(err)
 	}
 	lo, hi := showWindow(target, *ctxN, *from, *to, s.Messages)
-	msgs, err := db.Window(s.Session.ID, lo, hi)
+	msgs, err := db.Window(s.Session.ID, lo, hi, target, *system)
 	if err != nil {
 		fatal(err)
 	}
 	fmt.Printf("session %s · %s · %s\n", s.Session.ID, s.Session.Source, s.Session.Project)
 	fmt.Printf("%s · %d messages (#0–#%d) · log %s\n", dateRange(s.Session.StartedAt, s.LastAt), s.Messages, s.Messages-1, s.Session.Path)
 	if len(msgs) == 0 {
-		fmt.Printf("no messages in #%d–#%d\n", lo, hi)
+		fmt.Printf("no conversation in #%d–#%d (host context only; --system shows it)\n", lo, hi)
 		return
 	}
 	var more []string
@@ -689,8 +733,16 @@ func showCmd(args []string) {
 	if !*full {
 		more = append(more, "whole messages: --full")
 	}
-	fmt.Printf("showing #%d–#%d; %s\n", msgs[0].Seq, msgs[len(msgs)-1].Seq, strings.Join(more, "; "))
+	fmt.Printf("showing #%d–#%d; %s\n", lo, hi, strings.Join(more, "; "))
+	next := lo
+	hidden := func(upTo int) {
+		if upTo > next {
+			fmt.Printf("\n--- %s hidden: host context (system prompts, AGENTS.md, IDE state); --system shows it\n", seqRange(next, upTo-1))
+		}
+	}
 	for _, m := range msgs {
+		hidden(m.Seq)
+		next = m.Seq + 1
 		mark := ""
 		if m.Seq == target {
 			mark = "  <- hit"
@@ -707,6 +759,14 @@ func showCmd(args []string) {
 		}
 		fmt.Println(text)
 	}
+	hidden(hi + 1)
+}
+
+func seqRange(a, b int) string {
+	if a == b {
+		return fmt.Sprintf("#%d", a)
+	}
+	return fmt.Sprintf("#%d–#%d", a, b)
 }
 
 // showWindow picks the #seq range: explicit --from/--to first, then

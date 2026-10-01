@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -317,12 +318,55 @@ type SessionResult struct {
 	Messages int
 	LastAt   time.Time
 	Hits     []Hit
+	// Ending is where the session stopped, in seq order: the last real user
+	// prompt, the last assistant reply, and any note after both (a turn
+	// that failed or was aborted). Snippets hold the whole text.
+	Ending   []Hit
 	ViaGraph bool // found only through graph neighbours of the query
+	Named    bool // the query contains this session's ID
+}
+
+// sessionRef matches words that may be session IDs or ID prefixes:
+// UUIDs, their 8-character heads, and other long word-like IDs.
+var sessionRef = regexp.MustCompile(`[\p{L}\p{N}_-]{8,}`)
+
+// namedSessions returns the sessions whose ID, or unique ID prefix, the
+// query contains, in query order. Only words with a digit are tried.
+func (db *DB) namedSessions(query, project, source string) ([]string, error) {
+	var out []string
+	for _, ref := range sessionRef.FindAllString(query, -1) {
+		if !strings.ContainsAny(ref, "0123456789") {
+			continue
+		}
+		filter, args := filterSQL("s", project, source, []any{strings.ToLower(ref)})
+		rows, err := db.sql.Query(`SELECT session_id FROM sessions s WHERE starts_with(lower(s.session_id), ?)`+filter+` LIMIT 2`, args...)
+		if err != nil {
+			return nil, err
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		if len(ids) == 1 && !slices.Contains(out, ids[0]) {
+			out = append(out, ids[0])
+		}
+	}
+	return out, nil
 }
 
 // Recall groups ranked message hits by session, so one call answers
-// "which conversations, when, about what, and where exactly". Sessions
-// matching the query's own words come first, in rank order. If they
+// "which conversations, when, about what, and where exactly". A session
+// whose ID the query names comes first. Sessions matching the query's
+// own words follow, in rank order. If they
 // leave slots open, sessions found through the query's topic-graph
 // neighbours fill them, marked ViaGraph. It also returns those neighbours.
 func (db *DB) Recall(query, project, source string, sessions, perSession int) ([]SessionResult, []Topic, error) {
@@ -342,8 +386,16 @@ func (db *DB) Recall(query, project, source string, sessions, perSession int) ([
 	if err != nil {
 		return nil, nil, err
 	}
+	named, err := db.namedSessions(query, project, source)
+	if err != nil {
+		return nil, nil, err
+	}
 	var out []SessionResult
 	index := map[string]int{}
+	for _, id := range named[:min(len(named), sessions)] {
+		index[id] = len(out)
+		out = append(out, SessionResult{Session: Session{ID: id}, Named: true})
+	}
 	add := func(hits []Hit, viaGraph bool) {
 		for _, h := range hits {
 			i, ok := index[h.SessionID]
@@ -377,13 +429,45 @@ func (db *DB) Recall(query, project, source string, sessions, perSession int) ([
 		if err := db.describeSession(&out[i]); err != nil {
 			return nil, nil, err
 		}
+		if err := db.describeEnding(&out[i]); err != nil {
+			return nil, nil, err
+		}
 	}
 	return out, related, nil
 }
 
-// titleFilter skips injected context blocks (<environment_context>,
-// <command-name>, AGENTS.md dumps) that precede the real first prompt.
-const titleFilter = `role = 'user' AND NOT starts_with(ltrim(text), '<') AND NOT starts_with(ltrim(text), '# AGENTS.md')`
+// contextFilter matches what the host injected rather than what was said:
+// system prompts, and user-role blocks such as <environment_context>,
+// <command-name> or AGENTS.md dumps.
+const contextFilter = `(role = 'system' OR (role = 'user' AND (starts_with(ltrim(text), '<') OR starts_with(ltrim(text), '# AGENTS.md'))))`
+
+// titleFilter finds real user prompts.
+const titleFilter = `role = 'user' AND NOT ` + contextFilter
+
+// describeEnding loads where the session stopped; see SessionResult.Ending.
+func (db *DB) describeEnding(r *SessionResult) error {
+	rows, err := db.sql.Query(`WITH m AS (SELECT * FROM messages WHERE session_id = ?),
+		lu AS (SELECT max(seq) AS seq FROM m WHERE `+titleFilter+`),
+		la AS (SELECT max(seq) AS seq FROM m WHERE role = 'assistant')
+		SELECT m.session_id, m.seq, m.source, m.project, m.role, m.text, m.created_at FROM m, lu, la
+		WHERE m.seq = lu.seq OR m.seq = la.seq
+			OR (m.role = 'note' AND m.seq > coalesce(greatest(lu.seq, la.seq), -1))
+		ORDER BY m.seq`, r.Session.ID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	r.Ending = nil
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return err
+		}
+		r.Ending = append(r.Ending, Hit{SessionID: m.SessionID, Seq: m.Seq, Source: m.Source, Project: m.Project,
+			Role: m.Role, Snippet: m.Text, CreatedAt: m.CreatedAt})
+	}
+	return rows.Err()
+}
 
 func (db *DB) describeSession(r *SessionResult) error {
 	var started, last sql.NullTime
@@ -441,9 +525,12 @@ func (db *DB) ResolveSession(ref string) (SessionResult, error) {
 }
 
 // Window returns a session's messages with from <= seq <= to, in order.
-func (db *DB) Window(sessionID string, from, to int) ([]Message, error) {
+// Unless withContext is set it drops host-injected context (see
+// contextFilter), except the message at seq keep.
+func (db *DB) Window(sessionID string, from, to, keep int, withContext bool) ([]Message, error) {
 	rows, err := db.sql.Query(`SELECT session_id, seq, source, project, role, text, created_at
-		FROM messages WHERE session_id = ? AND seq BETWEEN ? AND ? ORDER BY seq`, sessionID, from, to)
+		FROM messages WHERE session_id = ? AND seq BETWEEN ? AND ?
+		AND (? OR seq = ? OR NOT `+contextFilter+`) ORDER BY seq`, sessionID, from, to, withContext, keep)
 	if err != nil {
 		return nil, err
 	}

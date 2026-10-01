@@ -92,7 +92,7 @@ session stores.
 duck-mem ingest [--db PATH] [ROOT...]   index new messages from session logs
 duck-mem query [--db PATH] [--project P] [--source S] [--limit N] [--hits N] <text...>
                                         best-matching sessions, with their hits
-duck-mem show [--db PATH] [--context N] [--from A] [--to B] [--full] <session>[#seq]
+duck-mem show [--db PATH] [--context N] [--from A] [--to B] [--full] [--system] <session>[#seq]
                                         read the messages around a hit
 duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
                                         what a project discusses together with <term>
@@ -118,6 +118,9 @@ $ duck-mem query "flaky test on darwin arm64" --project duck-mem --limit 2
     #12 user 14:02:11: the arm64 runner times out on ingest_test.go:184, flaky?
     #41 assistant 14:19:03: TestRetryExponentialBackoff failed 3 of 5 runs on darwin-arm64
     #58 assistant 14:41:57: the timeout is the -race flag, not the backoff; fixed in helper_test.go:22
+    ended with:
+      #410 user 15:02:40: commit it
+      #411 assistant 15:03:12: committed as 4f2a9c1; CI is green on darwin-arm64
 
 [2] 0199f2d8-77aa-70c2-9d13-6b2f0aa9e410  codex · 2026-08-15 · 96 msgs · /home/you/Projects/duck-mem
     (no query words here; found through the topic-graph neighbours below)
@@ -129,13 +132,19 @@ Topic graph: often discussed with these words: race (4), timeout (3), retry (2),
 Read a hit with the messages around it: duck-mem show 0199f1c4-2b7a-7c31-9f0e-5d2a8b41c7de#41
 ```
 
-Each result is a session: what it was, when, which project, how it started and
-the messages that matched, placed where the query terms are closest together.
+Each result is a session: what it was, when, which project, how it started,
+the messages that matched (placed where the query terms are closest together)
+and how it ended: the last prompt, the last reply and, when the last turn got
+no reply, a note with the reason (usage limit, interrupted) and the log path.
 Sessions that match only through the topic graph are marked as such and appear
-after the direct hits, so the graph widens a search without reordering it.
+after the direct hits, so the graph widens a search without reordering it; the
+topic-graph line is printed only when it explains such a session or the query
+left slots empty. A session ID (or unique prefix) in the query puts that
+session first, which is how an agent picks up another agent's thread.
 
 `show` is the second step — it prints the messages around a hit so you can read
-the reasoning in context:
+the reasoning in context. Host context (system prompts, AGENTS.md dumps, IDE
+state) is collapsed to one line; `--system` prints it:
 
 ```console
 $ duck-mem show 0199f1c4#41 --context 2

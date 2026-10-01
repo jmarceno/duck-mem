@@ -23,7 +23,7 @@ type Message struct {
 	Seq       int // order within the session, assigned at ingest
 	Source    string
 	Project   string
-	Role      string // user | assistant | system | note
+	Role      string // user | assistant | system | note (plans, turns that ended without a reply)
 	Text      string
 	CreatedAt time.Time // zero when the source format carries no timestamp
 }
