@@ -196,7 +196,7 @@ func filterSQL(alias, project, source string, args []any) (string, []any) {
 }
 
 // keywordRank scores messages with BM25 over msg_terms, each term's
-// contribution scaled by its weight.
+// contribution scaled by its weight. Host context is never a hit.
 func (db *DB) keywordRank(weights map[string]float64, project, source string, limit int) ([]scored, error) {
 	var n, total float64
 	if err := db.sql.QueryRow(`SELECT (SELECT count(*) FROM messages), (SELECT coalesce(sum(tf), 0) FROM msg_terms)`).Scan(&n, &total); err != nil {
@@ -223,7 +223,7 @@ func (db *DB) keywordRank(weights map[string]float64, project, source string, li
 				(c.tf + ` + strconv.FormatFloat(bm25K1, 'f', -1, 64) + ` * (` + strconv.FormatFloat(1-bm25B, 'f', -1, 64) + ` + ` +
 		strconv.FormatFloat(bm25B, 'f', -1, 64) + ` * dl.dl / $2))) AS score
 		FROM cand c JOIN dl USING (session_id, seq) JOIN messages m USING (session_id, seq)
-		WHERE true` + positional(filter, 3) + `
+		WHERE NOT ` + contextFilter + positional(filter, 3) + `
 		GROUP BY c.session_id, c.seq ORDER BY score DESC LIMIT ` + strconv.Itoa(limit)
 	return db.scoredRows(q, args, false)
 }

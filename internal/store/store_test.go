@@ -281,7 +281,7 @@ func TestRecallPinsNamedSessionWithItsEnding(t *testing.T) {
 	add("01a0f755-bbbb",
 		[2]string{"user", "raise the attachment limit"},
 		[2]string{"assistant", "I'll trace the attachment checks"},
-		[2]string{"user", "<environment_context>cwd</environment_context>"},
+		[2]string{"user", "<environment_context>01a0f755 attachment limit</environment_context>"},
 		[2]string{"assistant", "tests fail on multipart headers"},
 		[2]string{"note", "turn failed: usage limit"})
 	results, _, err := db.Recall("01a0f755 attachment limit", "", "", 5, 3)
@@ -297,6 +297,11 @@ func TestRecallPinsNamedSessionWithItsEnding(t *testing.T) {
 	}
 	if !slices.Equal(ending, []int{0, 3, 4}) {
 		t.Fatalf("ending should be last prompt, last reply, trailing note: %v", ending)
+	}
+	for _, h := range results[0].Hits {
+		if h.Seq == 2 {
+			t.Fatalf("host context returned as a hit: %+v", h)
+		}
 	}
 }
 
