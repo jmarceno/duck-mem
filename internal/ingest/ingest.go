@@ -227,7 +227,8 @@ func readLinesFrom(path string, offset int64, fn func(map[string]any)) error {
 		case KindClaude:
 			valid = str(o, "type") != ""
 		case KindMuse:
-			valid = o["payload"] != nil || o["retained_frame"] != nil
+			// retained_marker stands in for an ephemeral record Muse did not keep.
+			valid = o["payload"] != nil || o["retained_frame"] != nil || o["retained_marker"] != nil
 		case KindCursorTranscript:
 			// Cursor interleaves turn lifecycle records with conversation messages.
 			valid = (str(o, "role") != "" && o["message"] != nil) || str(o, "type") == "turn_ended"

@@ -121,6 +121,7 @@ func TestIngestKeepsConversationDropsToolCalls(t *testing.T) {
 	writeTemp(t, muse, strings.Join([]string{
 		`{"payload_type":"runtime.session.route_facts","stream":{"id":"m1"},"recorded_at":1789984409011408,"payload":{"record":{"cwd":"/home/u/portal"}}}`,
 		`{"payload_type":"runtime.user_intent.accepted","stream":{"id":"m1"},"recorded_at":1789984409395508,"payload":{"refill_blocks":[{"kind":"text","text":"migrate the redship db"}]}}`,
+		`{"retained_marker":"omitted_live_only","schema_version":1,"stream":{"kind":"session","id":"m1"},"position":{"id":"p1","sequence":3},"omitted_record":{"record_type":"status","durability":"ephemeral","payload_type":"runtime.session","payload_kind":"task","omission_class":"task_tool_delta_v1"}}`,
 		`{"payload_type":"runtime.session","stream":{"id":"m1"},"recorded_at":1789984409398898,"payload":{"event":{"kind":"started","prompt":"migrate the redship db"}}}`,
 		`{"payload_type":"runtime.session","stream":{"id":"m1"},"recorded_at":1789984409400000,"payload":{"event":{"kind":"assistant_tool_calls_committed"}}}`,
 		`{"payload_type":"runtime.session","stream":{"id":"m1"},"recorded_at":1789984409400001,"payload":{"event":{"kind":"output","chunk":"some tool output"}}}`,
