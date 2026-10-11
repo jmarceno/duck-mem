@@ -8,6 +8,25 @@ import (
 	"testing"
 )
 
+func TestCleanCycleClearsFailureOnlyWhenNothingWasSkipped(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := appendSyncLog(syncLogEntry{Harness: "all", Result: "failure", Reason: "Database error", Detail: "lock"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := acknowledgeCleanCycle(1); err != nil {
+		t.Fatal(err)
+	}
+	if !unreadSyncFailure() {
+		t.Fatal("a cycle that skipped a file cleared the failure")
+	}
+	if err := acknowledgeCleanCycle(0); err != nil {
+		t.Fatal(err)
+	}
+	if unreadSyncFailure() {
+		t.Fatal("a complete cycle left the failure set")
+	}
+}
+
 func TestSyncHistoryAndFailureAcknowledgement(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	failure := syncLogEntry{Harness: "cursor", Result: "failure", Reason: "Unexpected format", Detail: "unrecognized record envelope", Path: "/cursor/thread.jsonl"}

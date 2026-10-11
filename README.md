@@ -275,9 +275,11 @@ text is stored in these logs. Logs are retained without automatic deletion.
 **Open database folder** opens `~/.local/share/duck-mem/` the same way.
 **View logs** opens this directory in the default file manager and clears the
 indicator for existing failures. Failures include the affected file path and
-show a red dot drawn directly into the tray icon, retained across successful
-syncs and tray restarts; a later failure sets it again. Busy and stopped states
-use amber and grey dots respectively. The tray refreshes every ten seconds.
+show a red dot drawn directly into the tray icon. The dot also clears when a
+later cycle finishes without an error and without skipping a file, because a
+skipped file is not checkpointed and is still missing. A later failure sets
+the dot again. Busy and stopped states use amber and grey dots respectively.
+The tray refreshes every ten seconds.
 
 The tray is optional — `duck-mem ingest`, `query` and the rest work without it.
 

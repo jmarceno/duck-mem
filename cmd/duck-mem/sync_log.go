@@ -73,6 +73,23 @@ func acknowledgeSyncFailure(marker []byte) error {
 	return os.WriteFile(acknowledgedPath(), marker, 0o600)
 }
 
+// acknowledgeCleanCycle clears an unread failure after a cycle that skipped
+// nothing. A skipped file was not checkpointed, so it is still missing; a
+// later cycle that finishes with zero skips has ingested it.
+func acknowledgeCleanCycle(skipped int) error {
+	if skipped != 0 {
+		return nil
+	}
+	marker, err := os.ReadFile(failurePath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return acknowledgeSyncFailure(marker)
+}
+
 func harnessName(kind ingest.Kind) string {
 	switch kind {
 	case ingest.KindCodex:

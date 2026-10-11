@@ -225,6 +225,9 @@ func performCycle(db *store.DB, dbPath string, roots []string) (owner.IngestResu
 	if err := db.Checkpoint(); err != nil {
 		return owner.IngestResult{}, err
 	}
+	if err := acknowledgeCleanCycle(nSkip); err != nil {
+		logSyncFailure("all", "Other", err)
+	}
 	if err := writeSyncStatus(dbPath, syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}); err != nil {
 		logSyncFailure("all", "Other", err)
 		fmt.Fprintln(os.Stderr, "sync status:", err)
