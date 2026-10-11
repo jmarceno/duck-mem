@@ -49,12 +49,15 @@ func newTrayIcons() (trayIcons, error) {
 }
 
 // icon includes the failure badge in the main pixmap so hosts that ignore
-// OverlayIconPixmap still display unread errors.
+// OverlayIconPixmap still display unread errors. The returned buffers are
+// copies: dbus.Store writes a new icon into the previous value's backing
+// array, which would otherwise overwrite the cached logo the first time a
+// failure icon is published.
 func (i trayIcons) icon(s traySnapshot) []iconPixmap {
 	if s.failure {
-		return i.failed
+		return clonePixmaps(i.failed)
 	}
-	return i.logo
+	return clonePixmaps(i.logo)
 }
 
 // Failure takes precedence over the busy and stopped overlays.
@@ -63,12 +66,20 @@ func (i trayIcons) overlay(s traySnapshot) []iconPixmap {
 	case s.failure:
 		return []iconPixmap{}
 	case s.busy:
-		return i.busy
+		return clonePixmaps(i.busy)
 	case !s.running:
-		return i.stopped
+		return clonePixmaps(i.stopped)
 	default:
 		return []iconPixmap{}
 	}
+}
+
+func clonePixmaps(list []iconPixmap) []iconPixmap {
+	out := make([]iconPixmap, len(list))
+	for i, p := range list {
+		out[i] = iconPixmap{Width: p.Width, Height: p.Height, Data: append([]byte(nil), p.Data...)}
+	}
+	return out
 }
 
 func failureIcon(logo *image.NRGBA) *image.NRGBA {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"image"
 	"image/color"
 	"testing"
@@ -68,6 +69,21 @@ func TestOverlayOnlyMarksTheStoppedOrBusyStates(t *testing.T) {
 	}
 	if got := set.overlay(traySnapshot{}); len(got) != 1 || got[0].Width != 1 {
 		t.Errorf("stopped overlay = %v, want the stopped badge", got)
+	}
+}
+
+func TestPublishedIconDoesNotRewriteCachedLogo(t *testing.T) {
+	set, err := newTrayIcons()
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := set.icon(traySnapshot{failure: true})
+	// dbus.Store copies a new pixmap into the previous value's buffer.
+	shown := set.icon(traySnapshot{running: true})
+	copy(shown[0].Data, failed[0].Data)
+	again := set.icon(traySnapshot{running: true})
+	if bytes.Equal(again[0].Data, failed[0].Data) {
+		t.Fatal("publishing overwrote the cached logo")
 	}
 }
 
