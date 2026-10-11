@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"regexp"
@@ -53,7 +54,8 @@ const (
 )
 
 // Search ranks messages by the query's own words; see rank.
-func (db *DB) Search(query, project, source string, limit int) ([]Hit, error) {
+func (db *DB) Search(ctx context.Context, query, project, source string, limit int) ([]Hit, error) {
+	defer db.setRead(ctx)()
 	terms, err := db.queryTerms(query)
 	if err != nil {
 		return nil, err
@@ -165,7 +167,7 @@ func addRRF(fused map[msgKey]float64, ranked []scored) {
 
 // queryTerms stems the query exactly like the posting list.
 func (db *DB) queryTerms(query string) ([]string, error) {
-	rows, err := db.sql.Query(`SELECT DISTINCT stem(word, 'porter') FROM (SELECT unnest(`+fmt.Sprintf(tokenSQL, "?")+`) AS word)
+	rows, err := db.query(`SELECT DISTINCT stem(word, 'porter') FROM (SELECT unnest(`+fmt.Sprintf(tokenSQL, "?")+`) AS word)
 		WHERE length(word) BETWEEN 2 AND 40`, query)
 	if err != nil {
 		return nil, err
@@ -199,7 +201,7 @@ func filterSQL(alias, project, source string, args []any) (string, []any) {
 // contribution scaled by its weight. Host context is never a hit.
 func (db *DB) keywordRank(weights map[string]float64, project, source string, limit int) ([]scored, error) {
 	var n, total float64
-	if err := db.sql.QueryRow(`SELECT (SELECT count(*) FROM messages), (SELECT coalesce(sum(tf), 0) FROM msg_terms)`).Scan(&n, &total); err != nil {
+	if err := db.queryRow(`SELECT (SELECT count(*) FROM messages), (SELECT coalesce(sum(tf), 0) FROM msg_terms)`).Scan(&n, &total); err != nil {
 		if strings.Contains(err.Error(), "msg_terms") {
 			return nil, fmt.Errorf("keyword index missing: restart the duck-mem daemon or run `duck-mem index` with this version")
 		}
@@ -254,7 +256,7 @@ func (db *DB) vectorRank(vec []float32, project, source string, limit int) ([]sc
 }
 
 func (db *DB) scoredRows(q string, args []any, distance bool) ([]scored, error) {
-	rows, err := db.sql.Query(q, args...)
+	rows, err := db.query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +287,7 @@ func (db *DB) messagesByKey(keys []msgKey) (map[msgKey]Message, error) {
 	for i, k := range keys {
 		vals[i] = fmt.Sprintf("(%s, %d)", sqlString(k.sessionID), k.seq)
 	}
-	rows, err := db.sql.Query(`SELECT m.session_id, m.seq, m.source, m.project, m.role, m.text, m.created_at
+	rows, err := db.query(`SELECT m.session_id, m.seq, m.source, m.project, m.role, m.text, m.created_at
 		FROM messages m JOIN (VALUES ` + strings.Join(vals, ",") + `) v(session_id, seq) USING (session_id, seq)`)
 	if err != nil {
 		return nil, err
@@ -339,7 +341,7 @@ func (db *DB) namedSessions(query, project, source string) ([]string, error) {
 			continue
 		}
 		filter, args := filterSQL("s", project, source, []any{strings.ToLower(ref)})
-		rows, err := db.sql.Query(`SELECT session_id FROM sessions s WHERE starts_with(lower(s.session_id), ?)`+filter+` LIMIT 2`, args...)
+		rows, err := db.query(`SELECT session_id FROM sessions s WHERE starts_with(lower(s.session_id), ?)`+filter+` LIMIT 2`, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -369,7 +371,8 @@ func (db *DB) namedSessions(query, project, source string) ([]string, error) {
 // own words follow, in rank order. If they
 // leave slots open, sessions found through the query's topic-graph
 // neighbours fill them, marked ViaGraph. It also returns those neighbours.
-func (db *DB) Recall(query, project, source string, sessions, perSession int) ([]SessionResult, []Topic, error) {
+func (db *DB) Recall(ctx context.Context, query, project, source string, sessions, perSession int) ([]SessionResult, []Topic, error) {
+	defer db.setRead(ctx)()
 	if sessions < 1 || perSession < 1 {
 		return nil, nil, fmt.Errorf("limit must be positive")
 	}
@@ -446,7 +449,7 @@ const titleFilter = `role = 'user' AND NOT ` + contextFilter
 
 // describeEnding loads where the session stopped; see SessionResult.Ending.
 func (db *DB) describeEnding(r *SessionResult) error {
-	rows, err := db.sql.Query(`WITH m AS (SELECT * FROM messages WHERE session_id = ?),
+	rows, err := db.query(`WITH m AS (SELECT * FROM messages WHERE session_id = ?),
 		lu AS (SELECT max(seq) AS seq FROM m WHERE `+titleFilter+`),
 		la AS (SELECT max(seq) AS seq FROM m WHERE role = 'assistant')
 		SELECT m.session_id, m.seq, m.source, m.project, m.role, m.text, m.created_at FROM m, lu, la
@@ -472,7 +475,7 @@ func (db *DB) describeEnding(r *SessionResult) error {
 func (db *DB) describeSession(r *SessionResult) error {
 	var started, last sql.NullTime
 	var title sql.NullString
-	err := db.sql.QueryRow(`SELECT s.source, s.project, s.path, s.started_at,
+	err := db.queryRow(`SELECT s.source, s.project, s.path, s.started_at,
 		(SELECT count(*) FROM messages m WHERE m.session_id = s.session_id),
 		(SELECT max(created_at) FROM messages m WHERE m.session_id = s.session_id),
 		(SELECT text FROM messages m WHERE m.session_id = s.session_id AND `+titleFilter+` ORDER BY seq LIMIT 1)
@@ -492,8 +495,9 @@ func (db *DB) describeSession(r *SessionResult) error {
 }
 
 // ResolveSession finds a session by full ID or unique ID prefix.
-func (db *DB) ResolveSession(ref string) (SessionResult, error) {
-	rows, err := db.sql.Query(`SELECT session_id FROM sessions WHERE starts_with(session_id, ?) ORDER BY session_id LIMIT 6`, ref)
+func (db *DB) ResolveSession(ctx context.Context, ref string) (SessionResult, error) {
+	defer db.setRead(ctx)()
+	rows, err := db.query(`SELECT session_id FROM sessions WHERE starts_with(session_id, ?) ORDER BY session_id LIMIT 6`, ref)
 	if err != nil {
 		return SessionResult{}, err
 	}
@@ -527,8 +531,9 @@ func (db *DB) ResolveSession(ref string) (SessionResult, error) {
 // Window returns a session's messages with from <= seq <= to, in order.
 // Unless withContext is set it drops host-injected context (see
 // contextFilter), except the message at seq keep.
-func (db *DB) Window(sessionID string, from, to, keep int, withContext bool) ([]Message, error) {
-	rows, err := db.sql.Query(`SELECT session_id, seq, source, project, role, text, created_at
+func (db *DB) Window(ctx context.Context, sessionID string, from, to, keep int, withContext bool) ([]Message, error) {
+	defer db.setRead(ctx)()
+	rows, err := db.query(`SELECT session_id, seq, source, project, role, text, created_at
 		FROM messages WHERE session_id = ? AND seq BETWEEN ? AND ?
 		AND (? OR seq = ? OR NOT `+contextFilter+`) ORDER BY seq`, sessionID, from, to, withContext, keep)
 	if err != nil {

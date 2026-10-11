@@ -128,8 +128,9 @@ Host context (system prompts, AGENTS.md, IDE state) is collapsed to one
 - Results are memory, not current truth. The code may have changed since.
   Check the checkout before you act on a recalled detail.
 - The current conversation is not in memory yet. The daemon syncs every few minutes.
-- If you see "Could not set lock", the daemon is in the middle of a long
-  re-index. Retry after a short wait.
+- A query waits while a sync or another query is using the database. It does
+  not fail because the daemon is writing. If the query itself runs longer
+  than 30 seconds, it stops.
 
 ## Mapping an area: related
 

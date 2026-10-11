@@ -200,9 +200,14 @@ use counts as of each run, a periodic full rebuild heals the small drift:
 0 4 * * 0 duck-mem index --full   # weekly rebuild; daily ingest stays incremental
 ```
 
-DuckDB allows a single writer process at a time, so the daemon opens the
-database per cycle and closes it again, and CLI commands retry through the
-brief lock a cycle can hold. Nothing is left locked between runs.
+DuckDB allows one read-write process at a time. The daemon is that process:
+it opens the database at startup and keeps it. `query`, `show`, `related`,
+`ingest`, and `index` send their work to the daemon and wait in one queue, so
+a sync and a search no longer fail each other with a file-lock error. Time in
+the queue is not limited. Once a `query`, `show`, or `related` starts, it has
+30 seconds to finish; ingest, index, and checkpoint are not capped. With the
+daemon stopped, those commands open the database themselves. `repack` still
+needs the service stopped, because it has to copy the file without a writer.
 
 Vector search deliberately uses no approximate index. The vss HNSW index that
 earlier versions persisted kept every checkpoint's index blocks, so the file

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -46,6 +47,42 @@ type Session struct {
 type DB struct {
 	sql      *sql.DB
 	readOnly bool
+	// readCtx cancels agent reads. Writes leave it nil and use a background context.
+	readCtx context.Context
+}
+
+// setRead installs ctx for agent reads on this connection and returns a
+// restore. The owner calls it from query, show, and related so a deadline
+// interrupts DuckDB. Writes leave readCtx nil.
+func (db *DB) setRead(ctx context.Context) func() {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	prev := db.readCtx
+	db.readCtx = ctx
+	return func() { db.readCtx = prev }
+}
+
+func (db *DB) readContext() context.Context {
+	if db.readCtx != nil {
+		return db.readCtx
+	}
+	return context.Background()
+}
+
+func (db *DB) query(q string, args ...any) (*sql.Rows, error) {
+	return db.sql.QueryContext(db.readContext(), q, args...)
+}
+
+func (db *DB) queryRow(q string, args ...any) *sql.Row {
+	return db.sql.QueryRowContext(db.readContext(), q, args...)
+}
+
+// Checkpoint folds the WAL back into the database file. The owner keeps
+// the connection open, so a cycle has to checkpoint itself.
+func (db *DB) Checkpoint() error {
+	_, err := db.sql.Exec(`CHECKPOINT`)
+	return err
 }
 
 // FileCheckpoint records the file state already reflected in messages.
@@ -847,7 +884,8 @@ type RelatedHit struct {
 // Empty project searches all projects; otherwise vertices are filtered
 // by project substring. Depth 1 ranks direct neighbors; depth 2 adds
 // neighbors-of-neighbors, scored by the two-hop weight sum.
-func (db *DB) Related(term, project string, depth, limit int) ([]RelatedHit, error) {
+func (db *DB) Related(ctx context.Context, term, project string, depth, limit int) ([]RelatedHit, error) {
+	defer db.setRead(ctx)()
 	if limit < 1 || (depth != 1 && depth != 2) {
 		return nil, fmt.Errorf("related needs a positive limit and depth 1 or 2")
 	}
@@ -942,7 +980,7 @@ func (db *DB) graphNeighbors(term, project string) ([]RelatedHit, error) {
 		q += ` AND contains(lower(g.project), lower(` + sqlString(project) + `))`
 	}
 	q += ` GROUP BY g.term, g.kind, g.from_term, g.to_term`
-	rows, err := db.sql.Query(q)
+	rows, err := db.query(q)
 	if err != nil {
 		return nil, fmt.Errorf("duckpgq traversal: %w", err)
 	}
@@ -979,7 +1017,7 @@ func (db *DB) graphTwoHop(term, project string) ([]RelatedHit, error) {
 		q += ` AND contains(lower(g.project), lower(` + sqlString(project) + `))`
 	}
 	q += ` GROUP BY g.via, g.term, g.kind, g.from_term, g.to_term`
-	rows, err := db.sql.Query(q)
+	rows, err := db.query(q)
 	if err != nil {
 		return nil, fmt.Errorf("duckpgq traversal: %w", err)
 	}

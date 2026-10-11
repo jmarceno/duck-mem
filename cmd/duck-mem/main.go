@@ -22,6 +22,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jmarceno/duck-mem/internal/ingest"
+	"github.com/jmarceno/duck-mem/internal/owner"
 	"github.com/jmarceno/duck-mem/internal/store"
 )
 
@@ -134,29 +135,19 @@ func ingestCmd(args []string) {
 		logSyncFailure("all", "Database error", err)
 		fatal(err)
 	}
-	db, err := openTolerant(*dbPath, false)
+	mem, err := openMemory(*dbPath, true)
 	if err != nil {
 		logSyncFailure("all", "Database error", err)
 		fatal(err)
 	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			logSyncFailure("all", "Database error", err)
-		}
-	}()
-
-	files, nSess, nMsg, nSkip := runCycle(db, roots)
-	fmt.Printf("files=%d sessions=%d messages=%d skipped=%d db=%s\n", files, nSess, nMsg, nSkip, *dbPath)
-	newMsgs, newPairs, err := db.IndexNew(2)
+	defer mem.Close()
+	res, err := mem.Ingest(roots)
 	if err != nil {
 		logSyncFailure("all", "Database error", err)
 		fatal(err)
 	}
-	fmt.Printf("index: +%d messages, +%d pairs\n", newMsgs, newPairs)
-	if err := writeSyncStatus(*dbPath, syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}); err != nil {
-		logSyncFailure("all", "Other", err)
-		fmt.Fprintln(os.Stderr, "sync status:", err)
-	}
+	fmt.Printf("files=%d sessions=%d messages=%d skipped=%d db=%s\n", res.Files, res.Sessions, res.Messages, res.Skipped, *dbPath)
+	fmt.Printf("index: +%d messages, +%d pairs\n", res.NewMsgs, res.NewPairs)
 }
 
 func daemonCmd(args []string) {
@@ -180,34 +171,36 @@ func daemonCmd(args []string) {
 		logSyncFailure("all", "Database error", err)
 		fatal(err)
 	}
+	own, err := owner.Start(*dbPath, owner.Handlers{
+		Ingest: func(db *store.DB, got []string) (owner.IngestResult, error) {
+			if len(got) == 0 {
+				got = roots
+			}
+			return performCycle(db, *dbPath, got)
+		},
+		Index: performIndex,
+	})
+	if err != nil {
+		logSyncFailure("all", "Database error", err)
+		fatal(err)
+	}
+	defer own.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	fmt.Printf("%s daemon start db=%s interval=%s roots=%d\n",
 		time.Now().UTC().Format(time.RFC3339), *dbPath, interval, len(roots))
 	cycle := func(n int) {
-		// Open per cycle and close right after: DuckDB allows one
-		// process at a time, so holding the file would block queries
-		// for the daemon's whole lifetime.
-		db, err := store.Open(*dbPath)
-		if err != nil {
-			logSyncFailure("all", "Database error", err)
-			fmt.Printf("%s cycle=%d open error: %v\n", time.Now().UTC().Format(time.RFC3339), n, err)
-			return
-		}
-		files, nSess, nMsg, nSkip := runCycle(db, roots)
-		newMsgs, newPairs, err := db.IndexNew(2)
-		err = errors.Join(err, db.Close())
+		val, err := own.Do(owner.KindWrite, func(_ context.Context, db *store.DB) (any, error) {
+			return performCycle(db, *dbPath, roots)
+		})
 		if err != nil {
 			logSyncFailure("all", "Database error", err)
 			fmt.Printf("%s cycle=%d error: %v\n", time.Now().UTC().Format(time.RFC3339), n, err)
 			return
 		}
-		if err := writeSyncStatus(*dbPath, syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}); err != nil {
-			logSyncFailure("all", "Other", err)
-			fmt.Printf("%s cycle=%d status error: %v\n", time.Now().UTC().Format(time.RFC3339), n, err)
-		}
+		res := val.(owner.IngestResult)
 		fmt.Printf("%s cycle=%d files=%d sessions=%d messages=%d skipped=%d indexed=+%d pairs=+%d\n",
-			time.Now().UTC().Format(time.RFC3339), n, files, nSess, nMsg, nSkip, newMsgs, newPairs)
+			time.Now().UTC().Format(time.RFC3339), n, res.Files, res.Sessions, res.Messages, res.Skipped, res.NewMsgs, res.NewPairs)
 	}
 	cycle(0)
 	ticker := time.NewTicker(interval)
@@ -221,6 +214,45 @@ func daemonCmd(args []string) {
 			cycle(n)
 		}
 	}
+}
+
+func performCycle(db *store.DB, dbPath string, roots []string) (owner.IngestResult, error) {
+	files, nSess, nMsg, nSkip := runCycle(db, roots)
+	newMsgs, newPairs, err := db.IndexNew(2)
+	if err != nil {
+		return owner.IngestResult{}, err
+	}
+	if err := db.Checkpoint(); err != nil {
+		return owner.IngestResult{}, err
+	}
+	if err := writeSyncStatus(dbPath, syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}); err != nil {
+		logSyncFailure("all", "Other", err)
+		fmt.Fprintln(os.Stderr, "sync status:", err)
+	}
+	return owner.IngestResult{
+		Files: files, Sessions: nSess, Messages: nMsg, Skipped: nSkip,
+		NewMsgs: newMsgs, NewPairs: newPairs,
+	}, nil
+}
+
+func performIndex(db *store.DB, minDF int, full bool) (owner.IndexResult, error) {
+	if full {
+		if err := db.IndexFull(minDF); err != nil {
+			return owner.IndexResult{}, err
+		}
+		if err := db.Checkpoint(); err != nil {
+			return owner.IndexResult{}, err
+		}
+		return owner.IndexResult{Full: true}, nil
+	}
+	newMsgs, newPairs, err := db.IndexNew(minDF)
+	if err != nil {
+		return owner.IndexResult{}, err
+	}
+	if err := db.Checkpoint(); err != nil {
+		return owner.IndexResult{}, err
+	}
+	return owner.IndexResult{NewMsgs: newMsgs, NewPairs: newPairs}, nil
 }
 
 // runCycle skips unchanged files and reads only the appended bytes of
@@ -500,23 +532,20 @@ func indexCmd(args []string) {
 	full := fs.Bool("full", false, "full rebuild: exact thresholds, heals drift (run weekly)")
 	flagArgs, _ := splitArgs(args, map[string]bool{"--db": true, "--min-df": true, "--full": false})
 	_ = fs.Parse(flagArgs)
-	db, err := openTolerant(*dbPath, false)
+	mem, err := openMemory(*dbPath, true)
 	if err != nil {
 		fatal(err)
 	}
-	defer db.Close()
-	if *full {
-		if err := db.IndexFull(*minDF); err != nil {
-			fatal(err)
-		}
+	defer mem.Close()
+	res, err := mem.Index(*minDF, *full)
+	if err != nil {
+		fatal(err)
+	}
+	if res.Full {
 		fmt.Println("topic graph rebuilt (full)")
 		return
 	}
-	newMsgs, newPairs, err := db.IndexNew(*minDF)
-	if err != nil {
-		fatal(err)
-	}
-	fmt.Printf("index: +%d messages, +%d pairs\n", newMsgs, newPairs)
+	fmt.Printf("index: +%d messages, +%d pairs\n", res.NewMsgs, res.NewPairs)
 }
 
 func relatedCmd(args []string) {
@@ -533,12 +562,12 @@ func relatedCmd(args []string) {
 		fmt.Fprintln(os.Stderr, "related needs a term")
 		os.Exit(2)
 	}
-	db, err := openTolerant(*dbPath, true)
+	mem, err := openMemory(*dbPath, false)
 	if err != nil {
 		fatal(err)
 	}
-	defer db.Close()
-	hits, err := db.Related(strings.Join(fs.Args(), " "), *project, *depth, *limit)
+	defer mem.Close()
+	hits, err := mem.Related(strings.Join(fs.Args(), " "), *project, *depth, *limit)
 	if err != nil {
 		fatal(err)
 	}
@@ -574,14 +603,14 @@ func queryCmd(args []string) {
 		fmt.Fprintln(os.Stderr, "query needs search text")
 		os.Exit(2)
 	}
-	db, err := openTolerant(*dbPath, true)
+	mem, err := openMemory(*dbPath, false)
 	if err != nil {
 		fatal(err)
 	}
-	defer db.Close()
+	defer mem.Close()
 
 	q := strings.Join(fs.Args(), " ")
-	results, related, err := db.Recall(q, *project, *source, *limit, *perSession)
+	results, related, err := mem.Recall(q, *project, *source, *limit, *perSession)
 	if err != nil {
 		fatal(err)
 	}
@@ -595,7 +624,7 @@ func queryCmd(args []string) {
 	if len(results) == 0 {
 		fmt.Printf("no matches for %q%s\n", q, scope)
 		if *project != "" {
-			if others, _, err := db.Recall(q, "", *source, 5, 1); err == nil && len(others) > 0 {
+			if others, _, err := mem.Recall(q, "", *source, 5, 1); err == nil && len(others) > 0 {
 				var projects []string
 				seen := map[string]bool{}
 				for _, r := range others {
@@ -703,17 +732,17 @@ func showCmd(args []string) {
 		}
 		ref, target = ref[:i], n
 	}
-	db, err := openTolerant(*dbPath, true)
+	mem, err := openMemory(*dbPath, false)
 	if err != nil {
 		fatal(err)
 	}
-	defer db.Close()
-	s, err := db.ResolveSession(ref)
+	defer mem.Close()
+	s, err := mem.ResolveSession(ref)
 	if err != nil {
 		fatal(err)
 	}
 	lo, hi := showWindow(target, *ctxN, *from, *to, s.Messages)
-	msgs, err := db.Window(s.Session.ID, lo, hi, target, *system)
+	msgs, err := mem.Window(s.Session.ID, lo, hi, target, *system)
 	if err != nil {
 		fatal(err)
 	}

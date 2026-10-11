@@ -75,7 +75,7 @@ func (db *DB) stemWords(words []string) (map[string]string, error) {
 	if len(words) == 0 {
 		return out, nil
 	}
-	rows, err := db.sql.Query(`SELECT w, stem(w, 'porter') FROM (SELECT unnest(string_split(?, chr(10))) AS w)`,
+	rows, err := db.query(`SELECT w, stem(w, 'porter') FROM (SELECT unnest(string_split(?, chr(10))) AS w)`,
 		strings.Join(words, "\n"))
 	if err != nil {
 		return nil, err
@@ -101,7 +101,7 @@ func (db *DB) topicLabels(terms []string) (map[string]string, error) {
 	for i, t := range terms {
 		quoted[i] = sqlString(t)
 	}
-	rows, err := db.sql.Query(`SELECT term, max(label) FROM topics
+	rows, err := db.query(`SELECT term, max(label) FROM topics
 		WHERE term IN (` + strings.Join(quoted, ",") + `) AND label <> '' GROUP BY term`)
 	if err != nil {
 		return nil, err
@@ -166,7 +166,7 @@ func (db *DB) graphNeighbours(stems []string, project string, n, minWeight int) 
 		q += ` AND contains(lower(g.project), lower(` + sqlString(project) + `))`
 	}
 	q += ` GROUP BY g.term ORDER BY 2 DESC, 4 DESC, 1 LIMIT ` + strconv.Itoa(n)
-	rows, err := db.sql.Query(q)
+	rows, err := db.query(q)
 	if err != nil {
 		return nil, err
 	}

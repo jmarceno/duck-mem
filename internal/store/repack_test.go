@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"os"
 	"path/filepath"
@@ -62,7 +63,7 @@ func TestRepackPreservesValuesSequencesAndSource(t *testing.T) {
 	if cp, err := copy.GetCheckpoint("f"); err != nil || cp == nil || cp.TailHash != "hash" {
 		t.Fatalf("checkpoint: %v %v", cp, err)
 	}
-	if hits, err := copy.Search("zephyrturbine storage", "", "", 5); err != nil || len(hits) == 0 {
+	if hits, err := copy.Search(context.Background(), "zephyrturbine storage", "", "", 5); err != nil || len(hits) == 0 {
 		t.Fatalf("repacked search: %v %v", hits, err)
 	}
 }

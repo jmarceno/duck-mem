@@ -389,7 +389,7 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 		}
 	case 6:
 		if a.beginAction("re-indexing") {
-			go a.fullReindex(s.running)
+			go a.fullReindex()
 		}
 	}
 	return nil
@@ -420,19 +420,8 @@ func (a *trayApp) runSystemctl(action string) {
 	}
 }
 
-func (a *trayApp) fullReindex(wasRunning bool) {
+func (a *trayApp) fullReindex() {
 	defer a.endAction()
-	if wasRunning {
-		if err := systemctl("stop", serviceName); err != nil {
-			log.Printf("stop daemon for re-index: %v", err)
-			return
-		}
-		defer func() {
-			if err := systemctl("start", serviceName); err != nil {
-				log.Printf("restart daemon after re-index: %v", err)
-			}
-		}()
-	}
 	self, err := os.Executable()
 	if err != nil {
 		log.Printf("full re-index: %v", err)

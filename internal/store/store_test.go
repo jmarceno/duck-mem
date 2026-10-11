@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
@@ -40,7 +41,7 @@ func TestSearchFindsBySimilarityFiltersAndDedupes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hits, err := db.Search("redship", "", "", 10)
+	hits, err := db.Search(context.Background(), "redship", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +49,7 @@ func TestSearchFindsBySimilarityFiltersAndDedupes(t *testing.T) {
 		t.Fatalf("got %d hits want 2: %+v", len(hits), hits)
 	}
 
-	hits, err = db.Search("redship deployed", "", "", 10)
+	hits, err = db.Search(context.Background(), "redship deployed", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +62,7 @@ func TestSearchFindsBySimilarityFiltersAndDedupes(t *testing.T) {
 		}
 	}
 
-	hits, err = db.Search("redship", "omen", "", 10)
+	hits, err = db.Search(context.Background(), "redship", "omen", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +70,7 @@ func TestSearchFindsBySimilarityFiltersAndDedupes(t *testing.T) {
 		t.Fatalf("project filter failed: %+v", hits)
 	}
 
-	hits, err = db.Search("redship", "ORGANIZER", "", 10)
+	hits, err = db.Search(context.Background(), "redship", "ORGANIZER", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +153,7 @@ func TestOpenDropsLegacyHNSWIndex(t *testing.T) {
 		t.Fatalf("legacy index still present: %d %v", n, err)
 	}
 	insertMsg(t, db, "s", 1, "zephyrturbine stalls")
-	hits, err := db.Search("zephyrturbine", "", "", 5)
+	hits, err := db.Search(context.Background(), "zephyrturbine", "", "", 5)
 	if err != nil || len(hits) == 0 {
 		t.Fatalf("search after migration: %v %v", hits, err)
 	}
@@ -160,13 +161,13 @@ func TestOpenDropsLegacyHNSWIndex(t *testing.T) {
 
 func TestSearchAndRelatedRejectInvalidLimits(t *testing.T) {
 	db := openTemp(t)
-	if _, err := db.Search("anything", "", "", 0); err == nil {
+	if _, err := db.Search(context.Background(), "anything", "", "", 0); err == nil {
 		t.Fatal("search accepted zero limit")
 	}
-	if _, err := db.Related("anything", "", 2, -1); err == nil {
+	if _, err := db.Related(context.Background(), "anything", "", 2, -1); err == nil {
 		t.Fatal("related accepted negative limit")
 	}
-	if _, err := db.Related("anything", "", 3, 10); err == nil {
+	if _, err := db.Related(context.Background(), "anything", "", 3, 10); err == nil {
 		t.Fatal("related accepted unsupported depth")
 	}
 }
@@ -174,7 +175,7 @@ func TestSearchAndRelatedRejectInvalidLimits(t *testing.T) {
 func TestSearchSnippetShowsMatchInLongMessage(t *testing.T) {
 	db := openTemp(t)
 	insertMsg(t, db, "long", 0, strings.Repeat("padding ", 100)+"zephyrturbine conclusion")
-	hits, err := db.Search("zephyrturbine", "", "", 10)
+	hits, err := db.Search(context.Background(), "zephyrturbine", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +189,7 @@ func TestSearchRanksPhraseAndFocusedMessageFirst(t *testing.T) {
 	insertMsg(t, db, "a", 0, "bastion "+strings.Repeat("padding ", 80)+"sentry")
 	insertMsg(t, db, "b", 0, "bastion sentry")
 	insertMsg(t, db, "c", 0, "bastion sentry "+strings.Repeat("padding ", 80))
-	hits, err := db.Search("bastion sentry", "", "", 3)
+	hits, err := db.Search(context.Background(), "bastion sentry", "", "", 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +205,7 @@ func TestSearchFindsWordFormsInLongMessage(t *testing.T) {
 	insertMsg(t, db, "report", 0, strings.Repeat("padding words here ", 60)+
 		"then the enemies simply disengaged as if the player vanished "+strings.Repeat("more filler text ", 60))
 	insertMsg(t, db, "other", 0, "quartermaster ledger totals")
-	hits, err := db.Search("enemy disengage", "", "", 5)
+	hits, err := db.Search(context.Background(), "enemy disengage", "", "", 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +231,7 @@ func TestRecallGroupsBySessionWithTitle(t *testing.T) {
 	add("aaa-1", "<environment_context>cwd</environment_context>", "the barricade blocks enemy sight",
 		"barricade sight plan", "barricade sight plan", "unrelated")
 	add("aaa-2", "barricade")
-	results, _, err := db.Recall("barricade sight", "", "", 5, 2)
+	results, _, err := db.Recall(context.Background(), "barricade sight", "", "", 5, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,18 +246,18 @@ func TestRecallGroupsBySessionWithTitle(t *testing.T) {
 		t.Fatalf("hits not capped and deduplicated: %+v", first.Hits)
 	}
 
-	if _, err := db.ResolveSession("aaa"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+	if _, err := db.ResolveSession(context.Background(), "aaa"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("ambiguous prefix resolved: %v", err)
 	}
-	s, err := db.ResolveSession("aaa-1")
+	s, err := db.ResolveSession(context.Background(), "aaa-1")
 	if err != nil || s.Messages != 5 {
 		t.Fatalf("resolve: %+v err=%v", s, err)
 	}
-	window, err := db.Window(s.Session.ID, 0, 2, -1, false)
+	window, err := db.Window(context.Background(), s.Session.ID, 0, 2, -1, false)
 	if err != nil || len(window) != 2 || window[0].Seq != 1 || window[1].Seq != 2 {
 		t.Fatalf("window should hide host context: %+v err=%v", window, err)
 	}
-	if window, err = db.Window(s.Session.ID, 0, 2, 0, false); err != nil || len(window) != 3 {
+	if window, err = db.Window(context.Background(), s.Session.ID, 0, 2, 0, false); err != nil || len(window) != 3 {
 		t.Fatalf("window should keep the requested message: %+v err=%v", window, err)
 	}
 }
@@ -284,7 +285,7 @@ func TestRecallPinsNamedSessionWithItsEnding(t *testing.T) {
 		[2]string{"user", "<environment_context>01a0f755 attachment limit</environment_context>"},
 		[2]string{"assistant", "tests fail on multipart headers"},
 		[2]string{"note", "turn failed: usage limit"})
-	results, _, err := db.Recall("01a0f755 attachment limit", "", "", 5, 3)
+	results, _, err := db.Recall(context.Background(), "01a0f755 attachment limit", "", "", 5, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,14 +359,14 @@ func TestReadOnlyOpenReadsAndRefusesMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	hits, err := reader.Search("zephyrturbine", "", "", 10)
+	hits, err := reader.Search(context.Background(), "zephyrturbine", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(hits) != 1 {
 		t.Fatalf("got %d hits want 1", len(hits))
 	}
-	related, err := reader.Related("zephyr", "p", 1, 5)
+	related, err := reader.Related(context.Background(), "zephyr", "p", 1, 5)
 	if err != nil || len(related) != 1 || related[0].Term != "read" {
 		t.Fatalf("read-only graph traversal: %+v err=%v", related, err)
 	}
@@ -385,7 +386,7 @@ func TestRelatedRanksDirectAndTwoHop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hits, err := db.Related("Bastion", "omen", 1, 10)
+	hits, err := db.Related(context.Background(), "Bastion", "omen", 1, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +394,7 @@ func TestRelatedRanksDirectAndTwoHop(t *testing.T) {
 		t.Fatalf("depth1 wrong: %+v", hits)
 	}
 
-	hits, err = db.Related("bastion", "omen", 2, 10)
+	hits, err = db.Related(context.Background(), "bastion", "omen", 2, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +420,7 @@ func TestRelatedAggregatesAcrossProjects(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	hits, err := db.Related("bastion", "", 1, 10)
+	hits, err := db.Related(context.Background(), "bastion", "", 1, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,19 +553,19 @@ func TestSyncMessagesRefreshesEditedSessionAndGraph(t *testing.T) {
 	if n, _, err := db.IndexNew(1); err != nil || n != 2 {
 		t.Fatalf("rewritten rows not indexed incrementally: n=%d err=%v", n, err)
 	}
-	old, err := db.Search("sentry", "", "", 10)
+	old, err := db.Search(context.Background(), "sentry", "", "", 10)
 	if err != nil || len(old) != 0 {
 		t.Fatalf("stale message remained: hits=%+v err=%v", old, err)
 	}
-	hits, err := db.Related("bastion", "new", 1, 10)
+	hits, err := db.Related(context.Background(), "bastion", "new", 1, 10)
 	if err != nil || len(hits) != 1 || hits[0].Term != "turret" || hits[0].Weight != 2 {
 		t.Fatalf("updated graph wrong: hits=%+v err=%v", hits, err)
 	}
-	hits, err = db.Related("bastion", "old", 1, 10)
+	hits, err = db.Related(context.Background(), "bastion", "old", 1, 10)
 	if err != nil || len(hits) != 0 {
 		t.Fatalf("stale graph remained: hits=%+v err=%v", hits, err)
 	}
-	hits, err = db.Related("bastion", "keep", 1, 10)
+	hits, err = db.Related(context.Background(), "bastion", "keep", 1, 10)
 	if err != nil || len(hits) != 1 || hits[0].Term != "aegis" || hits[0].Weight != 1 {
 		t.Fatalf("other session's graph changed: hits=%+v err=%v", hits, err)
 	}
@@ -574,7 +575,7 @@ func TestSyncMessagesRefreshesEditedSessionAndGraph(t *testing.T) {
 	if _, _, err := db.IndexNew(1); err != nil {
 		t.Fatal(err)
 	}
-	hits, err = db.Related("bastion", "", 1, 10)
+	hits, err = db.Related(context.Background(), "bastion", "", 1, 10)
 	if err != nil || len(hits) != 1 || hits[0].Term != "aegis" {
 		t.Fatalf("deleted session still indexed: hits=%+v err=%v", hits, err)
 	}
@@ -608,7 +609,7 @@ func TestGraphMergesWordFormsUnderOneLabel(t *testing.T) {
 	if _, _, err := db.IndexNew(1); err != nil {
 		t.Fatal(err)
 	}
-	hits, err := db.Related("enemy", "p", 1, 10)
+	hits, err := db.Related(context.Background(), "enemy", "p", 1, 10)
 	if err != nil || len(hits) != 1 || hits[0].Term != "roam" || hits[0].Weight != 3 {
 		t.Fatalf("word forms not merged: %+v err=%v", hits, err)
 	}
@@ -624,7 +625,7 @@ func TestRecallFillsFromGraphNeighboursAfterDirectMatches(t *testing.T) {
 	if _, _, err := db.IndexNew(1); err != nil {
 		t.Fatal(err)
 	}
-	results, related, err := db.Recall("disengage", "", "", 5, 1)
+	results, related, err := db.Recall(context.Background(), "disengage", "", "", 5, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -635,7 +636,7 @@ func TestRecallFillsFromGraphNeighboursAfterDirectMatches(t *testing.T) {
 	if !slices.ContainsFunc(related, func(t Topic) bool { return t.Label == "roam" }) {
 		t.Fatalf("neighbour not reported: %+v", related)
 	}
-	if full, _, err := db.Recall("disengage", "", "", 1, 1); err != nil || len(full) != 1 || full[0].ViaGraph {
+	if full, _, err := db.Recall(context.Background(), "disengage", "", "", 1, 1); err != nil || len(full) != 1 || full[0].ViaGraph {
 		t.Fatalf("graph filled a slot a direct match needed: %+v err=%v", full, err)
 	}
 }
@@ -649,7 +650,7 @@ func TestRecurringTypedEdgesOutrankCoMention(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	hits, err := db.Related("bastion", "p", 1, 10)
+	hits, err := db.Related(context.Background(), "bastion", "p", 1, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -665,7 +666,7 @@ func TestRelatedKeepsDirectionAndSourceEvidence(t *testing.T) {
 	if _, _, err := db.IndexNew(1); err != nil {
 		t.Fatal(err)
 	}
-	hits, err := db.Related("bastion", "p", 1, 10)
+	hits, err := db.Related(context.Background(), "bastion", "p", 1, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -702,7 +703,7 @@ func TestIndexMigratesOldGraphToDirectedEvidence(t *testing.T) {
 	if n, _, err := db.IndexNew(1); err != nil || n != 1 {
 		t.Fatalf("legacy graph was not reindexed: n=%d err=%v", n, err)
 	}
-	hits, err := db.Related("bastion", "p", 1, 10)
+	hits, err := db.Related(context.Background(), "bastion", "p", 1, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,7 +728,7 @@ func TestDepth2ExpandsStrongestViasOnly(t *testing.T) {
 	if err := db.ReplaceEdges(edges); err != nil {
 		t.Fatal(err)
 	}
-	hits, err := db.Related("hub", "p", 2, 50)
+	hits, err := db.Related(context.Background(), "hub", "p", 2, 50)
 	if err != nil {
 		t.Fatal(err)
 	}

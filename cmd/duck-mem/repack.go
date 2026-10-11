@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"time"
 
+	"github.com/jmarceno/duck-mem/internal/owner"
 	"github.com/jmarceno/duck-mem/internal/store"
 )
 
@@ -18,6 +20,14 @@ func repackCmd(args []string) {
 		fmt.Fprintln(os.Stderr, "repack requires --out PATH")
 		os.Exit(2)
 	}
+	unlock, err := owner.TryLock(*source)
+	if errors.Is(err, owner.ErrBusy) {
+		fatal(fmt.Errorf("stop duck-mem.service before repack; it holds the database"))
+	}
+	if err != nil {
+		fatal(err)
+	}
+	defer unlock()
 	start := time.Now()
 	if err := store.Repack(*source, *out); err != nil {
 		fatal(err)
