@@ -272,6 +272,7 @@ failure. Failures include `Unexpected format`, `Database error`, or `Other`
 and available error details; cycle-wide errors use harness `all`. No session
 text is stored in these logs. Logs are retained without automatic deletion.
 
+**Open database folder** opens `~/.local/share/duck-mem/` the same way.
 **View logs** opens this directory in the default file manager and clears the
 indicator for existing failures. Failures include the affected file path and
 show a red dot drawn directly into the tray icon, retained across successful

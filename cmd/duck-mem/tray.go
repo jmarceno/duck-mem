@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -287,6 +288,7 @@ func (a *trayApp) menuItems(s traySnapshot) []menuLayout {
 		menuItem(5, "Stop daemon", s.running && !s.busy),
 		menuItem(6, "Full re-index", !s.busy),
 		menuItem(7, "View logs", true),
+		menuItem(8, "Open database folder", true),
 	}
 }
 
@@ -363,22 +365,17 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 	switch id {
 	case 7:
 		marker, _ := os.ReadFile(failurePath())
-		if err := os.MkdirAll(logDir(), 0o700); err != nil {
-			return dbus.MakeFailedError(err)
+		if err := openFolder(logDir()); err != nil {
+			return err
 		}
-		cmd := exec.Command("xdg-open", logDir())
-		if err := cmd.Start(); err != nil {
-			return dbus.MakeFailedError(err)
-		}
-		go func() {
-			if err := cmd.Wait(); err != nil {
-				log.Printf("open sync logs: %v", err)
-			}
-		}()
 		if err := acknowledgeSyncFailure(marker); err != nil {
 			return dbus.MakeFailedError(err)
 		}
 		a.refresh()
+	case 8:
+		if err := openFolder(filepath.Dir(defaultDB())); err != nil {
+			return err
+		}
 	case 4:
 		if !s.running && a.beginAction("starting") {
 			go a.runSystemctl("start")
@@ -392,6 +389,22 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 			go a.fullReindex()
 		}
 	}
+	return nil
+}
+
+func openFolder(path string) *dbus.Error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return dbus.MakeFailedError(err)
+	}
+	cmd := exec.Command("xdg-open", path)
+	if err := cmd.Start(); err != nil {
+		return dbus.MakeFailedError(err)
+	}
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			log.Printf("open %s: %v", path, err)
+		}
+	}()
 	return nil
 }
 
