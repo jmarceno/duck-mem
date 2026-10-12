@@ -217,7 +217,17 @@ func daemonCmd(args []string) {
 }
 
 func performCycle(db *store.DB, dbPath string, roots []string) (owner.IngestResult, error) {
+	if err := db.PrepareSessionCopies(); err != nil {
+		return owner.IngestResult{}, err
+	}
 	files, nSess, nMsg, nSkip := runCycle(db, roots)
+	copies, err := db.SuppressSessionCopies()
+	if err != nil {
+		return owner.IngestResult{}, err
+	}
+	if copies > 0 {
+		fmt.Printf("suppressed %d copied sessions (files remain watched)\n", copies)
+	}
 	newMsgs, newPairs, err := db.IndexNew(2)
 	if err != nil {
 		return owner.IngestResult{}, err
@@ -344,8 +354,17 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 			var sess store.Session
 			var msgs []store.Message
 			appended := false
+			isCopy := false
+			if checkpoint != nil {
+				isCopy, err = db.IsSessionCopy(checkpoint.SessionID)
+				if err != nil {
+					failure = err
+					nSkip++
+					return
+				}
+			}
 			if checkpoint != nil && checkpoint.ParserVersion == parserVersion && projectMatches &&
-				kind != ingest.KindCursorPlan && checkpoint.EndsLine && info.Size() > checkpoint.Size {
+				!isCopy && kind != ingest.KindCursorPlan && checkpoint.EndsLine && info.Size() > checkpoint.Size {
 				if oldHash, err := hashTail(f, checkpoint.Size); err == nil && oldHash == checkpoint.TailHash {
 					previous, err := db.GetSession(checkpoint.SessionID)
 					if err != nil {
@@ -377,16 +396,7 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 				return
 			}
 			reason = "Database error"
-			if err := db.UpsertSession(sess); err != nil {
-				failure = err
-				nSkip++
-				return
-			}
-			if appended {
-				err = db.InsertMessages(msgs)
-			} else {
-				err = db.SyncMessages(sess.ID, msgs)
-			}
+			err = db.SyncConversation(sess, msgs, appended, loadSessionCopy)
 			if err != nil {
 				failure = err
 				nSkip++
@@ -436,10 +446,7 @@ func ingestOpenCode(db *store.DB, path string) (int, int, error) {
 	}
 	count, completed := 0, 0
 	for _, s := range sessions {
-		if err := db.UpsertSession(s.Session); err != nil {
-			return completed, count, &syncDatabaseError{err}
-		}
-		if err := db.SyncMessages(s.Session.ID, s.Messages); err != nil {
+		if err := db.SyncConversation(s.Session, s.Messages, false, loadSessionCopy); err != nil {
 			return completed, count, &syncDatabaseError{err}
 		}
 		count += len(s.Messages)
@@ -456,6 +463,22 @@ func ingestOpenCode(db *store.DB, path string) (int, int, error) {
 		}
 	}
 	return len(sessions), count, nil
+}
+
+func loadSessionCopy(s store.Session) (store.Session, []store.Message, error) {
+	if ingest.Classify(s.Path) == ingest.KindOpenCode {
+		sessions, err := ingest.IngestOpenCode(s.Path)
+		if err != nil {
+			return s, nil, err
+		}
+		for _, snapshot := range sessions {
+			if snapshot.Session.ID == s.ID {
+				return snapshot.Session, snapshot.Messages, nil
+			}
+		}
+		return s, nil, fmt.Errorf("session %s missing from %s", s.ID, s.Path)
+	}
+	return ingest.IngestFile(s.Path)
 }
 
 // SQLite may keep recent writes entirely in its WAL; checkpoint both files.

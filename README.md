@@ -239,6 +239,23 @@ imported whole as a single note, and OpenCode child sessions are imported
 alongside their parents. Cursor transcripts whose project cannot be resolved
 stay under `cursor:<slug>` rather than being given an invented path.
 
+Imported cross-harness copies are suppressed when their entire conversation
+exactly matches the beginning of another retained session in the same project.
+Matching removes known timestamp/query wrappers, host context, and import
+markers; it preserves wording, internal whitespace, order, and failure notes.
+It requires at least three messages, 500 bytes, and a substantive assistant
+reply. Uncertain matches and shorter conversations remain imported.
+
+Suppression removes the copy's messages, embeddings, search postings, and graph
+contributions. Its identity, source path, fingerprints, and file checkpoint
+remain. Changed copies are fully reparsed: distinct content restores the full
+conversation as a separate session, including its shared history. Rewriting
+an owner first restores any copies it would no longer cover; unavailable copy
+logs prevent that rewrite rather than losing history. `show` accepts suppressed
+IDs and resolves them to the retained session. Existing imports are checked
+automatically on the first sync after upgrading; no parser-version bump or
+full re-index is needed.
+
 ### Schema
 
 ```sql
@@ -252,6 +269,7 @@ topic_edges(src_id, dst_id, term_a, term_b, weight, kind,
             from_term, to_term, evidence)
 msg_edges(session_id, seq, term_a, term_b, ...) -- per-message edge log
 file_checkpoints(path, size, mtime_ns, tail_hash, ends_line, session_id, …)
+session_copies(session_id, hashes, eligible, imported, duplicate_of, seen_at)
 ```
 
 `project` is a value, not a column: DuckDB columns are schema, so one column

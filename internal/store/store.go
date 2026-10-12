@@ -216,6 +216,13 @@ func (db *DB) init() error {
 			session_id TEXT NOT NULL,
 			project TEXT NOT NULL,
 			parser_version INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS session_copies(
+			session_id TEXT PRIMARY KEY,
+			hashes TEXT NOT NULL,
+			eligible BOOLEAN NOT NULL,
+			imported BOOLEAN NOT NULL,
+			duplicate_of TEXT NOT NULL DEFAULT '',
+			seen_at TIMESTAMP NOT NULL DEFAULT current_timestamp)`,
 	} {
 		if _, err := db.sql.Exec(q); err != nil {
 			return err

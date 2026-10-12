@@ -524,7 +524,11 @@ func (db *DB) ResolveSession(ctx context.Context, ref string) (SessionResult, er
 	case len(ids) > 1:
 		return SessionResult{}, fmt.Errorf("session prefix %q is ambiguous: %s", ref, strings.Join(ids, ", "))
 	}
-	r := SessionResult{Session: Session{ID: ids[0]}}
+	id, err := db.canonicalSessionID(ids[0])
+	if err != nil {
+		return SessionResult{}, err
+	}
+	r := SessionResult{Session: Session{ID: id}}
 	return r, db.describeSession(&r)
 }
 
@@ -533,6 +537,10 @@ func (db *DB) ResolveSession(ctx context.Context, ref string) (SessionResult, er
 // contextFilter), except the message at seq keep.
 func (db *DB) Window(ctx context.Context, sessionID string, from, to, keep int, withContext bool) ([]Message, error) {
 	defer db.setRead(ctx)()
+	sessionID, err := db.canonicalSessionID(sessionID)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := db.query(`SELECT session_id, seq, source, project, role, text, created_at
 		FROM messages WHERE session_id = ? AND seq BETWEEN ? AND ?
 		AND (? OR seq = ? OR NOT `+contextFilter+`) ORDER BY seq`, sessionID, from, to, withContext, keep)
