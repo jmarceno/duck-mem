@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="duck-mem" width="200">
+  <img src="assets/logo.svg" alt="duck-mem" width="200">
 </p>
 
 <h1 align="center">duck-mem</h1>

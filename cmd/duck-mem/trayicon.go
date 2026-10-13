@@ -105,7 +105,7 @@ func logoImage() (*image.NRGBA, error) {
 			logoErr = err
 			return
 		}
-		// The logo is 1254px square RGBA; tray sizes come straight off it.
+		// The logo is a square RGBA raster; tray sizes come straight off it.
 		b := img.Bounds()
 		logoDecoded = image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
 		draw.Draw(logoDecoded, logoDecoded.Bounds(), img, b.Min, draw.Src)
@@ -114,8 +114,7 @@ func logoImage() (*image.NRGBA, error) {
 }
 
 // resampleArea box-filters src down to size×size. It averages premultiplied
-// alpha, so the logo's black outline does not bleed into its transparent
-// margin and 55% of the source is not turned into a grey haze at 22px.
+// alpha to preserve the artwork's colors along transparent edges at tray sizes.
 func resampleArea(src *image.NRGBA, size int) *image.NRGBA {
 	dst := image.NewNRGBA(image.Rect(0, 0, size, size))
 	sw, sh := float64(src.Bounds().Dx()), float64(src.Bounds().Dy())
