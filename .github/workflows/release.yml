@@ -1,0 +1,98 @@
+name: Release
+
+# Manually trigger a build of duck-mem and publish it to this repository's
+# Gitea releases. Run it from the "Actions" tab -> "Release".
+#
+# Requirements on the Gitea side:
+#   * A runner is registered for this repository.
+#   * A secret named GITEA_TOKEN holding an API token with the "Create,
+#     upload and delete release assets" scope (Settings -> Applications ->
+#     API tokens, or a personal access token with that scope).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the 'v' prefix (e.g. 1.2.3). Leave blank to auto-tag from the commit."
+        required: false
+        default: ""
+      body:
+        description: "Release notes shown on the published release."
+        required: false
+        default: ""
+
+# The runner token must create tags and releases.
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      # go-duckdb links via cgo, so a C compiler is required on the runner.
+      - name: Install C compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          go build -o dist/duck-mem ./cmd/duck-mem
+          sha8="${GITHUB_SHA::8}"
+          cp "dist/duck-mem" "dist/duck-mem-$sha8"
+
+      - name: Create release
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_SERVER: ${{ gitea.server_url }}
+          GITEA_REPO: ${{ gitea.repository }}
+          VERSION: ${{ github.event.inputs.version }}
+          BODY: ${{ github.event.inputs.body }}
+        run: |
+          set -euo pipefail
+
+          sha8="${GITHUB_SHA::8}"
+          asset="dist/duck-mem-$sha8"
+
+          # An explicit version becomes a normal release; an empty one yields
+          # a prerelease auto-tag derived from the commit so it is never
+          # mistaken for a final version.
+          if [ -z "$VERSION" ]; then
+            tag="v0.0.0-$sha8"
+            prerelease="true"
+          else
+            tag="v$VERSION"
+            prerelease="false"
+          fi
+
+          api="$GITEA_SERVER/api/v1"
+          echo "Creating release $tag for $GITEA_REPO"
+
+          # The create-release endpoint has no attachment field, so upload the
+          # binary in a second call to the assets endpoint.
+          resp=$(curl -sS --fail -X POST "$api/repos/$GITEA_REPO/releases" \
+            -H "Authorization: Bearer $GITEA_TOKEN" \
+            -F "tag_name=$tag" \
+            -F "name=$tag" \
+            -F "body=$BODY" \
+            -F "draft=false" \
+            -F "prerelease=$prerelease")
+
+          # Extract the release id (only coreutils needed to parse the JSON).
+          release_id=$(printf '%s' "$resp" | grep -oE '"id":[0-9]+' | head -n1 | cut -d: -f2)
+
+          echo "Uploading $asset (release $release_id)"
+          curl -sS --fail -X POST "$api/repos/$GITEA_REPO/releases/$release_id/assets" \
+            -H "Authorization: Bearer $GITEA_TOKEN" \
+            -F "name=duck-mem-$sha8" \
+            --form "attachment=@$asset"
