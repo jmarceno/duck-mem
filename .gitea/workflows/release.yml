@@ -1,0 +1,58 @@
+name: release
+
+# MANUAL ONLY: start it from the Actions tab ("Run workflow") on the branch
+# to release. Never add push / tag / schedule / pull_request triggers.
+#
+# Everything else is automatic: the version (the latest release tag with the
+# patch bumped, v0.1.0 for the first release), the tested build on Debian
+# bookworm (glibc 2.36), and the release with tag v<version> on the
+# dispatched commit. A commit that already has a release tag is refused.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Plan version
+        id: plan
+        run: .gitea/scripts/release-plan.sh 0.1.0
+
+      - name: Test and build (Debian bookworm)
+        run: |
+          set -euo pipefail
+          .gitea/scripts/container-build.sh golang:1.24-bookworm build/release \
+            -v duck-mem-release-gomod:/go/pkg/mod \
+            -v duck-mem-release-gocache:/root/.cache/go-build \
+            -- bash -euo pipefail -c '
+              go test ./...
+              mkdir -p build/release
+              go build -trimpath -o build/release/duck-mem ./cmd/duck-mem
+            '
+
+      - name: Collect assets
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 0755 build/release/duck-mem "dist/duck-mem-$VERSION-linux-amd64"
+          (cd dist && sha256sum ./duck-mem-* > SHA256SUMS)
+
+      - name: Publish release
+        env:
+          GITEA_API: ${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          RELEASE_SHA: ${{ gitea.sha }}
+        run: .gitea/scripts/release-publish.sh "${{ steps.plan.outputs.tag }}" "duck-mem ${{ steps.plan.outputs.version }}" "${{ steps.plan.outputs.notes }}" dist
