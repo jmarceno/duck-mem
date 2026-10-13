@@ -22,7 +22,7 @@ chmod 0600 "$curl_config"
 printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" >"$curl_config"
 api() { curl --fail-with-body --silent --show-error --config "$curl_config" "$@"; }
 
-existing="$(api "$GITEA_API/releases/tags/$tag" -o /dev/null -w '%{http_code}' || true)"
+existing="$(curl --silent --config "$curl_config" -o /dev/null -w '%{http_code}' "$GITEA_API/releases/tags/$tag")"
 [[ "$existing" == 404 ]] || { echo "::error::release $tag already exists (HTTP $existing)" >&2; exit 1; }
 
 api "$GITEA_API/releases?draft=true&limit=50" \
