@@ -1090,27 +1090,6 @@ func (db *DB) Count() (sessions, messages int, err error) {
 	return
 }
 
-// SessionCount reports how many sessions are stored in the database file.
-// The file is attached read-only, without search extensions, so a status
-// reader can count while the indexer holds the write connection.
-func SessionCount(path string) (int, error) {
-	if _, err := os.Stat(path); err != nil {
-		return 0, fmt.Errorf("database not found: %s", path)
-	}
-	sdb, err := sql.Open("duckdb", "")
-	if err != nil {
-		return 0, err
-	}
-	defer sdb.Close()
-	sdb.SetMaxOpenConns(1)
-	if _, err := sdb.Exec(`ATTACH ` + sqlString(path) + ` AS src (READ_ONLY)`); err != nil {
-		return 0, err
-	}
-	var n int
-	err = sdb.QueryRow(`SELECT count(*) FROM src.sessions`).Scan(&n)
-	return n, err
-}
-
 func topicID(project, term string) string {
 	return project + "\x1f" + term
 }
