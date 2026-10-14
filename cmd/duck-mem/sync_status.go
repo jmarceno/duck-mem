@@ -11,6 +11,8 @@ type syncStatus struct {
 	CompletedAt time.Time `json:"completed_at"`
 	Files       int       `json:"files"`
 	Skipped     int       `json:"skipped"`
+	Sessions    int       `json:"sessions"`
+	HasSessions bool      `json:"has_sessions"`
 }
 
 func stateDir() string {

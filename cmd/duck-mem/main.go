@@ -238,7 +238,15 @@ func performCycle(db *store.DB, dbPath string, roots []string) (owner.IngestResu
 	if err := acknowledgeCleanCycle(nSkip); err != nil {
 		logSyncFailure("all", "Other", err)
 	}
-	if err := writeSyncStatus(dbPath, syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}); err != nil {
+	status := syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}
+	if sessions, _, err := db.Count(); err != nil {
+		logSyncFailure("all", "Other", err)
+		fmt.Fprintln(os.Stderr, "session count:", err)
+	} else {
+		status.Sessions = sessions
+		status.HasSessions = true
+	}
+	if err := writeSyncStatus(dbPath, status); err != nil {
 		logSyncFailure("all", "Other", err)
 		fmt.Fprintln(os.Stderr, "sync status:", err)
 	}

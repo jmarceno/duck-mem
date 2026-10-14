@@ -28,7 +28,7 @@ func TestUninstallPromptKeepsDataUnlessExplicitlyConfirmed(t *testing.T) {
 
 func TestCompletedSyncIsReadableByTray(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	want := syncStatus{CompletedAt: time.Date(2026, 9, 27, 17, 45, 0, 0, time.UTC), Files: 12, Skipped: 1}
+	want := syncStatus{CompletedAt: time.Date(2026, 9, 27, 17, 45, 0, 0, time.UTC), Files: 12, Skipped: 1, Sessions: 40, HasSessions: true}
 	if err := writeSyncStatus(defaultDB(), want); err != nil {
 		t.Fatal(err)
 	}
