@@ -373,6 +373,13 @@ func TestReadOnlyOpenReadsAndRefusesMissing(t *testing.T) {
 	if _, err := OpenReadOnly(filepath.Join(t.TempDir(), "nope.duckdb")); err == nil {
 		t.Fatal("expected error for missing database")
 	}
+	n, err := SessionCount(path)
+	if err != nil || n != 1 {
+		t.Fatalf("session count = %d, err=%v", n, err)
+	}
+	if _, err := SessionCount(filepath.Join(t.TempDir(), "nope.duckdb")); err == nil {
+		t.Fatal("expected error for missing database")
+	}
 }
 
 func TestRelatedRanksDirectAndTwoHop(t *testing.T) {

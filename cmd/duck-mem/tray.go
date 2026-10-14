@@ -16,6 +16,7 @@ import (
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/introspect"
 	"github.com/godbus/dbus/v5/prop"
+	"github.com/jmarceno/duck-mem/internal/store"
 )
 
 const (
@@ -65,13 +66,15 @@ type trayApp struct {
 }
 
 type traySnapshot struct {
-	failure  bool
-	running  bool
-	busy     bool
-	action   string
-	last     syncStatus
-	lastSeen bool
-	revision uint32
+	failure       bool
+	running       bool
+	busy          bool
+	action        string
+	last          syncStatus
+	lastSeen      bool
+	sessions      int
+	sessionsKnown bool
+	revision      uint32
 }
 
 func runTray() error {
@@ -183,10 +186,17 @@ func (a *trayApp) refresh() bool {
 	last, err := readSyncStatus()
 	seen := err == nil && !last.CompletedAt.IsZero()
 	failure := unreadSyncFailure()
+	prev := a.snapshot()
+	sessions, sessionsKnown := prev.sessions, prev.sessionsKnown
+	if n, err := store.SessionCount(defaultDB()); err == nil {
+		sessions, sessionsKnown = n, true
+	}
 	a.mu.Lock()
-	changed := a.state.failure != failure || a.state.running != running || a.state.lastSeen != seen || a.state.last != last
+	changed := a.state.failure != failure || a.state.running != running || a.state.lastSeen != seen || a.state.last != last ||
+		a.state.sessions != sessions || a.state.sessionsKnown != sessionsKnown
 	a.state.running, a.state.last, a.state.lastSeen = running, last, seen
 	a.state.failure = failure
+	a.state.sessions, a.state.sessionsKnown = sessions, sessionsKnown
 	if changed {
 		a.state.revision++
 	}
@@ -260,6 +270,13 @@ func (a *trayApp) lastSyncLabel(s traySnapshot) string {
 	return label
 }
 
+func sessionsLabel(s traySnapshot) string {
+	if !s.sessionsKnown {
+		return "Sessions: unavailable"
+	}
+	return fmt.Sprintf("Sessions: %d", s.sessions)
+}
+
 // StatusNotifierItem methods. The host displays the exported DBusMenu.
 func (a *trayApp) ContextMenu(x, y int32) *dbus.Error                 { return nil }
 func (a *trayApp) Activate(x, y int32) *dbus.Error                    { return nil }
@@ -283,6 +300,7 @@ func (a *trayApp) menuItems(s traySnapshot) []menuLayout {
 	return []menuLayout{
 		menuItem(1, status, false),
 		menuItem(2, a.lastSyncLabel(s), false),
+		menuItem(9, sessionsLabel(s), false),
 		{ID: 3, Properties: map[string]dbus.Variant{"type": dbus.MakeVariant("separator")}, Children: []dbus.Variant{}},
 		menuItem(4, "Start daemon", !s.running && !s.busy),
 		menuItem(5, "Stop daemon", s.running && !s.busy),

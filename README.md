@@ -279,8 +279,9 @@ an indexed `TEXT` on both tables, filtered with `WHERE project ILIKE '%name%'`.
 ## Tray
 
 `duck-mem-tray.service` registers a StatusNotifierItem (and DBusMenu) item using
-the project logo. The menu shows the indexer's state and the last completed
-sync, and can start or stop the indexer or force a full re-index. A dot appears
+the project logo. The menu shows the indexer's state, the last completed
+sync, and how many sessions are registered, and can start or stop the indexer
+or force a full re-index. A dot appears
 over the icon while an action is running or when the indexer is down.
 
 Sync history is retained as monthly JSONL files in
