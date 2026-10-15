@@ -294,6 +294,7 @@ func (a *trayApp) menuItems(s traySnapshot) []menuLayout {
 		{ID: 3, Properties: map[string]dbus.Variant{"type": dbus.MakeVariant("separator")}, Children: []dbus.Variant{}},
 		menuItem(4, "Start daemon", !s.running && !s.busy),
 		menuItem(5, "Stop daemon", s.running && !s.busy),
+		menuItem(10, "Ingest now", !s.busy),
 		menuItem(6, "Full re-index", !s.busy),
 		menuItem(7, "View logs", true),
 		menuItem(8, "Open database folder", true),
@@ -396,6 +397,10 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 		if a.beginAction("re-indexing") {
 			go a.fullReindex()
 		}
+	case 10:
+		if a.beginAction("ingesting") {
+			go a.ingestNow()
+		}
 	}
 	return nil
 }
@@ -454,6 +459,24 @@ func (a *trayApp) fullReindex() {
 		log.Printf("full re-index: %v: %s", err, strings.TrimSpace(string(out)))
 	} else {
 		log.Printf("full re-index complete")
+	}
+}
+
+// ingestNow runs one sync cycle on demand, so a just-finished session does
+// not wait out the daemon's interval.
+func (a *trayApp) ingestNow() {
+	defer a.endAction()
+	self, err := os.Executable()
+	if err != nil {
+		log.Printf("ingest now: %v", err)
+		return
+	}
+	cmd := exec.Command(self, "ingest")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("ingest now: %v: %s", err, strings.TrimSpace(string(out)))
+	} else {
+		log.Printf("ingest now complete: %s", strings.TrimSpace(string(out)))
 	}
 }
 
