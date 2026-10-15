@@ -216,6 +216,11 @@ func (db *DB) init() error {
 			session_id TEXT NOT NULL,
 			project TEXT NOT NULL,
 			parser_version INTEGER NOT NULL)`,
+		// project_aliases maps a renamed project's original name to its
+		// current one so re-ingest keeps the rename.
+		`CREATE TABLE IF NOT EXISTS project_aliases(
+			old_name TEXT PRIMARY KEY,
+			new_name TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS session_copies(
 			session_id TEXT PRIMARY KEY,
 			hashes TEXT NOT NULL,

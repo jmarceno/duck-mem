@@ -67,6 +67,8 @@ func main() {
 		daemonCmd(os.Args[2:])
 	case "repack":
 		repackCmd(os.Args[2:])
+	case "rename":
+		renameCmd(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		usage()
@@ -87,6 +89,9 @@ func usage() {
   duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
   duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
   duck-mem repack [--db PATH] --out PATH  write a verified ZSTD copy; source remains unchanged
+  duck-mem rename [--db PATH] <current-name> <new-name>
+                                         rename a project: replace its exact name in all stored
+                                         data and refresh the indexes; the new name must be unused
 `)
 }
 
@@ -178,7 +183,8 @@ func daemonCmd(args []string) {
 			}
 			return performCycle(db, *dbPath, got)
 		},
-		Index: performIndex,
+		Index:  performIndex,
+		Rename: performRename,
 	})
 	if err != nil {
 		logSyncFailure("all", "Database error", err)
@@ -353,8 +359,16 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 				nSkip++
 				return
 			}
-			projectMatches := kind != ingest.KindCursorTranscript ||
-				(checkpoint != nil && checkpoint.Project == ingest.CursorProject(f, projects))
+			projectMatches := kind != ingest.KindCursorTranscript
+			if !projectMatches && checkpoint != nil {
+				current, err := db.ResolveProject(ingest.CursorProject(f, projects))
+				if err != nil {
+					failure = err
+					nSkip++
+					return
+				}
+				projectMatches = checkpoint.Project == current
+			}
 			if checkpoint != nil && checkpoint.ParserVersion == parserVersion && projectMatches &&
 				checkpoint.Size == info.Size() && checkpoint.ModTimeNS == info.ModTime().UnixNano() {
 				return
@@ -404,7 +418,10 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 				return
 			}
 			reason = "Database error"
-			err = db.SyncConversation(sess, msgs, appended, loadSessionCopy)
+			err = applyProjectAlias(db, &sess, msgs)
+			if err == nil {
+				err = db.SyncConversation(sess, msgs, appended, loadSessionCopy)
+			}
 			if err != nil {
 				failure = err
 				nSkip++
@@ -431,6 +448,19 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 	return files, nSess, nMsg, nSkip
 }
 
+// applyProjectAlias files a parsed session under its renamed project.
+func applyProjectAlias(db *store.DB, sess *store.Session, msgs []store.Message) error {
+	name, err := db.ResolveProject(sess.Project)
+	if err != nil {
+		return err
+	}
+	sess.Project = name
+	for i := range msgs {
+		msgs[i].Project = name
+	}
+	return nil
+}
+
 func ingestOpenCode(db *store.DB, path string) (int, int, error) {
 	before, err := sqliteState(path)
 	if err != nil {
@@ -454,6 +484,9 @@ func ingestOpenCode(db *store.DB, path string) (int, int, error) {
 	}
 	count, completed := 0, 0
 	for _, s := range sessions {
+		if err := applyProjectAlias(db, &s.Session, s.Messages); err != nil {
+			return completed, count, &syncDatabaseError{err}
+		}
 		if err := db.SyncConversation(s.Session, s.Messages, false, loadSessionCopy); err != nil {
 			return completed, count, &syncDatabaseError{err}
 		}
@@ -580,6 +613,41 @@ func indexCmd(args []string) {
 		return
 	}
 	fmt.Printf("index: +%d messages, +%d pairs\n", res.NewMsgs, res.NewPairs)
+}
+
+func renameCmd(args []string) {
+	fs := flag.NewFlagSet("rename", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDB(), "DuckDB file")
+	flagArgs, positional := splitArgs(args, map[string]bool{"--db": true})
+	_ = fs.Parse(flagArgs)
+	names := append(fs.Args(), positional...)
+	if len(names) != 2 {
+		fmt.Fprintln(os.Stderr, "rename needs two arguments: <current-name> <new-name>")
+		os.Exit(2)
+	}
+	mem, err := openMemory(*dbPath, true)
+	if err != nil {
+		fatal(err)
+	}
+	defer mem.Close()
+	n, err := mem.RenameProject(names[0], names[1])
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("renamed %d sessions: %s -> %s\n", n, names[0], names[1])
+}
+
+// performRename renames a project and folds the WAL back so the change is
+// durable even if the owning process keeps its connection open.
+func performRename(db *store.DB, old, new string) (int, error) {
+	n, err := db.RenameProject(old, new)
+	if err != nil {
+		return 0, err
+	}
+	if err := db.Checkpoint(); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func relatedCmd(args []string) {

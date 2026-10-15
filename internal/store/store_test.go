@@ -429,6 +429,70 @@ func TestRelatedAggregatesAcrossProjects(t *testing.T) {
 	}
 }
 
+func TestRenameProject(t *testing.T) {
+	db := openTemp(t)
+	add := func(sid, project, text string) {
+		if err := db.UpsertSession(Session{ID: sid, Source: "codex", Project: project, Path: sid + ".jsonl"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.InsertMessages([]Message{{SessionID: sid, Seq: 0, Source: "codex", Project: project, Role: "user", Text: text}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("old-1", "/home/u/old", "bastion sentry turret")
+	add("old-2", "/home/u/old", "bastion sentry holds")
+	add("keep-1", "/home/u/keep", "bastion aegis")
+	if _, _, err := db.IndexNew(1); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.RenameProject("/home/u/nope", "/home/u/x"); err == nil {
+		t.Fatal("expected error renaming a missing project")
+	}
+	if _, err := db.RenameProject("/home/u/old", "/home/u/keep"); err == nil {
+		t.Fatal("expected error renaming onto an existing project")
+	}
+
+	n, err := db.RenameProject("/home/u/old", "/home/u/new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("renamed %d sessions, want 2", n)
+	}
+	if _, err := db.RenameProject("/home/u/new", "/home/u/newer"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.ResolveProject("/home/u/old"); err != nil || got != "/home/u/newer" {
+		t.Fatalf("re-ingest of the original name maps to %q err=%v", got, err)
+	}
+	if _, err := db.RenameProject("/home/u/newer", "/home/u/new"); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := db.Search(context.Background(), "sentry", "new", "", 10)
+	if err != nil || len(hits) != 2 {
+		t.Fatalf("search under new name: hits=%d err=%v", len(hits), err)
+	}
+	hits, err = db.Search(context.Background(), "sentry", "old", "", 10)
+	if err != nil || len(hits) != 0 {
+		t.Fatalf("stale search under old name: hits=%d err=%v", len(hits), err)
+	}
+
+	rel, err := db.Related(context.Background(), "bastion", "new", 1, 10)
+	if err != nil || len(rel) == 0 {
+		t.Fatalf("graph lost under new name: %+v err=%v", rel, err)
+	}
+	rel, err = db.Related(context.Background(), "bastion", "old", 1, 10)
+	if err != nil || len(rel) != 0 {
+		t.Fatalf("stale graph under old name: %+v err=%v", rel, err)
+	}
+	rel, err = db.Related(context.Background(), "bastion", "keep", 1, 10)
+	if err != nil || len(rel) != 1 || rel[0].Term != "aegis" {
+		t.Fatalf("other project changed: %+v err=%v", rel, err)
+	}
+}
+
 func embedDim() int { return embed.Dim }
 
 func mustEmbed(t *testing.T, text string) []float32 {

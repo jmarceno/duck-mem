@@ -117,3 +117,10 @@ func (m *memory) Index(minDF int, full bool) (owner.IndexResult, error) {
 	}
 	return performIndex(m.db, minDF, full)
 }
+
+func (m *memory) RenameProject(old, new string) (int, error) {
+	if m.client != nil {
+		return m.client.RenameProject(old, new)
+	}
+	return performRename(m.db, old, new)
+}

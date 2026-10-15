@@ -16,6 +16,7 @@ const (
 	opRelated = "related"
 	opIngest  = "ingest"
 	opIndex   = "index"
+	opRename  = "rename"
 )
 
 type request struct {
@@ -35,6 +36,8 @@ type request struct {
 	Roots       []string `json:"roots,omitempty"`
 	MinDF       int      `json:"min_df,omitempty"`
 	Full        bool     `json:"full,omitempty"`
+	OldProject  string   `json:"old_project,omitempty"`
+	NewProject  string   `json:"new_project,omitempty"`
 }
 
 type response struct {
@@ -123,5 +126,13 @@ func (c *Client) Ingest(roots []string) (IngestResult, error) {
 func (c *Client) Index(minDF int, full bool) (IndexResult, error) {
 	var out IndexResult
 	err := c.roundTrip(request{Op: opIndex, MinDF: minDF, Full: full}, &out)
+	return out, err
+}
+
+// RenameProject asks the owner to rename a project. It runs as a write job,
+// so it is serialized with ingest cycles.
+func (c *Client) RenameProject(old, new string) (int, error) {
+	var out int
+	err := c.roundTrip(request{Op: opRename, OldProject: old, NewProject: new}, &out)
 	return out, err
 }

@@ -296,6 +296,7 @@ func (a *trayApp) menuItems(s traySnapshot) []menuLayout {
 		menuItem(5, "Stop daemon", s.running && !s.busy),
 		menuItem(10, "Ingest now", !s.busy),
 		menuItem(6, "Full re-index", !s.busy),
+		menuItem(11, "Rename project", !s.busy),
 		menuItem(7, "View logs", true),
 		menuItem(8, "Open database folder", true),
 	}
@@ -401,6 +402,10 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 		if a.beginAction("ingesting") {
 			go a.ingestNow()
 		}
+	case 11:
+		if a.beginAction("renaming") {
+			go a.renameProject()
+		}
 	}
 	return nil
 }
@@ -477,6 +482,63 @@ func (a *trayApp) ingestNow() {
 		log.Printf("ingest now: %v: %s", err, strings.TrimSpace(string(out)))
 	} else {
 		log.Printf("ingest now complete: %s", strings.TrimSpace(string(out)))
+	}
+}
+
+// renameProject asks for the current and new names, confirms twice, then
+// runs the rename. The rename is a write job on the daemon, so it is
+// serialized with ingest: no data is ingested while it runs.
+func (a *trayApp) renameProject() {
+	defer a.endAction()
+	old, ok := zenityEntry("Rename project", "Current project name:", "")
+	if !ok || old == "" {
+		return
+	}
+	newName, ok := zenityEntry("Rename project", "New project name:", old)
+	if !ok || newName == "" {
+		return
+	}
+	summary := fmt.Sprintf("Rename project\n%s\nto\n%s\n\nAll stored data for the project is updated.", old, newName)
+	if !zenityQuestion("Rename project", summary) {
+		return
+	}
+	if !zenityQuestion("Are you sure?", "This cannot be undone. Continue?") {
+		return
+	}
+	self, err := os.Executable()
+	if err != nil {
+		log.Printf("rename project: %v", err)
+		return
+	}
+	cmd := exec.Command(self, "rename", old, newName)
+	raw, err := cmd.CombinedOutput()
+	out := strings.TrimSpace(string(raw))
+	if err != nil {
+		log.Printf("rename project: %v: %s", err, out)
+		zenityInfo("Rename failed", out)
+		return
+	}
+	log.Printf("rename project complete: %s", out)
+	zenityInfo("Done", out)
+}
+
+// zenity shows the smallest possible dialogs without adding a GUI toolkit.
+// A non-zero exit (user clicked Cancel) is reported as ok=false.
+func zenityEntry(title, label, initial string) (string, bool) {
+	out, err := exec.Command("zenity", "--entry", "--title="+title, "--text="+label, "--entry-text="+initial).Output()
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(out)), true
+}
+
+func zenityQuestion(title, text string) bool {
+	return exec.Command("zenity", "--question", "--title="+title, "--text="+text).Run() == nil
+}
+
+func zenityInfo(title, text string) {
+	if err := exec.Command("zenity", "--info", "--title="+title, "--text="+text).Run(); err != nil {
+		log.Printf("zenity info: %v", err)
 	}
 }
 

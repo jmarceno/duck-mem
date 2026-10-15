@@ -64,6 +64,7 @@ type IndexResult struct {
 type Handlers struct {
 	Ingest func(db *store.DB, roots []string) (IngestResult, error)
 	Index  func(db *store.DB, minDF int, full bool) (IndexResult, error)
+	Rename func(db *store.DB, old, new string) (int, error)
 }
 
 type job struct {
@@ -282,6 +283,14 @@ func (o *Owner) dispatch(req request) response {
 		}
 		val, err := o.Do(KindWrite, func(_ context.Context, db *store.DB) (any, error) {
 			return o.handlers.Index(db, req.MinDF, req.Full)
+		})
+		return payloadResponse(val, err)
+	case opRename:
+		if o.handlers.Rename == nil {
+			return response{Error: "rename is not served by this process"}
+		}
+		val, err := o.Do(KindWrite, func(_ context.Context, db *store.DB) (any, error) {
+			return o.handlers.Rename(db, req.OldProject, req.NewProject)
 		})
 		return payloadResponse(val, err)
 	default:
