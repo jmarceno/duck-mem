@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"os"
@@ -65,5 +66,79 @@ func TestRepackPreservesValuesSequencesAndSource(t *testing.T) {
 	}
 	if hits, err := copy.Search(context.Background(), "zephyrturbine storage", "", "", 5); err != nil || len(hits) == 0 {
 		t.Fatalf("repacked search: %v %v", hits, err)
+	}
+}
+
+func TestRepackSwapRebuildsInPlace(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "memory.duckdb")
+	db, err := Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertMsg(t, db, "s", 0, "zephyrturbine storage")
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Leftovers from an interrupted repack are replaced, not kept.
+	for _, stale := range []string{source + ".repack-tmp", source + ".repack-tmp.wal"} {
+		if err := os.WriteFile(stale, []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := RepackSwap(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Before != before.Size() || res.Out != "" {
+		t.Fatalf("result = %+v; source was %d bytes", res, before.Size())
+	}
+	after, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.After == 0 || res.After != after.Size() {
+		t.Fatalf("result = %+v; file is %d bytes", res, after.Size())
+	}
+	for _, leftover := range []string{source + ".repack-tmp", source + ".repack-tmp.wal", source + ".wal"} {
+		if _, err := os.Stat(leftover); err == nil {
+			t.Fatalf("%s was left behind", leftover)
+		}
+	}
+	rebuilt, err := Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rebuilt.Close()
+	if hits, err := rebuilt.Search(context.Background(), "zephyrturbine storage", "", "", 5); err != nil || len(hits) == 0 {
+		t.Fatalf("rebuilt search: %v %v", hits, err)
+	}
+}
+
+func TestRepackSwapLeavesSourceOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "memory.duckdb")
+	garbage := []byte("not a duckdb file")
+	if err := os.WriteFile(source, garbage, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RepackSwap(source); err == nil {
+		t.Fatal("repacked a corrupt source")
+	}
+	after, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, garbage) {
+		t.Fatal("the source changed after a failed repack")
+	}
+	for _, leftover := range []string{source + ".repack-tmp", source + ".repack-tmp.wal"} {
+		if _, err := os.Stat(leftover); err == nil {
+			t.Fatalf("%s was left behind", leftover)
+		}
 	}
 }

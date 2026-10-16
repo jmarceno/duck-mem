@@ -297,6 +297,7 @@ func (a *trayApp) menuItems(s traySnapshot) []menuLayout {
 		menuItem(10, "Ingest now", !s.busy),
 		menuItem(6, "Full re-index", !s.busy),
 		menuItem(11, "Rename project", !s.busy),
+		menuItem(12, "Repack database", !s.busy),
 		menuItem(7, "View logs", true),
 		menuItem(8, "Open database folder", true),
 	}
@@ -405,6 +406,10 @@ func (a *trayApp) Event(id int32, eventID string, data dbus.Variant, timestamp u
 	case 11:
 		if a.beginAction("renaming") {
 			go a.renameProject()
+		}
+	case 12:
+		if a.beginAction("repacking") {
+			go a.repackDatabase()
 		}
 	}
 	return nil
@@ -520,6 +525,32 @@ func (a *trayApp) renameProject() {
 	}
 	log.Printf("rename project complete: %s", out)
 	zenityInfo("Done", out)
+}
+
+// repackDatabase rebuilds the database file to reclaim space left by
+// rewrites and dropped data. The daemon repacks in place, so a running
+// indexer stays up and only wedges the queue for the duration.
+func (a *trayApp) repackDatabase() {
+	defer a.endAction()
+	question := "Rebuild the database file and reclaim unused space?\n\nQueries wait while it runs (about a minute on a large database)."
+	if !zenityQuestion("Repack database", question) {
+		return
+	}
+	self, err := os.Executable()
+	if err != nil {
+		log.Printf("repack database: %v", err)
+		return
+	}
+	cmd := exec.Command(self, "repack")
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		log.Printf("repack database: %v: %s", err, text)
+		zenityInfo("Repack failed", text)
+		return
+	}
+	log.Printf("repack database complete: %s", text)
+	zenityInfo("Repack complete", text)
 }
 
 // zenity shows the smallest possible dialogs without adding a GUI toolkit.

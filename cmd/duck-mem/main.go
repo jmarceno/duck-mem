@@ -88,7 +88,9 @@ func usage() {
   duck-mem index [--db PATH] [--min-df N] [--full] rebuild the topic graph
   duck-mem related [--db PATH] [--project P] [--depth 1|2] [--limit N] <term>
   duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
-  duck-mem repack [--db PATH] --out PATH  write a verified ZSTD copy; source remains unchanged
+  duck-mem repack [--db PATH] [--out PATH]
+                                         rebuild the database file and reclaim unused
+                                         space; without --out it swaps in place
   duck-mem rename [--db PATH] <current-name> <new-name>
                                          rename a project: replace its exact name in all stored
                                          data and refresh the indexes; the new name must be unused
@@ -196,6 +198,12 @@ func daemonCmd(args []string) {
 	fmt.Printf("%s daemon start db=%s interval=%s roots=%d\n",
 		time.Now().UTC().Format(time.RFC3339), *dbPath, interval, len(roots))
 	cycle := func(n int) {
+		// A pause is reported once by the cycle that caused it; staying
+		// quiet afterwards avoids one failure per interval for a database
+		// that needs repair.
+		if own.Paused() {
+			return
+		}
 		val, err := own.Do(owner.KindWrite, func(_ context.Context, db *store.DB) (any, error) {
 			return performCycle(db, *dbPath, roots)
 		})

@@ -2,11 +2,86 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// RepackResult reports the file size a repack changed.
+type RepackResult struct {
+	Out    string `json:"out,omitempty"`
+	Before int64  `json:"before"`
+	After  int64  `json:"after"`
+}
+
+// ErrRepacked reports that the rebuilt file is already in place despite the
+// error that came with it: only the cleanup after the swap failed.
+var ErrRepacked = errors.New("the rebuilt file is already in place")
+
+// RepackSwap replaces source with a fresh, verified file built in place: the
+// repack runs beside it, then the verified copy takes the source's name and
+// the source's WAL, already folded into the copy, is removed. The source is
+// untouched when the repack fails, and the source's file mode is preserved.
+func RepackSwap(source string) (RepackResult, error) {
+	abs, err := filepath.Abs(source)
+	if err != nil {
+		return RepackResult{}, err
+	}
+	before, err := os.Stat(abs)
+	if err != nil {
+		return RepackResult{}, err
+	}
+	tmp := abs + ".repack-tmp"
+	_ = os.Remove(tmp)
+	_ = os.Remove(tmp + ".wal")
+	if err := Repack(abs, tmp); err != nil {
+		_ = os.Remove(tmp)
+		_ = os.Remove(tmp + ".wal")
+		return RepackResult{}, err
+	}
+	if err := os.Rename(tmp, abs); err != nil {
+		_ = os.Remove(tmp)
+		_ = os.Remove(tmp + ".wal")
+		return RepackResult{}, err
+	}
+	after, statErr := os.Stat(abs)
+	res := RepackResult{Before: before.Size()}
+	if statErr == nil {
+		res.After = after.Size()
+	}
+	if err := os.Chmod(abs, before.Mode().Perm()); err != nil {
+		return res, fmt.Errorf("%w; restoring the file mode failed: %v", ErrRepacked, err)
+	}
+	if err := os.Remove(abs + ".wal"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return res, fmt.Errorf("%w; removing the stale WAL failed: %v", ErrRepacked, err)
+	}
+	if err := syncDir(filepath.Dir(abs)); err != nil {
+		return res, fmt.Errorf("%w; syncing the directory failed: %v", ErrRepacked, err)
+	}
+	if statErr != nil {
+		return res, fmt.Errorf("%w; stating the new file failed: %v", ErrRepacked, statErr)
+	}
+	return res, nil
+}
+
+// RepackTo writes a verified copy of source to out and reports both sizes.
+// The source is left in place.
+func RepackTo(source, out string) (RepackResult, error) {
+	before, err := os.Stat(source)
+	if err != nil {
+		return RepackResult{}, err
+	}
+	if err := Repack(source, out); err != nil {
+		return RepackResult{}, err
+	}
+	after, err := os.Stat(out)
+	if err != nil {
+		return RepackResult{}, err
+	}
+	return RepackResult{Out: out, Before: before.Size(), After: after.Size()}, nil
+}
 
 // Repack writes a fresh ZSTD database without changing source. Destination
 // must not exist. Index storage is rebuilt, never copied from the old file,
@@ -136,12 +211,20 @@ func Repack(source, destination string) (err error) {
 	if err := os.Link(tmp, destination); err != nil {
 		return err
 	}
-	d, err := os.Open(filepath.Dir(destination))
+	return syncDir(filepath.Dir(destination))
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	defer d.Close()
-	return d.Sync()
+	err = d.Sync()
+	closeErr := d.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
 }
 
 func quoteIdentifier(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }

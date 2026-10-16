@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,7 +71,15 @@ type Handlers struct {
 type job struct {
 	kind Kind
 	fn   func(context.Context, *store.DB) (any, error)
-	out  chan result
+	// A repack job is handled by the worker itself: it closes the shared
+	// handle, rebuilds the file, and reopens before the next job runs.
+	repack *repackJob
+	out    chan result
+}
+
+// repackJob is one repack request: an empty out swaps the live file.
+type repackJob struct {
+	out string
 }
 
 type result struct {
@@ -87,6 +96,13 @@ type Owner struct {
 	jobs        chan job
 	readTimeout time.Duration
 	handlers    Handlers
+
+	// fatalStreak counts consecutive write jobs that failed with a broken
+	// transaction. The worker owns it; the mutex guards the pause below.
+	fatalStreak int
+	mu          sync.Mutex
+	paused      bool
+	pauseMsg    string
 
 	wg         sync.WaitGroup
 	workerDone chan struct{}
@@ -180,7 +196,11 @@ func (o *Owner) Close() error {
 	o.wg.Wait()
 	close(o.jobs)
 	<-o.workerDone
-	err := o.db.Close()
+	var err error
+	// A failed reopen or repack leaves no handle to close.
+	if o.db != nil {
+		err = o.db.Close()
+	}
 	_ = os.Remove(SocketPath(o.path))
 	_ = unix.Flock(int(o.lock.Fd()), unix.LOCK_UN)
 	_ = o.lock.Close()
@@ -197,9 +217,48 @@ func (o *Owner) Do(kind Kind, fn func(context.Context, *store.DB) (any, error)) 
 	return r.val, r.err
 }
 
+// Repack rebuilds the database file as a write job. The worker closes the
+// database for the duration, so no job can hold a handle to the file being
+// replaced. Out writes a verified copy and leaves the live file in place.
+func (o *Owner) Repack(out string) (store.RepackResult, error) {
+	j := job{kind: KindWrite, repack: &repackJob{out: out}, out: make(chan result, 1)}
+	o.jobs <- j
+	r := <-j.out
+	if r.err != nil {
+		return store.RepackResult{}, r.err
+	}
+	res, _ := r.val.(store.RepackResult)
+	return res, nil
+}
+
+// Paused reports that writes stopped after repeated transaction errors. The
+// daemon uses it to stop cycling until the database is repaired.
+func (o *Owner) Paused() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.paused
+}
+
 func (o *Owner) loop() {
 	defer close(o.workerDone)
 	for j := range o.jobs {
+		if j.repack != nil {
+			val, err := o.runRepack(*j.repack)
+			j.out <- result{val, err}
+			continue
+		}
+		if j.kind == KindWrite {
+			if err := o.writesPausedError(); err != nil {
+				j.out <- result{nil, err}
+				continue
+			}
+		}
+		if o.db == nil {
+			// The last reopen failed; nothing but a repack or a restart
+			// can bring the file back.
+			j.out <- result{nil, o.pausedError()}
+			continue
+		}
 		ctx := context.Background()
 		var cancel context.CancelFunc
 		if j.kind == KindRead {
@@ -213,8 +272,128 @@ func (o *Owner) loop() {
 		if timedOut {
 			err = fmt.Errorf("query timed out after %s", o.readTimeout)
 		}
+		if j.kind == KindWrite {
+			o.observeWrite(err)
+		}
 		j.out <- result{val, err}
 	}
+}
+
+// fatalDBError reports whether err left DuckDB's transaction manager
+// unusable: "Failed to commit", "Failed to rollback", and "Conflict on
+// update" all arrive with this prefix, and the handle cannot commit again.
+func fatalDBError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "TransactionContext Error")
+}
+
+// observeWrite reopens the database after a broken transaction and, when it
+// breaks twice without a clean write in between, pauses writes. Without the
+// pause a corrupt file fails every cycle forever with the same error.
+func (o *Owner) observeWrite(err error) {
+	if err == nil {
+		o.fatalStreak = 0
+		return
+	}
+	if !fatalDBError(err) {
+		return
+	}
+	o.fatalStreak++
+	o.reopen(err)
+	if o.fatalStreak >= 2 {
+		o.pause(err)
+	}
+}
+
+func (o *Owner) reopen(cause error) {
+	if err := o.db.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "close database after %v: %v\n", cause, err)
+	}
+	db, err := store.Open(o.path)
+	if err != nil {
+		// No usable handle: every job is refused until a repack succeeds
+		// or the service restarts.
+		o.db = nil
+		o.pause(err)
+		fmt.Fprintf(os.Stderr, "reopen database after %v: %v\n", cause, err)
+		return
+	}
+	o.db = db
+}
+
+func (o *Owner) pause(err error) {
+	o.mu.Lock()
+	if !o.paused {
+		o.paused = true
+		o.pauseMsg = err.Error()
+	}
+	o.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "writes paused after database errors: %v\n", err)
+}
+
+func (o *Owner) resume() {
+	o.mu.Lock()
+	o.paused = false
+	o.pauseMsg = ""
+	o.mu.Unlock()
+	o.fatalStreak = 0
+}
+
+func (o *Owner) writesPausedError() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.paused {
+		return nil
+	}
+	return fmt.Errorf("writes are paused after database errors (%s); repair the database with duck-mem repack or restart duck-mem.service", o.pauseMsg)
+}
+
+func (o *Owner) pausedError() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.paused {
+		return fmt.Errorf("the database is not open")
+	}
+	return fmt.Errorf("the database needs repair (%s); run duck-mem repack or restart duck-mem.service", o.pauseMsg)
+}
+
+// runRepack closes the database, rewrites the file, and reopens. With an
+// out path it writes a verified copy and leaves the live file alone; without
+// one it replaces the live file, and only that clears a pause, because only
+// then is the file the daemon writes to the one that was verified.
+func (o *Owner) runRepack(rj repackJob) (any, error) {
+	if o.db != nil {
+		closeErr := o.db.Close()
+		o.db = nil
+		if closeErr != nil {
+			return nil, fmt.Errorf("close database for repack: %w", closeErr)
+		}
+	}
+	var (
+		res store.RepackResult
+		err error
+	)
+	if rj.out != "" {
+		res, err = store.RepackTo(o.path, rj.out)
+	} else {
+		res, err = store.RepackSwap(o.path)
+	}
+	db, reopenErr := store.Open(o.path)
+	if reopenErr != nil {
+		o.pause(reopenErr)
+		return nil, fmt.Errorf("reopen database after repack: %w", reopenErr)
+	}
+	o.db = db
+	if err != nil {
+		if rj.out == "" && errors.Is(err, store.ErrRepacked) {
+			// The rebuilt file is in place; only cleanup failed.
+			o.resume()
+		}
+		return nil, err
+	}
+	if rj.out == "" {
+		o.resume()
+	}
+	return res, nil
 }
 
 func (o *Owner) accept() {
@@ -292,6 +471,9 @@ func (o *Owner) dispatch(req request) response {
 		val, err := o.Do(KindWrite, func(_ context.Context, db *store.DB) (any, error) {
 			return o.handlers.Rename(db, req.OldProject, req.NewProject)
 		})
+		return payloadResponse(val, err)
+	case opRepack:
+		val, err := o.Repack(req.Out)
 		return payloadResponse(val, err)
 	default:
 		return response{Error: "unknown operation " + req.Op}

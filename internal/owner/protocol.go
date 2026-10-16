@@ -17,6 +17,7 @@ const (
 	opIngest  = "ingest"
 	opIndex   = "index"
 	opRename  = "rename"
+	opRepack  = "repack"
 )
 
 type request struct {
@@ -38,6 +39,7 @@ type request struct {
 	Full        bool     `json:"full,omitempty"`
 	OldProject  string   `json:"old_project,omitempty"`
 	NewProject  string   `json:"new_project,omitempty"`
+	Out         string   `json:"out,omitempty"`
 }
 
 type response struct {
@@ -135,4 +137,13 @@ func (c *Client) RenameProject(old, new string) (int, error) {
 	var out int
 	err := c.roundTrip(request{Op: opRename, OldProject: old, NewProject: new}, &out)
 	return out, err
+}
+
+// Repack asks the owner to rebuild the database file. The owner closes its
+// handle for the duration, so the command works while the indexer is up.
+// Out writes a verified copy there instead of replacing the live file.
+func (c *Client) Repack(out string) (store.RepackResult, error) {
+	var res store.RepackResult
+	err := c.roundTrip(request{Op: opRepack, Out: out}, &res)
+	return res, err
 }

@@ -124,3 +124,34 @@ func (m *memory) RenameProject(old, new string) (int, error) {
 	}
 	return performRename(m.db, old, new)
 }
+
+// errNoDaemon means no process serves the database: the caller can take the
+// owner lock and use the file directly.
+var errNoDaemon = errors.New("no daemon is serving this database")
+
+// dialOwner connects to the daemon that owns dbPath. A held lock with no
+// socket means the daemon is still starting: wait until one of those two
+// changes. It never opens the database itself.
+func dialOwner(dbPath string) (*owner.Client, error) {
+	deadline := time.Now().Add(2 * time.Minute)
+	var dialErr error
+	for {
+		if c, err := owner.Dial(dbPath); err == nil {
+			return c, nil
+		} else {
+			dialErr = err
+		}
+		unlock, err := owner.TryLock(dbPath)
+		if err == nil {
+			unlock()
+			return nil, errNoDaemon
+		}
+		if !errors.Is(err, owner.ErrBusy) {
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("database owner is not accepting connections: %w", dialErr)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}

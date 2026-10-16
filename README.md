@@ -100,7 +100,9 @@ duck-mem index [--db PATH] [--min-df N] [--full]
                                         incremental (or full) topic-graph index
 duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
                                         the ingest loop the service runs
-duck-mem repack [--db PATH] --out PATH  verified ZSTD copy; source is read-only
+duck-mem repack [--db PATH] [--out PATH]
+                                        rebuild the file and reclaim unused space;
+                                        without --out it swaps in place
 ```
 
 Flags may come before or after the text. The database defaults to
@@ -198,6 +200,7 @@ use counts as of each run, a periodic full rebuild heals the small drift:
 
 ```bash
 0 4 * * 0 duck-mem index --full   # weekly rebuild; daily ingest stays incremental
+0 5 1 * * duck-mem repack         # monthly repack reclaims space from rewrites
 ```
 
 DuckDB allows one read-write process at a time. The daemon is that process:
@@ -206,8 +209,16 @@ it opens the database at startup and keeps it. `query`, `show`, `related`,
 a sync and a search no longer fail each other with a file-lock error. Time in
 the queue is not limited. Once a `query`, `show`, or `related` starts, it has
 30 seconds to finish; ingest, index, and checkpoint are not capped. With the
-daemon stopped, those commands open the database themselves. `repack` still
-needs the service stopped, because it has to copy the file without a writer.
+daemon stopped, those commands open the database themselves. `repack` also
+works while the daemon runs: it closes the database for the duration, rebuilds
+the file, and reopens.
+
+A failed transaction (`Failed to commit`, `Conflict on update`) leaves DuckDB's
+handle unable to commit again. The owner reopens the file after such an error,
+and pauses writes when it happens twice without a clean write in between, so a
+damaged file stops cleanly with the real error instead of failing every cycle
+with a misleading conflict. A successful repack, or a restart after repair,
+resumes the writes.
 
 Vector search deliberately uses no approximate index. The vss HNSW index that
 earlier versions persisted kept every checkpoint's index blocks, so the file
@@ -216,11 +227,14 @@ of ~60k embeddings costs ~40 ms warm and finds every true neighbor (the HNSW
 index returned about 60–75% of them). Opening an older database drops that
 index; its blocks become reusable but the file only shrinks after a repack.
 
-`duck-mem repack --db SOURCE --out NEW_FILE` writes a separate compressed copy,
+`duck-mem repack` rebuilds the database file to reclaim space left by rewrites
+and dropped data, and drops a legacy HNSW index if one is still present. It
 verifies every table's row count and complete-row hash, preserves sequence
-positions, and rebuilds indexes. The destination must not exist; the command
-never replaces the source or stops services. Stop the services, repack, then
-swap the new file in place of the old one.
+positions, and rebuilds indexes before the new file becomes visible. With no
+flags it replaces the live file in place; the source stays untouched when the
+repack fails. `--out NEW_FILE` writes a separate copy instead and leaves the
+live file alone; the destination must not exist. Repack does not need the
+services stopped, and the tray menu offers the same in-place repack.
 
 ### What gets indexed
 
@@ -281,9 +295,9 @@ an indexed `TEXT` on both tables, filtered with `WHERE project ILIKE '%name%'`.
 `duck-mem-tray.service` registers a StatusNotifierItem (and DBusMenu) item using
 the project logo. The menu shows the indexer's state, the last completed
 sync, and how many sessions are registered, and can start or stop the indexer,
-sync immediately instead of waiting for the next cycle, or force a full
-re-index. A dot appears
-over the icon while an action is running or when the indexer is down.
+sync immediately instead of waiting for the next cycle, force a full
+re-index, rename a project, or repack the database to reclaim space. A dot
+appears over the icon while an action is running or when the indexer is down.
 
 Sync history is retained as monthly JSONL files in
 `~/.local/state/duck-mem/logs/`. Each cycle records the harness, time, session
