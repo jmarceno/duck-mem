@@ -6,7 +6,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 
-	duckdb "github.com/marcboeker/go-duckdb/v2"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // named converts positional ? values to the slice go-duckdb's ExecContext takes.

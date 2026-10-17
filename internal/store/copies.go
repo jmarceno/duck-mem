@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	duckdb "github.com/marcboeker/go-duckdb/v2"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // Only known transport envelopes are removed. Code, internal whitespace,

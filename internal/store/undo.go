@@ -5,7 +5,7 @@ import (
 
 	"github.com/jmarceno/duck-mem/internal/topics"
 
-	duckdb "github.com/marcboeker/go-duckdb/v2"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // edgeLogRow is one edge contribution of one indexed message.

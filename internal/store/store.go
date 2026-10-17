@@ -14,7 +14,7 @@ import (
 	"github.com/jmarceno/duck-mem/internal/embed"
 	"github.com/jmarceno/duck-mem/internal/topics"
 
-	duckdb "github.com/marcboeker/go-duckdb/v2"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // Message is one kept utterance from a session. Tool calls and tool

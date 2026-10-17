@@ -8,7 +8,7 @@ import (
 	"github.com/jmarceno/duck-mem/internal/embed"
 	"github.com/jmarceno/duck-mem/internal/topics"
 
-	duckdb "github.com/marcboeker/go-duckdb/v2"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // withTx runs fn on the DuckDB connection inside one transaction.
