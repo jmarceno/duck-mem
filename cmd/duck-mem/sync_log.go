@@ -102,6 +102,8 @@ func harnessName(kind ingest.Kind) string {
 		return "cursor"
 	case ingest.KindOpenCode:
 		return "opencode"
+	case ingest.KindDSH:
+		return "dsh"
 	default:
 		return "unknown"
 	}

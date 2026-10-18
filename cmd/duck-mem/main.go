@@ -393,8 +393,10 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 					return
 				}
 			}
+			// DSH sessions are compressed, so they are always re-read whole;
+			// the size and mtime check above still skips unchanged ones.
 			if checkpoint != nil && checkpoint.ParserVersion == parserVersion && projectMatches &&
-				!isCopy && kind != ingest.KindCursorPlan && checkpoint.EndsLine && info.Size() > checkpoint.Size {
+				!isCopy && kind != ingest.KindCursorPlan && kind != ingest.KindDSH && checkpoint.EndsLine && info.Size() > checkpoint.Size {
 				if oldHash, err := hashTail(f, checkpoint.Size); err == nil && oldHash == checkpoint.TailHash {
 					previous, err := db.GetSession(checkpoint.SessionID)
 					if err != nil {
@@ -702,7 +704,7 @@ func queryCmd(args []string) {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
 	dbPath := fs.String("db", defaultDB(), "DuckDB file")
 	project := fs.String("project", "", "filter by project path (substring match)")
-	source := fs.String("source", "", "filter by source: codex|claude|cursor|muse|opencode")
+	source := fs.String("source", "", "filter by source: codex|claude|cursor|muse|opencode|dsh")
 	limit := fs.Int("limit", 5, "max sessions")
 	perSession := fs.Int("hits", 3, "max matching messages shown per session")
 	known := map[string]bool{"--db": true, "--project": true, "--source": true, "--limit": true, "--hits": true}

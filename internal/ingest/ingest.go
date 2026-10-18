@@ -35,6 +35,7 @@ const (
 	KindCursorTranscript
 	KindCursorPlan
 	KindOpenCode
+	KindDSH
 )
 
 // Classify picks the parser from the file path.
@@ -44,6 +45,8 @@ func Classify(path string) Kind {
 		return KindCursorPlan
 	case filepath.Base(path) == "opencode.db":
 		return KindOpenCode
+	case strings.Contains(path, "/.dsh/sessions/") && strings.HasSuffix(path, ".jsonl.zstd"):
+		return KindDSH
 	case strings.Contains(path, "/agent-transcripts/") && strings.HasSuffix(path, ".jsonl"):
 		return KindCursorTranscript
 	case filepath.Base(path) == "session.jsonl" && strings.Contains(path, "/muse/sessions/"):
@@ -66,6 +69,7 @@ func DefaultRoots(home string) []string {
 		filepath.Join(home, ".cursor", "projects"),
 		filepath.Join(home, ".cursor", "plans"),
 		filepath.Join(home, ".local", "share", "opencode", "opencode.db"),
+		filepath.Join(home, ".dsh", "sessions"),
 	}
 }
 
@@ -119,6 +123,8 @@ func IngestFileWithCursorProjects(path string, projects map[string]string) (stor
 		return parseCursorTranscript(path, projects)
 	case KindCursorPlan:
 		return parseCursorPlan(path)
+	case KindDSH:
+		return parseDSH(path)
 	}
 	return store.Session{}, nil, nil
 }

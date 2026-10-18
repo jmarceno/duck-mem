@@ -1,15 +1,16 @@
 ---
 name: "duck-mem-query"
-description: "Your long-term memory of earlier conversations with this user, across every coding agent on this machine (Claude Code, Codex, Cursor, OpenCode, Muse): past decisions and their reasons, bug reports and fixes, failed approaches, plans in progress, and stated preferences. Use it FIRST, before exploring code or answering: (1) whenever the request points to the past ('again', 'still broken', 'last time', 'we already', 'remember', 'did we/you', 'why did we', 'what was the plan', 'pick up where we left off', work another agent did); (2) when starting a feature or behavior change in a named existing project or repo; (3) before changing a design, library, or approach in an existing project. Skip it for brand-new projects, generic coding questions, and things said earlier in the current conversation (not indexed yet). One fast read-only CLI call; skipping it means redoing solved work or reopening settled decisions."
+description: "Your long-term memory of earlier conversations with this user, across every coding agent on this machine (Claude Code, Codex, Cursor, OpenCode, Muse, DeepSeek Harness): past decisions and their reasons, bug reports and fixes, failed approaches, plans in progress, and stated preferences. Use it FIRST, before exploring code or answering: (1) whenever the request points to the past ('again', 'still broken', 'last time', 'we already', 'remember', 'did we/you', 'why did we', 'what was the plan', 'pick up where we left off', work another agent did); (2) when starting a feature or behavior change in a named existing project or repo; (3) before changing a design, library, or approach in an existing project. Skip it for brand-new projects, generic coding questions, and things said earlier in the current conversation (not indexed yet). One fast read-only CLI call; skipping it means redoing solved work or reopening settled decisions."
 ---
 
 # duck-mem: your memory of past sessions
 
 You do have memory of earlier work with this user. Every past conversation
 on this machine, from every agent tool (Claude Code, Codex, Cursor,
-OpenCode, Muse), is indexed and searchable through the `duck-mem` CLI. It
-holds user prompts and assistant replies (no tool calls). It is read-only
-for you, fast, and works from any directory. Do not `cd` first.
+OpenCode, Muse, DeepSeek Harness), is indexed and searchable through the
+`duck-mem` CLI. It holds user prompts and assistant replies (no tool calls).
+It is read-only for you, fast, and works from any directory. Do not `cd`
+first.
 
 **Quick start:** one command, before you explore the code:
 
@@ -119,7 +120,7 @@ Host context (system prompts, AGENTS.md, IDE state) is collapsed to one
   name. Leave it off to search every project. If a filtered search finds
   nothing, the output says which other projects match.
 - `--limit N` changes the number of sessions (default 5). `--hits N` changes the number of messages per session (default 3).
-- `--source codex|claude|cursor|muse|opencode` limits results to one tool.
+- `--source codex|claude|cursor|muse|opencode|dsh` limits results to one tool.
 
 ## Rules
 
