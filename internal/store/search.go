@@ -340,8 +340,12 @@ func (db *DB) namedSessions(query, project, source string) ([]string, error) {
 		if !strings.ContainsAny(ref, "0123456789") {
 			continue
 		}
-		filter, args := filterSQL("s", project, source, []any{strings.ToLower(ref)})
-		rows, err := db.query(`SELECT session_id FROM sessions s WHERE starts_with(lower(s.session_id), ?)`+filter+` LIMIT 2`, args...)
+		// A source prefix (dsh:, opencode:) must not hide the ID itself: match
+		// the stored ID or the part after its first colon.
+		ref = strings.ToLower(ref)
+		filter, args := filterSQL("s", project, source, []any{ref, ref})
+		rows, err := db.query(`SELECT session_id FROM sessions s WHERE (starts_with(lower(s.session_id), ?)
+			OR starts_with(lower(split_part(s.session_id, ':', 2)), ?))`+filter+` LIMIT 2`, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -497,7 +501,10 @@ func (db *DB) describeSession(r *SessionResult) error {
 // ResolveSession finds a session by full ID or unique ID prefix.
 func (db *DB) ResolveSession(ctx context.Context, ref string) (SessionResult, error) {
 	defer db.setRead(ctx)()
-	rows, err := db.query(`SELECT session_id FROM sessions WHERE starts_with(session_id, ?) ORDER BY session_id LIMIT 6`, ref)
+	rows, err := db.query(`SELECT session_id FROM sessions
+		WHERE starts_with(session_id, ?)
+		   OR starts_with(split_part(session_id, ':', 2), ?)
+		ORDER BY session_id LIMIT 6`, ref, ref)
 	if err != nil {
 		return SessionResult{}, err
 	}

@@ -306,6 +306,32 @@ func TestRecallPinsNamedSessionWithItsEnding(t *testing.T) {
 	}
 }
 
+// Sessions whose ID carries a source prefix still resolve and pin by prefix,
+// with or without that prefix, so an ID copied from query output works.
+func TestSourcePrefixedSessionIDResolvesByPrefix(t *testing.T) {
+	db := openTemp(t)
+	const sid = "dsh:session-abcdef12-3456"
+	if err := db.UpsertSession(Session{ID: sid, Source: "dsh", Project: "p", Path: "s.jsonl"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessages([]Message{{SessionID: sid, Seq: 0, Source: "dsh", Project: "p", Role: "user", Text: "start"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range []string{sid, "session-abcdef12-3456"} {
+		got, err := db.ResolveSession(context.Background(), ref)
+		if err != nil || got.Session.ID != sid {
+			t.Fatalf("resolve %q resolved to %q, err=%v", ref, got.Session.ID, err)
+		}
+	}
+	results, _, err := db.Recall(context.Background(), sid, "", "", 5, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Session.ID != sid || !results[0].Named {
+		t.Fatalf("prefixed ID did not pin the session: %+v", results)
+	}
+}
+
 // Databases from before keyword search get their posting list on open.
 func TestOpenBackfillsKeywordIndex(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.duckdb")
