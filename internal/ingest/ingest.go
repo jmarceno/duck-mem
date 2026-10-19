@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/jmarceno/duck-mem/internal/project"
 	"github.com/jmarceno/duck-mem/internal/store"
 )
 
@@ -145,11 +146,11 @@ func IngestAppended(path string, offset int64, previous store.Session, last *sto
 	return store.Session{}, nil, fmt.Errorf("append parsing unsupported for %s", path)
 }
 
-func newSession(id, source, project, path string, started time.Time) store.Session {
+func newSession(id, source, projectName, path string, started time.Time) store.Session {
 	if id == "" {
 		id = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	}
-	return store.Session{ID: id, Source: source, Project: project, Path: path, StartedAt: started}
+	return store.Session{ID: id, Source: source, Project: project.Clean(projectName), Path: path, StartedAt: started}
 }
 
 // collector assigns seq numbers and drops empty texts and adjacent duplicate
@@ -674,7 +675,7 @@ func parseCursorTranscriptFrom(path string, offset int64, sess store.Session, la
 		return sess, nil, err
 	}
 	sess.ID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
-	sess.Project = CursorProject(path, projects)
+	sess.Project = project.Clean(CursorProject(path, projects))
 	c.sess = sess
 	for i := range c.msgs {
 		c.msgs[i].SessionID = sess.ID

@@ -500,9 +500,14 @@ func TestRenameProject(t *testing.T) {
 	if err != nil || len(hits) != 2 {
 		t.Fatalf("search under new name: hits=%d err=%v", len(hits), err)
 	}
+	// The alias map resolves a query under the old name to the current one.
 	hits, err = db.Search(context.Background(), "sentry", "old", "", 10)
+	if err != nil || len(hits) != 2 {
+		t.Fatalf("rename alias did not resolve: hits=%d err=%v", len(hits), err)
+	}
+	hits, err = db.Search(context.Background(), "sentry", "/home/u/gone", "", 10)
 	if err != nil || len(hits) != 0 {
-		t.Fatalf("stale search under old name: hits=%d err=%v", len(hits), err)
+		t.Fatalf("unknown project matched: hits=%d err=%v", len(hits), err)
 	}
 
 	rel, err := db.Related(context.Background(), "bastion", "new", 1, 10)
@@ -510,8 +515,12 @@ func TestRenameProject(t *testing.T) {
 		t.Fatalf("graph lost under new name: %+v err=%v", rel, err)
 	}
 	rel, err = db.Related(context.Background(), "bastion", "old", 1, 10)
+	if err != nil || len(rel) == 0 {
+		t.Fatalf("graph lost under renamed alias: %+v err=%v", rel, err)
+	}
+	rel, err = db.Related(context.Background(), "bastion", "/home/u/gone", 1, 10)
 	if err != nil || len(rel) != 0 {
-		t.Fatalf("stale graph under old name: %+v err=%v", rel, err)
+		t.Fatalf("unknown project matched the graph: %+v err=%v", rel, err)
 	}
 	rel, err = db.Related(context.Background(), "bastion", "keep", 1, 10)
 	if err != nil || len(rel) != 1 || rel[0].Term != "aegis" {

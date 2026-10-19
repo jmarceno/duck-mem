@@ -10,20 +10,24 @@ import (
 )
 
 const (
-	opQuery   = "query"
-	opResolve = "resolve"
-	opWindow  = "window"
-	opRelated = "related"
-	opIngest  = "ingest"
-	opIndex   = "index"
-	opRename  = "rename"
-	opRepack  = "repack"
+	opQuery          = "query"
+	opResolve        = "resolve"
+	opWindow         = "window"
+	opRelated        = "related"
+	opIngest         = "ingest"
+	opIndex          = "index"
+	opRename         = "rename"
+	opRepack         = "repack"
+	opResolveProject = "resolve_project"
+	opProjects       = "projects"
 )
 
 type request struct {
 	Op          string   `json:"op"`
 	Query       string   `json:"query,omitempty"`
 	Project     string   `json:"project,omitempty"`
+	Projects    []string `json:"projects,omitempty"`
+	NoMatch     bool     `json:"no_match,omitempty"`
 	Source      string   `json:"source,omitempty"`
 	Limit       int      `json:"limit,omitempty"`
 	Hits        int      `json:"hits,omitempty"`
@@ -89,11 +93,26 @@ func (c *Client) roundTrip(req request, dest any) error {
 	return json.Unmarshal(resp.Payload, dest)
 }
 
-// Recall runs a query on the owner.
-func (c *Client) Recall(query, project, source string, limit, hits int) ([]store.SessionResult, []store.Topic, error) {
+// Recall runs a query on the owner within a resolved project filter.
+func (c *Client) Recall(query string, filter store.ProjectFilter, source string, limit, hits int) ([]store.SessionResult, []store.Topic, error) {
 	var out queryPayload
-	err := c.roundTrip(request{Op: opQuery, Query: query, Project: project, Source: source, Limit: limit, Hits: hits}, &out)
+	err := c.roundTrip(request{Op: opQuery, Query: query, Source: source, Limit: limit, Hits: hits,
+		Projects: filter.Values, NoMatch: filter.NoMatch}, &out)
 	return out.Results, out.Topics, err
+}
+
+// ResolveProject resolves a --project argument on the owner.
+func (c *Client) ResolveProject(ref string) (store.ProjectResolution, error) {
+	var out store.ProjectResolution
+	err := c.roundTrip(request{Op: opResolveProject, Project: ref}, &out)
+	return out, err
+}
+
+// Projects lists the stored projects on the owner.
+func (c *Client) Projects() ([]store.ProjectStat, error) {
+	var out []store.ProjectStat
+	err := c.roundTrip(request{Op: opProjects}, &out)
+	return out, err
 }
 
 // ResolveSession finds a session by id or unique prefix.
@@ -110,10 +129,11 @@ func (c *Client) Window(sessionID string, from, to, keep int, withContext bool) 
 	return out, err
 }
 
-// Related walks the topic graph.
-func (c *Client) Related(term, project string, depth, limit int) ([]store.RelatedHit, error) {
+// Related walks the topic graph within a resolved project filter.
+func (c *Client) Related(term string, filter store.ProjectFilter, depth, limit int) ([]store.RelatedHit, error) {
 	var out []store.RelatedHit
-	err := c.roundTrip(request{Op: opRelated, Term: term, Project: project, Depth: depth, Limit: limit}, &out)
+	err := c.roundTrip(request{Op: opRelated, Term: term, Depth: depth, Limit: limit,
+		Projects: filter.Values, NoMatch: filter.NoMatch}, &out)
 	return out, err
 }
 

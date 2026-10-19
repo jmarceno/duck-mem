@@ -53,14 +53,44 @@ const (
 	rrfK   = 60
 )
 
-// Search ranks messages by the query's own words; see rank.
+// Search ranks messages by the query's own words; see rank. The project
+// argument is resolved like --project (exact, alias, git identity, then a
+// substring fallback).
 func (db *DB) Search(ctx context.Context, query, project, source string, limit int) ([]Hit, error) {
+	filter, err := db.projectFilter(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	return db.SearchFiltered(ctx, query, filter, source, limit)
+}
+
+// SearchFiltered ranks messages within an already resolved project filter.
+func (db *DB) SearchFiltered(ctx context.Context, query string, filter ProjectFilter, source string, limit int) ([]Hit, error) {
 	defer db.setRead(ctx)()
 	terms, err := db.queryTerms(query)
 	if err != nil {
 		return nil, err
 	}
-	return db.rank(query, terms, nil, project, source, limit)
+	return db.rank(query, terms, nil, filter, source, limit)
+}
+
+// projectFilter resolves a project argument for the convenience read
+// methods. Empty means no restriction. When nothing resolves, the value
+// falls back to the plain substring filter these methods had before
+// resolution existed; the CLI uses ResolveProjectFilter directly so it can
+// print the advisory instead of guessing.
+func (db *DB) projectFilter(ctx context.Context, request string) (ProjectFilter, error) {
+	if request == "" {
+		return ProjectFilter{}, nil
+	}
+	res, err := db.ResolveProjectFilter(ctx, request)
+	if err != nil {
+		return ProjectFilter{}, err
+	}
+	if res.Reason == ProjectReasonNone {
+		return ProjectFilter{Substring: request}, nil
+	}
+	return res.Filter, nil
 }
 
 // Graph expansion: the most specific duckpgq neighbours of the query
@@ -80,8 +110,8 @@ const (
 //     the vector ranking only reorders BM25 candidates, which drops hash
 //     collisions between unrelated short messages.
 //
-// project and source only filter.
-func (db *DB) rank(query string, terms []string, expand []Topic, project, source string, limit int) ([]Hit, error) {
+// The project filter and source only filter.
+func (db *DB) rank(query string, terms []string, expand []Topic, filter ProjectFilter, source string, limit int) ([]Hit, error) {
 	if limit < 1 {
 		return nil, fmt.Errorf("limit must be positive")
 	}
@@ -98,13 +128,13 @@ func (db *DB) rank(query string, terms []string, expand []Topic, project, source
 		stems = append(stems, t.Term)
 	}
 	fused := map[msgKey]float64{}
-	ranked, err := db.keywordRank(weights, project, source, max(limit*10, 500))
+	ranked, err := db.keywordRank(weights, filter, source, max(limit*10, 500))
 	if err != nil {
 		return nil, err
 	}
 	addRRF(fused, ranked)
 	if vec := embed.Embed(query); vec != nil && len(fused) > 0 {
-		ranked, err := db.vectorRank(vec, project, source, max(limit*5, 50))
+		ranked, err := db.vectorRank(vec, filter, source, max(limit*5, 50))
 		if err != nil {
 			return nil, err
 		}
@@ -184,11 +214,24 @@ func (db *DB) queryTerms(query string) ([]string, error) {
 	return out, rows.Err()
 }
 
-func filterSQL(alias, project, source string, args []any) (string, []any) {
+// filterSQL renders a project filter and source filter for a bound query.
+// Resolved values compare exactly (case-insensitively); Substring is the
+// compatibility fallback, NoMatch matches nothing.
+func filterSQL(alias string, filter ProjectFilter, source string, args []any) (string, []any) {
 	q := ""
-	if project != "" {
+	if filter.NoMatch {
+		q += ` AND FALSE`
+	}
+	if len(filter.Values) > 0 {
+		ph := make([]string, len(filter.Values))
+		for i, v := range filter.Values {
+			ph[i] = "lower(?)"
+			args = append(args, v)
+		}
+		q += ` AND lower(` + alias + `.project) IN (` + strings.Join(ph, ",") + `)`
+	} else if filter.Substring != "" {
 		q += ` AND contains(lower(` + alias + `.project), lower(?))`
-		args = append(args, project)
+		args = append(args, filter.Substring)
 	}
 	if source != "" {
 		q += ` AND ` + alias + `.source = ?`
@@ -199,7 +242,7 @@ func filterSQL(alias, project, source string, args []any) (string, []any) {
 
 // keywordRank scores messages with BM25 over msg_terms, each term's
 // contribution scaled by its weight. Host context is never a hit.
-func (db *DB) keywordRank(weights map[string]float64, project, source string, limit int) ([]scored, error) {
+func (db *DB) keywordRank(weights map[string]float64, filter ProjectFilter, source string, limit int) ([]scored, error) {
 	var n, total float64
 	if err := db.queryRow(`SELECT (SELECT count(*) FROM messages), (SELECT coalesce(sum(tf), 0) FROM msg_terms)`).Scan(&n, &total); err != nil {
 		if strings.Contains(err.Error(), "msg_terms") {
@@ -214,7 +257,7 @@ func (db *DB) keywordRank(weights map[string]float64, project, source string, li
 	for t, w := range weights {
 		vals = append(vals, "("+sqlString(t)+", "+strconv.FormatFloat(w, 'f', -1, 64)+")")
 	}
-	filter, args := filterSQL("m", project, source, []any{n, total / n})
+	sqlFilter, args := filterSQL("m", filter, source, []any{n, total / n})
 	q := `WITH qt AS (SELECT * FROM (VALUES ` + strings.Join(vals, ",") + `) v(term, qw)),
 		df AS (SELECT term, any_value(qw) AS qw, count(*) AS df FROM msg_terms JOIN qt USING (term) GROUP BY term),
 		cand AS (SELECT t.session_id, t.seq, t.term, t.tf, df.df, df.qw FROM msg_terms t JOIN df USING (term)),
@@ -225,7 +268,7 @@ func (db *DB) keywordRank(weights map[string]float64, project, source string, li
 				(c.tf + ` + strconv.FormatFloat(bm25K1, 'f', -1, 64) + ` * (` + strconv.FormatFloat(1-bm25B, 'f', -1, 64) + ` + ` +
 		strconv.FormatFloat(bm25B, 'f', -1, 64) + ` * dl.dl / $2))) AS score
 		FROM cand c JOIN dl USING (session_id, seq) JOIN messages m USING (session_id, seq)
-		WHERE NOT ` + contextFilter + positional(filter, 3) + `
+		WHERE NOT ` + contextFilter + positional(sqlFilter, 3) + `
 		GROUP BY c.session_id, c.seq ORDER BY score DESC LIMIT ` + strconv.Itoa(limit)
 	return db.scoredRows(q, args, false)
 }
@@ -248,10 +291,10 @@ func positional(q string, start int) string {
 // vectorRank scans every embedding for the exact nearest messages. At tens
 // of thousands of 384-wide vectors this costs tens of milliseconds and, unlike
 // the approximate vss index it replaced, never misses a true neighbor.
-func (db *DB) vectorRank(vec []float32, project, source string, limit int) ([]scored, error) {
-	filter, args := filterSQL("messages", project, source, []any{vectorLiteral(vec)})
+func (db *DB) vectorRank(vec []float32, filter ProjectFilter, source string, limit int) ([]scored, error) {
+	sqlFilter, args := filterSQL("messages", filter, source, []any{vectorLiteral(vec)})
 	q := `SELECT session_id, seq, array_cosine_distance(embedding, ?::FLOAT[` + strconv.Itoa(embed.Dim) + `]) AS dist
-		FROM messages WHERE embedding IS NOT NULL` + filter + ` ORDER BY dist LIMIT ?`
+		FROM messages WHERE embedding IS NOT NULL` + sqlFilter + ` ORDER BY dist LIMIT ?`
 	return db.scoredRows(q, append(args, limit), true)
 }
 
@@ -334,7 +377,7 @@ var sessionRef = regexp.MustCompile(`[\p{L}\p{N}_-]{8,}`)
 
 // namedSessions returns the sessions whose ID, or unique ID prefix, the
 // query contains, in query order. Only words with a digit are tried.
-func (db *DB) namedSessions(query, project, source string) ([]string, error) {
+func (db *DB) namedSessions(query string, filter ProjectFilter, source string) ([]string, error) {
 	var out []string
 	for _, ref := range sessionRef.FindAllString(query, -1) {
 		if !strings.ContainsAny(ref, "0123456789") {
@@ -343,9 +386,9 @@ func (db *DB) namedSessions(query, project, source string) ([]string, error) {
 		// A source prefix (dsh:, opencode:) must not hide the ID itself: match
 		// the stored ID or the part after its first colon.
 		ref = strings.ToLower(ref)
-		filter, args := filterSQL("s", project, source, []any{ref, ref})
+		sqlFilter, args := filterSQL("s", filter, source, []any{ref, ref})
 		rows, err := db.query(`SELECT session_id FROM sessions s WHERE (starts_with(lower(s.session_id), ?)
-			OR starts_with(lower(split_part(s.session_id, ':', 2)), ?))`+filter+` LIMIT 2`, args...)
+			OR starts_with(lower(split_part(s.session_id, ':', 2)), ?))`+sqlFilter+` LIMIT 2`, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -376,6 +419,15 @@ func (db *DB) namedSessions(query, project, source string) ([]string, error) {
 // leave slots open, sessions found through the query's topic-graph
 // neighbours fill them, marked ViaGraph. It also returns those neighbours.
 func (db *DB) Recall(ctx context.Context, query, project, source string, sessions, perSession int) ([]SessionResult, []Topic, error) {
+	filter, err := db.projectFilter(ctx, project)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db.RecallFiltered(ctx, query, filter, source, sessions, perSession)
+}
+
+// RecallFiltered is Recall within an already resolved project filter.
+func (db *DB) RecallFiltered(ctx context.Context, query string, filter ProjectFilter, source string, sessions, perSession int) ([]SessionResult, []Topic, error) {
 	defer db.setRead(ctx)()
 	if sessions < 1 || perSession < 1 {
 		return nil, nil, fmt.Errorf("limit must be positive")
@@ -384,16 +436,16 @@ func (db *DB) Recall(ctx context.Context, query, project, source string, session
 	if err != nil {
 		return nil, nil, err
 	}
-	related, err := db.graphExpand(terms, project, expansionTerms)
+	related, err := db.graphExpand(terms, filter, expansionTerms)
 	if err != nil {
 		return nil, nil, err
 	}
 	fetch := sessions * perSession * 4
-	hits, err := db.rank(query, terms, nil, project, source, fetch)
+	hits, err := db.rank(query, terms, nil, filter, source, fetch)
 	if err != nil {
 		return nil, nil, err
 	}
-	named, err := db.namedSessions(query, project, source)
+	named, err := db.namedSessions(query, filter, source)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -426,7 +478,7 @@ func (db *DB) Recall(ctx context.Context, query, project, source string, session
 	// Widen only once the query's own matches are exhausted, so a graph
 	// session never stands in for a direct match past the fetch window.
 	if len(out) < sessions && len(hits) < fetch && len(related) > 0 {
-		more, err := db.rank(query, terms, related, project, source, fetch)
+		more, err := db.rank(query, terms, related, filter, source, fetch)
 		if err != nil {
 			return nil, nil, err
 		}

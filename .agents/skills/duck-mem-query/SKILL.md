@@ -118,16 +118,22 @@ Host context (system prompts, AGENTS.md, IDE state) is collapsed to one
 - Prefer names, identifiers, file names, and error text: `EnemyDef`,
   `enemyanim.ts`, `HNSW index missing`.
 - Word forms match: `enemy` also finds `enemies`, `disengage` finds `disengaged`.
-- `--project` is a substring of the project path. Use the repo directory
-  name. Leave it off to search every project. If a filtered search finds
-  nothing, the output says which other projects match.
+- `--project` narrows to one project. Use the repo directory name, the full
+  path, an old name it was renamed from, or its git remote name: case, a
+  trailing slash and renames resolve, and worktrees/clones of one remote are
+  one project. If nothing matches, up to three similar stored names are
+  printed with session counts and dates — they are leads, worded "similar
+  name only, not verified", so do not treat one as the same project. If one
+  filter names several projects, the output says so instead of silently
+  blending them. `duck-mem projects` lists stored names, counts, aliases and
+  git identity. `--project`/`--source` only narrow; they never merge data.
 - `--limit N` changes the number of sessions (default 5). `--hits N` changes the number of messages per session (default 3).
 - `--source codex|claude|cursor|muse|opencode|dsh` limits results to one tool.
 
 ## Rules
 
-- Read-only: use only `query`, `show`, and `related`. Never run `ingest`,
-  `index`, or `daemon`, and never open the database file.
+- Read-only: use only `query`, `show`, `related`, and `projects`. Never run
+  `ingest`, `index`, `daemon`, or `rename`, and never open the database file.
 - Results are memory, not current truth. The code may have changed since.
   Check the checkout before you act on a recalled detail.
 - The daemon syncs every few minutes, so earlier turns of the current

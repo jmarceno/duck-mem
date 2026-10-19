@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jmarceno/duck-mem/internal/project"
 	"github.com/jmarceno/duck-mem/internal/store"
 	"github.com/mattn/go-sqlite3"
 )
@@ -46,14 +47,14 @@ func IngestOpenCode(path string) ([]OpenCodeSession, error) {
 	}
 	var sessions []OpenCodeSession
 	for rows.Next() {
-		var id, project string
+		var id, dir string
 		var created int64
-		if err := rows.Scan(&id, &project, &created); err != nil {
+		if err := rows.Scan(&id, &dir, &created); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		sessions = append(sessions, OpenCodeSession{Session: store.Session{
-			ID: "opencode:" + id, Source: "opencode", Project: project,
+			ID: "opencode:" + id, Source: "opencode", Project: project.Clean(dir),
 			Path: path, StartedAt: sqliteTime(created),
 		}})
 	}

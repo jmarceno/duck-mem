@@ -136,18 +136,18 @@ type Topic struct {
 // Three quarters of edges are one-off co-mentions, and for a rare word
 // they are all there is ("disengage": passive, roam, sight), so those are
 // the fallback. Query stems themselves are excluded.
-func (db *DB) graphExpand(stems []string, project string, n int) ([]Topic, error) {
+func (db *DB) graphExpand(stems []string, filter ProjectFilter, n int) ([]Topic, error) {
 	if len(stems) == 0 || n < 1 {
 		return nil, nil
 	}
-	out, err := db.graphNeighbours(stems, project, n, 2)
+	out, err := db.graphNeighbours(stems, filter, n, 2)
 	if err != nil || len(out) > 0 {
 		return out, err
 	}
-	return db.graphNeighbours(stems, project, n, 1)
+	return db.graphNeighbours(stems, filter, n, 1)
 }
 
-func (db *DB) graphNeighbours(stems []string, project string, n, minWeight int) ([]Topic, error) {
+func (db *DB) graphNeighbours(stems []string, filter ProjectFilter, n, minWeight int) ([]Topic, error) {
 	quoted := make([]string, len(stems))
 	for i, s := range stems {
 		quoted[i] = sqlString(s)
@@ -162,9 +162,7 @@ func (db *DB) graphNeighbours(stems []string, project string, n, minWeight int) 
 	) g JOIN term_df d ON d.project = g.project AND d.term = g.term
 	WHERE g.src IN (` + in + `) AND g.term NOT IN (` + in + `)
 		AND g.kind = 'co-mention' AND g.weight >= ` + strconv.Itoa(minWeight)
-	if project != "" {
-		q += ` AND contains(lower(g.project), lower(` + sqlString(project) + `))`
-	}
+	q += projectSQL("g", filter)
 	q += ` GROUP BY g.term ORDER BY 2 DESC, 4 DESC, 1 LIMIT ` + strconv.Itoa(n)
 	rows, err := db.query(q)
 	if err != nil {

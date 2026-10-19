@@ -22,8 +22,10 @@ func TestOpenCodeKeepsVisibleTextOnly(t *testing.T) {
 		`CREATE TABLE project (id TEXT, worktree TEXT)`,
 		`CREATE TABLE session_v2 (id TEXT, project_id TEXT, directory TEXT, time_created INTEGER)`,
 		`CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)`,
-		`INSERT INTO project VALUES ('p', '/fallback')`,
-		`INSERT INTO session_v2 VALUES ('s', 'p', '/project', 1789980111419)`,
+		// OpenCode reports directories with a trailing separator; the parser
+		// must normalize it so it cannot create a second project value.
+		`INSERT INTO project VALUES ('p', '/fallback/')`,
+		`INSERT INTO session_v2 VALUES ('s', 'p', '/project/', 1789980111419)`,
 		`INSERT INTO session_v2 VALUES ('child', 'p', '', 1789980111420)`,
 		`INSERT INTO session_message VALUES ('a', 's', 'user', 1, 1789980111525, '{"text":"hello"}')`,
 		`INSERT INTO session_message VALUES ('b', 's', 'assistant', 2, 1789980111526, '{"content":[{"type":"reasoning","text":"private thought"},{"type":"tool","name":"shell","state":{"output":"secret output"}},{"type":"text","text":"visible answer"},{"type":"text","text":"second paragraph"}]}')`,

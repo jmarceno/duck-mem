@@ -64,14 +64,34 @@ func readTimeout(ctx context.Context, err error) error {
 	return err
 }
 
-func (m *memory) Recall(query, project, source string, limit, hits int) ([]store.SessionResult, []store.Topic, error) {
+func (m *memory) Recall(query string, filter store.ProjectFilter, source string, limit, hits int) ([]store.SessionResult, []store.Topic, error) {
 	if m.client != nil {
-		return m.client.Recall(query, project, source, limit, hits)
+		return m.client.Recall(query, filter, source, limit, hits)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), owner.AgentReadTimeout)
 	defer cancel()
-	results, topics, err := m.db.Recall(ctx, query, project, source, limit, hits)
+	results, topics, err := m.db.RecallFiltered(ctx, query, filter, source, limit, hits)
 	return results, topics, readTimeout(ctx, err)
+}
+
+func (m *memory) ResolveProject(request string) (store.ProjectResolution, error) {
+	if m.client != nil {
+		return m.client.ResolveProject(request)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), owner.AgentReadTimeout)
+	defer cancel()
+	res, err := m.db.ResolveProjectFilter(ctx, request)
+	return res, readTimeout(ctx, err)
+}
+
+func (m *memory) Projects() ([]store.ProjectStat, error) {
+	if m.client != nil {
+		return m.client.Projects()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), owner.AgentReadTimeout)
+	defer cancel()
+	list, err := m.db.ProjectStats(ctx)
+	return list, readTimeout(ctx, err)
 }
 
 func (m *memory) ResolveSession(ref string) (store.SessionResult, error) {
@@ -94,13 +114,13 @@ func (m *memory) Window(sessionID string, from, to, keep int, withContext bool) 
 	return msgs, readTimeout(ctx, err)
 }
 
-func (m *memory) Related(term, project string, depth, limit int) ([]store.RelatedHit, error) {
+func (m *memory) Related(term string, filter store.ProjectFilter, depth, limit int) ([]store.RelatedHit, error) {
 	if m.client != nil {
-		return m.client.Related(term, project, depth, limit)
+		return m.client.Related(term, filter, depth, limit)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), owner.AgentReadTimeout)
 	defer cancel()
-	hits, err := m.db.Related(ctx, term, project, depth, limit)
+	hits, err := m.db.RelatedFiltered(ctx, term, filter, depth, limit)
 	return hits, readTimeout(ctx, err)
 }
 

@@ -2,11 +2,12 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"database/sql/driver"
 	"fmt"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
+
+	"github.com/jmarceno/duck-mem/internal/project"
 )
 
 // named converts positional ? values to the slice go-duckdb's ExecContext takes.
@@ -59,6 +60,7 @@ func (db *DB) RenameProject(old, new string) (int, error) {
 			`UPDATE msg_edges SET project=? WHERE project=?`,
 			`UPDATE file_checkpoints SET project=? WHERE project=?`,
 			`UPDATE project_aliases SET new_name=? WHERE new_name=?`,
+			`UPDATE project_identities SET project=? WHERE project=?`,
 		} {
 			if err := execOn(conn, q, new, old); err != nil {
 				return err
@@ -143,12 +145,19 @@ func (db *DB) RenameProject(old, new string) (int, error) {
 }
 
 // ResolveProject returns the current name of a project that sources still
-// report under a name it was renamed from.
-func (db *DB) ResolveProject(project string) (string, error) {
-	var name string
-	err := db.sql.QueryRow(`SELECT new_name FROM project_aliases WHERE old_name=?`, project).Scan(&name)
-	if err == sql.ErrNoRows {
-		return project, nil
+// report under a name it was renamed from. The incoming value is normalized
+// first, so a trailing separator cannot escape the alias map.
+func (db *DB) ResolveProject(name string) (string, error) {
+	name = project.Clean(name)
+	if name == "" {
+		return "", nil
 	}
-	return name, err
+	aliases, err := db.projectAliases(context.Background())
+	if err != nil {
+		return name, err
+	}
+	if next, ok := aliases[project.Fold(name)]; ok {
+		return followAlias(next, aliases), nil
+	}
+	return name, nil
 }

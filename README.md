@@ -103,6 +103,9 @@ duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
 duck-mem repack [--db PATH] [--out PATH]
                                         rebuild the file and reclaim unused space;
                                         without --out it swaps in place
+duck-mem projects [--db PATH]
+                                        list stored projects, session counts, aliases
+                                        and captured git identity
 ```
 
 Flags may come before or after the text. The database defaults to
@@ -156,6 +159,55 @@ showing #39–#43; earlier: --from 0 --to 38; later: --from 44 --to 64; whole me
 ```
 
 Unique ID prefixes are enough, and `--project`/`--source` narrow either command.
+
+### Projects and identity
+
+Every session carries a project value: the directory (or short name) the
+harness reported. Values are normalized at ingest — trailing separators,
+duplicate separators, `~` and backslash paths are canonicalized — so one
+checkout cannot become two projects. `--project` accepts more than the exact
+stored string. Resolution tries, in order: the exact stored value or path, a
+name the project was renamed from, the directory basename (an agent's usual
+repo-directory name), and a shared git identity — worktrees and clones of one
+remote are the same project. Only then does the old substring filter apply.
+
+`--project` is advisory: resolving a name narrows a read; it never merges or
+rewrites data. Only `duck-mem rename` changes stored values, and it records an
+alias so later queries under the old name keep resolving.
+
+When a project cannot be resolved, the output says so instead of searching
+everything and offers up to three similar stored names with their session
+count, sources and date range:
+
+```console
+$ duck-mem query --project celestial flaky test
+no project matches "celestial"
+similar names: /home/you/Projects/celeste (36 sessions, claude+codex+cursor, 2026-10-06 → 2026-10-19)
+Similar name only, not verified — may be a different project, or an older name for the same one.
+```
+
+A filter that names more than one project says so and lists each with its
+session count, so `Generic` and `generic` are never silently blended:
+
+```console
+$ duck-mem query --project generic ledger
+--project "generic" matches 2 projects: /home/you/Projects/generic (79 sessions), /home/you/Projects/Generic (60 sessions)
+```
+
+Git identity is captured lazily while changed sessions are re-parsed; there is
+no backfill migration in the code. A previous data repair was done by hand
+once, before this existed, and the alias map keeps it from reverting.
+`duck-mem projects` shows everything the store knows:
+
+```console
+$ duck-mem projects
+60 stored projects, 4 with a captured git identity
+
+/home/you/Projects/organizer               925 sessions  claude,codex,cursor  …
+                                           git github.com/you/organizer · /home/you/Projects/organizer
+                                           aliases: /home/you/projects/organizer-tiptap, …
+/home/you/Projects/celeste                  36 sessions  claude,codex,cursor,dsh,opencode  …
+```
 
 ### Topic relationships
 
@@ -247,6 +299,10 @@ services stopped, and the tray menu offers the same in-place repack.
 | OpenCode | `~/.local/share/opencode/opencode.db` (read-only, including WAL) | `session_v2.directory`, else the worktree |
 | DeepSeek Harness | `~/.dsh/sessions/*/*/session.v4.jsonl.zstd` (zstd, read-only) | session header `cwd` |
 
+Project values are normalized when they are parsed (`filepath.Clean`-style:
+trailing and repeated separators, `~`, backslash paths), compared
+case-insensitively, and stored with the source's casing.
+
 Kept: user prompts, assistant text, system and developer text. Dropped
 everywhere: tool calls, tool outputs, reasoning and thinking blocks,
 environment snapshots, queue and metadata records. A Cursor plan file is
@@ -293,11 +349,15 @@ topic_edges(src_id, dst_id, term_a, term_b, weight, kind,
 msg_edges(session_id, seq, term_a, term_b, ...) -- per-message edge log
 file_checkpoints(path, size, mtime_ns, tail_hash, ends_line, session_id, …)
 session_copies(session_id, hashes, eligible, imported, duplicate_of, seen_at)
+project_aliases(old_name TEXT PRIMARY KEY, new_name)   -- rename map
+project_identities(project, repo_root, remote_url, common_dir, updated_at)
 ```
 
 `project` is a value, not a column: DuckDB columns are schema, so one column
 per project would need DDL for every new project and break every query. It is
-an indexed `TEXT` on both tables, filtered with `WHERE project ILIKE '%name%'`.
+an indexed `TEXT` on both tables; reads resolve a name to exact stored values
+(see [Projects and identity](#projects-and-identity)) and filter with
+`WHERE project IN (...)`, with the old substring match only as a fallback.
 
 ## Tray
 

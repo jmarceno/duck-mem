@@ -221,6 +221,15 @@ func (db *DB) init() error {
 		`CREATE TABLE IF NOT EXISTS project_aliases(
 			old_name TEXT PRIMARY KEY,
 			new_name TEXT NOT NULL)`,
+		// project_identities caches the git identity captured during ingest.
+		// It is filled lazily as changed sessions are re-parsed; there is no
+		// historical backfill.
+		`CREATE TABLE IF NOT EXISTS project_identities(
+			project TEXT PRIMARY KEY,
+			repo_root TEXT NOT NULL DEFAULT '',
+			remote_url TEXT NOT NULL DEFAULT '',
+			common_dir TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp)`,
 		`CREATE TABLE IF NOT EXISTS session_copies(
 			session_id TEXT PRIMARY KEY,
 			hashes TEXT NOT NULL,
@@ -897,6 +906,16 @@ type RelatedHit struct {
 // by project substring. Depth 1 ranks direct neighbors; depth 2 adds
 // neighbors-of-neighbors, scored by the two-hop weight sum.
 func (db *DB) Related(ctx context.Context, term, project string, depth, limit int) ([]RelatedHit, error) {
+	filter, err := db.projectFilter(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	return db.RelatedFiltered(ctx, term, filter, depth, limit)
+}
+
+// RelatedFiltered walks the topic graph within an already resolved project
+// filter.
+func (db *DB) RelatedFiltered(ctx context.Context, term string, filter ProjectFilter, depth, limit int) ([]RelatedHit, error) {
 	defer db.setRead(ctx)()
 	if limit < 1 || (depth != 1 && depth != 2) {
 		return nil, fmt.Errorf("related needs a positive limit and depth 1 or 2")
@@ -913,7 +932,7 @@ func (db *DB) Related(ctx context.Context, term, project string, depth, limit in
 	term = stems[term]
 	seen := map[string]RelatedHit{}
 	direct := map[string]int{}
-	first, err := db.graphNeighbors(term, project)
+	first, err := db.graphNeighbors(term, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -942,7 +961,7 @@ func (db *DB) Related(ctx context.Context, term, project string, depth, limit in
 		for _, v := range ordered {
 			vias[v.Term] = v.Weight
 		}
-		second, err := db.graphTwoHop(term, project)
+		second, err := db.graphTwoHop(term, filter)
 		if err != nil {
 			return nil, err
 		}
@@ -972,7 +991,7 @@ func (db *DB) Related(ctx context.Context, term, project string, depth, limit in
 	return out, db.labelHits(out)
 }
 
-func (db *DB) graphNeighbors(term, project string) ([]RelatedHit, error) {
+func (db *DB) graphNeighbors(term string, filter ProjectFilter) ([]RelatedHit, error) {
 	q := `SELECT g.term, sum(g.weight)::INTEGER, g.kind, g.from_term, g.to_term, min(g.evidence) FROM (
 		SELECT * FROM GRAPH_TABLE (topic_graph
 			MATCH (a:topics)-[e:Rel]->(b:topics)
@@ -988,9 +1007,7 @@ func (db *DB) graphNeighbors(term, project string) ([]RelatedHit, error) {
 			)
 		)
 	) g WHERE g.src = ` + sqlString(term)
-	if project != "" {
-		q += ` AND contains(lower(g.project), lower(` + sqlString(project) + `))`
-	}
+	q += projectSQL("g", filter)
 	q += ` GROUP BY g.term, g.kind, g.from_term, g.to_term`
 	rows, err := db.query(q)
 	if err != nil {
@@ -1008,7 +1025,7 @@ func (db *DB) graphNeighbors(term, project string) ([]RelatedHit, error) {
 	return out, rows.Err()
 }
 
-func (db *DB) graphTwoHop(term, project string) ([]RelatedHit, error) {
+func (db *DB) graphTwoHop(term string, filter ProjectFilter) ([]RelatedHit, error) {
 	q := `SELECT g.via, g.term, sum(g.weight)::INTEGER, g.kind, g.from_term, g.to_term, min(g.evidence) FROM (
 		SELECT * FROM GRAPH_TABLE (topic_graph
 			MATCH (a:topics)-[e1:Rel]->(hop:topics)-[e2:Rel]->(b:topics)
@@ -1025,9 +1042,7 @@ func (db *DB) graphTwoHop(term, project string) ([]RelatedHit, error) {
 			)
 		)
 	) g WHERE g.src = ` + sqlString(term) + ` AND g.term <> ` + sqlString(term)
-	if project != "" {
-		q += ` AND contains(lower(g.project), lower(` + sqlString(project) + `))`
-	}
+	q += projectSQL("g", filter)
 	q += ` GROUP BY g.via, g.term, g.kind, g.from_term, g.to_term`
 	rows, err := db.query(q)
 	if err != nil {

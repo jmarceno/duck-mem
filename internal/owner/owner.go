@@ -426,11 +426,22 @@ func (o *Owner) dispatch(req request) response {
 	switch req.Op {
 	case opQuery:
 		val, err := o.Do(KindRead, func(ctx context.Context, db *store.DB) (any, error) {
-			results, topics, err := db.Recall(ctx, req.Query, req.Project, req.Source, req.Limit, req.Hits)
+			filter := store.ProjectFilter{Values: req.Projects, NoMatch: req.NoMatch}
+			results, topics, err := db.RecallFiltered(ctx, req.Query, filter, req.Source, req.Limit, req.Hits)
 			if err != nil {
 				return nil, err
 			}
 			return queryPayload{Results: results, Topics: topics}, nil
+		})
+		return payloadResponse(val, err)
+	case opResolveProject:
+		val, err := o.Do(KindRead, func(ctx context.Context, db *store.DB) (any, error) {
+			return db.ResolveProjectFilter(ctx, req.Project)
+		})
+		return payloadResponse(val, err)
+	case opProjects:
+		val, err := o.Do(KindRead, func(ctx context.Context, db *store.DB) (any, error) {
+			return db.ProjectStats(ctx)
 		})
 		return payloadResponse(val, err)
 	case opResolve:
@@ -445,7 +456,8 @@ func (o *Owner) dispatch(req request) response {
 		return payloadResponse(val, err)
 	case opRelated:
 		val, err := o.Do(KindRead, func(ctx context.Context, db *store.DB) (any, error) {
-			return db.Related(ctx, req.Term, req.Project, req.Depth, req.Limit)
+			filter := store.ProjectFilter{Values: req.Projects, NoMatch: req.NoMatch}
+			return db.RelatedFiltered(ctx, req.Term, filter, req.Depth, req.Limit)
 		})
 		return payloadResponse(val, err)
 	case opIngest:

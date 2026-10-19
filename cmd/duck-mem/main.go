@@ -69,6 +69,8 @@ func main() {
 		repackCmd(os.Args[2:])
 	case "rename":
 		renameCmd(os.Args[2:])
+	case "projects":
+		projectsCmd(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		usage()
@@ -94,6 +96,8 @@ func usage() {
   duck-mem rename [--db PATH] <current-name> <new-name>
                                          rename a project: replace its exact name in all stored
                                          data and refresh the indexes; the new name must be unused
+  duck-mem projects [--db PATH]          list stored projects, their session counts, aliases
+                                         and captured git identity
 `)
 }
 
@@ -234,7 +238,7 @@ func performCycle(db *store.DB, dbPath string, roots []string) (owner.IngestResu
 	if err := db.PrepareSessionCopies(); err != nil {
 		return owner.IngestResult{}, err
 	}
-	files, nSess, nMsg, nSkip := runCycle(db, roots)
+	files, nSess, nMsg, nSkip := runCycle(db, roots, newIdentityRecorder(db))
 	copies, err := db.SuppressSessionCopies()
 	if err != nil {
 		return owner.IngestResult{}, err
@@ -292,7 +296,7 @@ func performIndex(db *store.DB, minDF int, full bool) (owner.IndexResult, error)
 
 // runCycle skips unchanged files and reads only the appended bytes of
 // append-only JSONL files. Rewrites take the full reconciliation path.
-func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
+func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files, nSess, nMsg, nSkip int) {
 	cursorProjects := map[string]map[string]string{}
 	entries := map[string]syncLogEntry{}
 	defer func() {
@@ -328,7 +332,7 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 				entries[key] = entry
 			}()
 			if ingest.Classify(f) == ingest.KindOpenCode {
-				sessions, messages, err := ingestOpenCode(db, f)
+				sessions, messages, err := ingestOpenCode(db, f, identities)
 				entry.Sessions, entry.Lines = sessions, messages
 				nSess += sessions
 				nMsg += messages
@@ -428,7 +432,11 @@ func runCycle(db *store.DB, roots []string) (files, nSess, nMsg, nSkip int) {
 				return
 			}
 			reason = "Database error"
+			rawProject := sess.Project
 			err = applyProjectAlias(db, &sess, msgs)
+			if err == nil {
+				err = identities.record(rawProject, sess.Project)
+			}
 			if err == nil {
 				err = db.SyncConversation(sess, msgs, appended, loadSessionCopy)
 			}
@@ -471,7 +479,7 @@ func applyProjectAlias(db *store.DB, sess *store.Session, msgs []store.Message) 
 	return nil
 }
 
-func ingestOpenCode(db *store.DB, path string) (int, int, error) {
+func ingestOpenCode(db *store.DB, path string, identities *identityRecorder) (int, int, error) {
 	before, err := sqliteState(path)
 	if err != nil {
 		return 0, 0, err
@@ -494,7 +502,11 @@ func ingestOpenCode(db *store.DB, path string) (int, int, error) {
 	}
 	count, completed := 0, 0
 	for _, s := range sessions {
+		rawProject := s.Session.Project
 		if err := applyProjectAlias(db, &s.Session, s.Messages); err != nil {
+			return completed, count, &syncDatabaseError{err}
+		}
+		if err := identities.record(rawProject, s.Session.Project); err != nil {
 			return completed, count, &syncDatabaseError{err}
 		}
 		if err := db.SyncConversation(s.Session, s.Messages, false, loadSessionCopy); err != nil {
@@ -663,7 +675,7 @@ func performRename(db *store.DB, old, new string) (int, error) {
 func relatedCmd(args []string) {
 	fs := flag.NewFlagSet("related", flag.ExitOnError)
 	dbPath := fs.String("db", defaultDB(), "DuckDB file")
-	project := fs.String("project", "", "restrict to project (substring match)")
+	projectName := fs.String("project", "", "restrict to project (name, path, alias or git identity)")
 	depth := fs.Int("depth", 1, "1: direct co-mentions, 2: include neighbors-of-neighbors")
 	limit := fs.Int("limit", 20, "max topics")
 	known := map[string]bool{"--db": true, "--project": true, "--depth": true, "--limit": true}
@@ -679,7 +691,11 @@ func relatedCmd(args []string) {
 		fatal(err)
 	}
 	defer mem.Close()
-	hits, err := mem.Related(strings.Join(fs.Args(), " "), *project, *depth, *limit)
+	filter, ok := resolveProjectFlag(mem, *projectName)
+	if !ok {
+		return
+	}
+	hits, err := mem.Related(strings.Join(fs.Args(), " "), filter, *depth, *limit)
 	if err != nil {
 		fatal(err)
 	}
@@ -700,10 +716,77 @@ func relatedCmd(args []string) {
 	}
 }
 
+// resolveProjectFlag resolves --project for a read command and prints the
+// advisory lines: did-you-mean when nothing matches, ambiguity when one
+// filter names several projects, and a note when a git identity collapsed
+// several stored names. ok=false means the caller should stop.
+func resolveProjectFlag(mem *memory, request string) (filter store.ProjectFilter, ok bool) {
+	if request == "" {
+		return store.ProjectFilter{}, true
+	}
+	res, err := mem.ResolveProject(request)
+	if err != nil {
+		fatal(err)
+	}
+	if res.Reason == store.ProjectReasonNone {
+		printProjectMiss(res)
+		return store.ProjectFilter{}, false
+	}
+	printProjectNotes(res)
+	return res.Filter, true
+}
+
+// printProjectMiss explains why a --project filter selected nothing: the
+// path may be gone, or the name may be close to a stored one. Candidates are
+// leads only; nothing is merged or rewritten.
+func printProjectMiss(res store.ProjectResolution) {
+	if res.StalePath {
+		fmt.Printf("project path does not exist: %s\n", res.Request)
+	} else {
+		fmt.Printf("no project matches %q\n", res.Request)
+	}
+	if len(res.Candidates) == 0 {
+		fmt.Println("`duck-mem projects` lists the stored names; if it was renamed, `duck-mem rename <old> <new>` records it.")
+		return
+	}
+	parts := make([]string, len(res.Candidates))
+	for i, c := range res.Candidates {
+		parts[i] = fmt.Sprintf("%s (%d sessions, %s, %s)",
+			c.Project, c.Sessions, strings.Join(c.Sources, "+"), dateRange(c.First, c.Last))
+	}
+	fmt.Printf("similar names: %s\n", strings.Join(parts, ", "))
+	fmt.Println("Similar name only, not verified — may be a different project, or an older name for the same one.")
+}
+
+// printProjectNotes prints the one-line advisory when a filter matched more
+// than one stored project, so a blend is never silent.
+func printProjectNotes(res store.ProjectResolution) {
+	switch {
+	case res.Ambiguous:
+		fmt.Printf("--project %q matches %d projects: %s\n", res.Request, len(res.Matched), projectCounts(res.Matched, 3))
+	case res.Reason == store.ProjectReasonIdentity && len(res.Matched) > 1:
+		fmt.Printf("--project %q resolved through git identity to %d stored names: %s\n",
+			res.Request, len(res.Matched), projectCounts(res.Matched, 3))
+	}
+}
+
+// projectCounts renders "name (n sessions), ..." for at most max values.
+func projectCounts(stats []store.ProjectStat, max int) string {
+	parts := make([]string, 0, max+1)
+	for i, st := range stats {
+		if i == max {
+			parts = append(parts, fmt.Sprintf("+%d more", len(stats)-max))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s (%d sessions)", st.Project, st.Sessions))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func queryCmd(args []string) {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
 	dbPath := fs.String("db", defaultDB(), "DuckDB file")
-	project := fs.String("project", "", "filter by project path (substring match)")
+	projectName := fs.String("project", "", "filter by project: name, path, alias or git identity")
 	source := fs.String("source", "", "filter by source: codex|claude|cursor|muse|opencode|dsh")
 	limit := fs.Int("limit", 5, "max sessions")
 	perSession := fs.Int("hits", 3, "max matching messages shown per session")
@@ -721,22 +804,26 @@ func queryCmd(args []string) {
 	}
 	defer mem.Close()
 
+	filter, ok := resolveProjectFlag(mem, *projectName)
+	if !ok {
+		return
+	}
 	q := strings.Join(fs.Args(), " ")
-	results, related, err := mem.Recall(q, *project, *source, *limit, *perSession)
+	results, related, err := mem.Recall(q, filter, *source, *limit, *perSession)
 	if err != nil {
 		fatal(err)
 	}
 	scope := ""
-	if *project != "" {
-		scope += " in projects matching " + strconv.Quote(*project)
+	if *projectName != "" {
+		scope += " in projects matching " + strconv.Quote(*projectName)
 	}
 	if *source != "" {
 		scope += " from " + *source
 	}
 	if len(results) == 0 {
 		fmt.Printf("no matches for %q%s\n", q, scope)
-		if *project != "" {
-			if others, _, err := mem.Recall(q, "", *source, 5, 1); err == nil && len(others) > 0 {
+		if *projectName != "" {
+			if others, _, err := mem.Recall(q, store.ProjectFilter{}, *source, 5, 1); err == nil && len(others) > 0 {
 				var projects []string
 				seen := map[string]bool{}
 				for _, r := range others {
@@ -785,7 +872,7 @@ func queryCmd(args []string) {
 			words[i] = fmt.Sprintf("%s (%d)", t.Label, t.Weight)
 		}
 		fmt.Printf("Topic graph: often discussed with these words: %s\n", strings.Join(words, ", "))
-		fmt.Println("  Add one to the query to widen it, or map the area: duck-mem related " + projectFlag(*project) + related[0].Label)
+		fmt.Println("  Add one to the query to widen it, or map the area: duck-mem related " + projectFlag(*projectName) + related[0].Label)
 	}
 	top := results[0]
 	if len(top.Hits) > 0 {
