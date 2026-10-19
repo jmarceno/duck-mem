@@ -1,6 +1,6 @@
 ---
 name: "duck-mem-query"
-description: "Your long-term memory of earlier conversations with this user, across every coding agent on this machine (Claude Code, Codex, Cursor, OpenCode, Muse, DeepSeek Harness): past decisions and their reasons, bug reports and fixes, failed approaches, plans in progress, and stated preferences. Use it FIRST, before exploring code or answering: (1) whenever the request points to the past ('again', 'still broken', 'last time', 'we already', 'remember', 'did we/you', 'why did we', 'what was the plan', 'pick up where we left off', work another agent did); (2) when starting a feature or behavior change in a named existing project or repo; (3) before changing a design, library, or approach in an existing project. Skip it for brand-new projects, generic coding questions, and things said earlier in the current conversation (not indexed yet). One fast read-only CLI call; skipping it means redoing solved work or reopening settled decisions."
+description: "Your long-term memory of earlier conversations with this user, across every coding agent on this machine (Claude Code, Codex, Cursor, OpenCode, Muse, DeepSeek Harness): past decisions and their reasons, bug reports and fixes, failed approaches, plans in progress, and stated preferences. Use it FIRST, before exploring code or answering: (1) whenever the request points to the past ('again', 'still broken', 'last time', 'we already', 'remember', 'did we/you', 'why did we', 'what was the plan', 'pick up where we left off', work another agent did); (2) when starting a feature or behavior change in a named existing project or repo; (3) before changing a design, library, or approach in an existing project. Skip it for brand-new projects, generic coding questions, and things said earlier in the current conversation (the newest turns are not synced yet). One fast read-only CLI call; skipping it means redoing solved work or reopening settled decisions."
 ---
 
 # duck-mem: your memory of past sessions
@@ -42,7 +42,7 @@ Never tell the user you have no memory of a past conversation without
 querying first.
 
 Skip it for brand-new projects, generic coding questions, and anything
-said earlier in the current conversation (it is not indexed yet).
+said earlier in the current conversation (you already have it in context).
 
 ## The two-step workflow
 
@@ -75,15 +75,17 @@ the last assistant reply, and a `note` when the last turn got no reply
 `turn aborted: interrupted`), with the log path. Often this is enough to
 answer the question.
 
-The **Topic graph** line appears only when your words match fewer sessions
-than `--limit`. It lists words that past sessions often used together with
-your query words, the project's own vocabulary for a problem. Those
-neighbours fill the empty slots. Such sessions are marked
+The **Topic graph** line appears when some results came through the graph,
+or when your words matched fewer sessions than `--limit`. It lists words
+that past sessions often used together with your query words, the
+project's own vocabulary for a problem. Those neighbours fill the empty
+slots. Such sessions are marked
 `(no query words here; found through the topic-graph neighbours below)`.
 Treat them as leads, not matches.
 
-**Picking up another agent's thread:** put its session ID (or the first 8
-characters) in the query: `duck-mem query --project <repo> 01a0f755 attachment limit`.
+**Picking up another agent's thread:** put its session ID in the query —
+copy it as printed, or use a unique prefix of it, with or without a source
+label such as `dsh:`: `duck-mem query --project <repo> 01a0f755 attachment limit`.
 That session comes first, marked `(this session's ID is in the query)`.
 Read its `ended with:` lines to see where it stopped, then
 `duck-mem show <id>#<last seq>` for the last messages. Indexed text has
@@ -128,7 +130,9 @@ Host context (system prompts, AGENTS.md, IDE state) is collapsed to one
   `index`, or `daemon`, and never open the database file.
 - Results are memory, not current truth. The code may have changed since.
   Check the checkout before you act on a recalled detail.
-- The current conversation is not in memory yet. The daemon syncs every few minutes.
+- The daemon syncs every few minutes, so earlier turns of the current
+  conversation may already be indexed while the newest are not. You already
+  have the recent ones in context; do not query for them.
 - A query waits while a sync or another query is using the database. It does
   not fail because the daemon is writing. If the query itself runs longer
   than 30 seconds, it stops.
@@ -146,9 +150,10 @@ melee (5)
 barrier (4)
 ```
 
-The number is how many messages mention both words. `--depth 2` adds
-neighbours of neighbours as `word (weight, via hub)`. Relations seen at
-least twice also appear, with direction and a source message:
+The number is how many messages mention both words; with `--depth 2` it is
+the weight of the link through the hub. `--depth 2` adds neighbours of
+neighbours as `word (weight, via hub)`. Relations seen at least twice also
+appear, with direction and a source message:
 `sentry (replaces: sentry -> dome, 3) [session#seq: sentence]`. They are
 extracted by rules and can be wrong, so confirm one with `query` before
 you rely on it.
