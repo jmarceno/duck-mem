@@ -122,3 +122,35 @@ func TestProjectResolution(t *testing.T) {
 		t.Fatalf("stale path not reported: %+v", res)
 	}
 }
+
+// A rename takes the name an agent or the tray user types, which is usually
+// the directory's basename, and must not reach a sibling checkout of the
+// same remote.
+func TestRenameResolvesBasename(t *testing.T) {
+	db := openTemp(t)
+	addProject(t, db, "/home/u/Projects/gravaai", 3)
+	addProject(t, db, "/home/u/Projects/Recordly", 2)
+	addProject(t, db, "/home/u/Projects/dup", 1)
+	addProject(t, db, "/home/u/work/dup", 1)
+	for _, dir := range []string{"/home/u/Projects/gravaai", "/home/u/Projects/Recordly"} {
+		if err := db.SaveProjectIdentity(dir, project.GitIdentity{
+			RepoRoot: dir, CommonDir: dir + "/.git", Remote: "github.com/u/gravaai",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res, err := db.RenameProject("gravaai", "gravaai-archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Old != "/home/u/Projects/gravaai" || res.Sessions != 3 {
+		t.Fatalf("resolved %+v", res)
+	}
+	if res, err = db.RenameProject("recordly", "gravaai"); err != nil || res.Sessions != 2 {
+		t.Fatalf("sibling checkout was not left intact: %+v err=%v", res, err)
+	}
+	if _, err := db.RenameProject("dup", "x"); err == nil || !strings.Contains(err.Error(), "several") {
+		t.Fatalf("ambiguous basename was not refused: %v", err)
+	}
+}

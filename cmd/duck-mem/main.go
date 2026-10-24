@@ -652,24 +652,24 @@ func renameCmd(args []string) {
 		fatal(err)
 	}
 	defer mem.Close()
-	n, err := mem.RenameProject(names[0], names[1])
+	res, err := mem.RenameProject(names[0], names[1])
 	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("renamed %d sessions: %s -> %s\n", n, names[0], names[1])
+	fmt.Printf("renamed %d sessions: %s -> %s\n", res.Sessions, res.Old, res.New)
 }
 
 // performRename renames a project and folds the WAL back so the change is
 // durable even if the owning process keeps its connection open.
-func performRename(db *store.DB, old, new string) (int, error) {
-	n, err := db.RenameProject(old, new)
+func performRename(db *store.DB, old, new string) (store.RenameResult, error) {
+	res, err := db.RenameProject(old, new)
 	if err != nil {
-		return 0, err
+		return store.RenameResult{}, err
 	}
 	if err := db.Checkpoint(); err != nil {
-		return 0, err
+		return store.RenameResult{}, err
 	}
-	return n, nil
+	return res, nil
 }
 
 func relatedCmd(args []string) {

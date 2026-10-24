@@ -479,12 +479,12 @@ func TestRenameProject(t *testing.T) {
 		t.Fatal("expected error renaming onto an existing project")
 	}
 
-	n, err := db.RenameProject("/home/u/old", "/home/u/new")
+	res, err := db.RenameProject("/home/u/old", "/home/u/new")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 2 {
-		t.Fatalf("renamed %d sessions, want 2", n)
+	if res.Sessions != 2 {
+		t.Fatalf("renamed %d sessions, want 2", res.Sessions)
 	}
 	if _, err := db.RenameProject("/home/u/new", "/home/u/newer"); err != nil {
 		t.Fatal(err)

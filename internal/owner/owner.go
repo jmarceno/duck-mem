@@ -65,7 +65,7 @@ type IndexResult struct {
 type Handlers struct {
 	Ingest func(db *store.DB, roots []string) (IngestResult, error)
 	Index  func(db *store.DB, minDF int, full bool) (IndexResult, error)
-	Rename func(db *store.DB, old, new string) (int, error)
+	Rename func(db *store.DB, old, new string) (store.RenameResult, error)
 }
 
 type job struct {
@@ -74,7 +74,12 @@ type job struct {
 	// A repack job is handled by the worker itself: it closes the shared
 	// handle, rebuilds the file, and reopens before the next job runs.
 	repack *repackJob
-	out    chan result
+	// fresh reopens the handle after the job. After the graph tables are
+	// dropped and recreated, the next rewrite of them in the same DuckDB
+	// instance misreads its own ZSTD segments ("ZSTD Decompression
+	// failed"); a fresh handle, like a separate process, does not.
+	fresh bool
+	out   chan result
 }
 
 // repackJob is one repack request: an empty out swaps the live file.
@@ -211,7 +216,17 @@ func (o *Owner) Close() error {
 // after it starts; a write is not. Queue wait is not limited and is not
 // cancelled when the caller gives up.
 func (o *Owner) Do(kind Kind, fn func(context.Context, *store.DB) (any, error)) (any, error) {
-	j := job{kind: kind, fn: fn, out: make(chan result, 1)}
+	return o.run(job{kind: kind, fn: fn})
+}
+
+// doFresh runs a write that rebuilds the graph tables and reopens the
+// handle afterwards.
+func (o *Owner) doFresh(fn func(context.Context, *store.DB) (any, error)) (any, error) {
+	return o.run(job{kind: KindWrite, fn: fn, fresh: true})
+}
+
+func (o *Owner) run(j job) (any, error) {
+	j.out = make(chan result, 1)
 	o.jobs <- j
 	r := <-j.out
 	return r.val, r.err
@@ -274,6 +289,9 @@ func (o *Owner) loop() {
 		}
 		if j.kind == KindWrite {
 			o.observeWrite(err)
+		}
+		if j.fresh && o.db != nil {
+			o.reopen(errors.New("graph rebuild"))
 		}
 		j.out <- result{val, err}
 	}
@@ -472,15 +490,22 @@ func (o *Owner) dispatch(req request) response {
 		if o.handlers.Index == nil {
 			return response{Error: "index is not served by this process"}
 		}
-		val, err := o.Do(KindWrite, func(_ context.Context, db *store.DB) (any, error) {
+		index := func(_ context.Context, db *store.DB) (any, error) {
 			return o.handlers.Index(db, req.MinDF, req.Full)
-		})
+		}
+		var val any
+		var err error
+		if req.Full {
+			val, err = o.doFresh(index)
+		} else {
+			val, err = o.Do(KindWrite, index)
+		}
 		return payloadResponse(val, err)
 	case opRename:
 		if o.handlers.Rename == nil {
 			return response{Error: "rename is not served by this process"}
 		}
-		val, err := o.Do(KindWrite, func(_ context.Context, db *store.DB) (any, error) {
+		val, err := o.doFresh(func(_ context.Context, db *store.DB) (any, error) {
 			return o.handlers.Rename(db, req.OldProject, req.NewProject)
 		})
 		return payloadResponse(val, err)

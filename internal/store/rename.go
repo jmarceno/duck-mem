@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"fmt"
+	"strings"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 
@@ -25,33 +27,51 @@ func execOn(conn *duckdb.Conn, q string, args ...any) error {
 	return err
 }
 
-// RenameProject replaces the exact project name old with new in every table
-// that stores it (sessions, messages, checkpoints, and the topic graph) and
-// returns the number of sessions renamed. The target name must be unused, so
-// a rename never merges two projects. The graph rows are restaged under new
-// IDs because topic and edge IDs embed the project name.
-func (db *DB) RenameProject(old, new string) (int, error) {
-	if old == "" || new == "" {
-		return 0, fmt.Errorf("rename needs both a current and a new project name")
+// RenameResult reports a finished rename. Old is the stored name the
+// request resolved to, which may differ from what the caller typed.
+type RenameResult struct {
+	Sessions int    `json:"sessions"`
+	Old      string `json:"old"`
+	New      string `json:"new"`
+}
+
+// RenameProject replaces the project old with new in every table that stores
+// it (sessions, messages, checkpoints, and the topic graph). old resolves the
+// way --project does, minus the tiers that can select several projects: the
+// exact value ignoring case, a renamed alias, or a unique basename. The
+// target name must be unused, so a rename never merges two projects. The
+// graph rows are restaged under new IDs because topic and edge IDs embed the
+// project name.
+func (db *DB) RenameProject(request, new string) (RenameResult, error) {
+	new = project.Clean(new)
+	if strings.TrimSpace(request) == "" || new == "" {
+		return RenameResult{}, fmt.Errorf("rename needs both a current and a new project name")
+	}
+	old, err := db.renameSource(request)
+	if err != nil {
+		return RenameResult{}, err
 	}
 	if old == new {
-		return 0, fmt.Errorf("current and new project names are the same")
+		return RenameResult{}, fmt.Errorf("current and new project names are the same")
 	}
 	var n int
 	if err := db.sql.QueryRow(`SELECT count(*) FROM sessions WHERE project=?`, old).Scan(&n); err != nil {
-		return 0, err
+		return RenameResult{}, err
 	}
 	if n == 0 {
-		return 0, fmt.Errorf("no project named %q", old)
+		return RenameResult{}, fmt.Errorf("no project named %q", request)
 	}
+	// Matching folds case, so a name differing only in case is taken too;
+	// changing the case of the project itself is allowed.
 	var m int
-	if err := db.sql.QueryRow(`SELECT count(*) FROM sessions WHERE project=?`, new).Scan(&m); err != nil {
-		return 0, err
+	if err := db.sql.QueryRow(`SELECT count(*) FROM sessions WHERE lower(project)=lower(?) AND project<>?`, new, old).Scan(&m); err != nil {
+		return RenameResult{}, err
 	}
 	if m > 0 {
-		return 0, fmt.Errorf("a project named %q already exists; a rename would merge them", new)
+		return RenameResult{}, fmt.Errorf("a project named %q already exists; a rename would merge them", new)
 	}
-	return n, db.withTx(func(conn *duckdb.Conn) error {
+	res := RenameResult{Sessions: n, Old: old, New: new}
+	return res, db.withTx(func(conn *duckdb.Conn) error {
 		// Plain tables store the project as a value.
 		for _, q := range []string{
 			`UPDATE sessions SET project=? WHERE project=?`,
@@ -67,7 +87,7 @@ func (db *DB) RenameProject(old, new string) (int, error) {
 			}
 		}
 		// Sources keep reporting the original name; remember where it went.
-		if err := execOn(conn, `DELETE FROM project_aliases WHERE old_name=?`, new); err != nil {
+		if err := execOn(conn, `DELETE FROM project_aliases WHERE lower(old_name)=lower(?)`, new); err != nil {
 			return err
 		}
 		if err := execOn(conn, `INSERT INTO project_aliases(old_name, new_name) VALUES(?, ?)
@@ -142,6 +162,64 @@ func (db *DB) RenameProject(old, new string) (int, error) {
 		}
 		return ensurePropertyGraphConn(conn, false)
 	})
+}
+
+// renameSource resolves the name a rename was asked for to exactly one
+// stored project, or explains why it cannot.
+func (db *DB) renameSource(request string) (string, error) {
+	ctx := context.Background()
+	stats, err := db.ProjectStats(ctx)
+	if err != nil {
+		return "", err
+	}
+	aliases, err := db.projectAliases(ctx)
+	if err != nil {
+		return "", err
+	}
+	clean := project.Clean(request)
+	exact := func(name string) []ProjectStat {
+		var out []ProjectStat
+		for _, st := range stats {
+			if project.Fold(project.Clean(st.Project)) == project.Fold(project.Clean(name)) {
+				out = append(out, st)
+			}
+		}
+		return out
+	}
+	matched := exact(clean)
+	if len(matched) == 0 {
+		if target, ok := resolveAlias(clean, aliases); ok {
+			matched = exact(target)
+		}
+	}
+	if len(matched) == 0 {
+		matched = matchBasename(clean, stats)
+	}
+	// Several stored values: prefer the one spelled exactly as asked.
+	if len(matched) > 1 {
+		for _, st := range matched {
+			if st.Project == clean {
+				return st.Project, nil
+			}
+		}
+	}
+	switch len(matched) {
+	case 1:
+		return matched[0].Project, nil
+	case 0:
+		msg := fmt.Sprintf("no project named %q", request)
+		if c := projectCandidates(clean, stats, 3); len(c) > 0 {
+			names := make([]string, len(c))
+			for i, cand := range c {
+				names[i] = cand.Project
+			}
+			msg += "; did you mean " + strings.Join(names, ", ") + "?"
+		}
+		return "", errors.New(msg)
+	default:
+		names := projectValues(matched)
+		return "", fmt.Errorf("%q matches several projects (%s); pass the full name", request, strings.Join(names, ", "))
+	}
 }
 
 // ResolveProject returns the current name of a project that sources still

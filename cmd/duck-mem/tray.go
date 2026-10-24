@@ -492,9 +492,12 @@ func (a *trayApp) ingestNow() {
 
 // renameProject asks for the current and new names, confirms twice, then
 // runs the rename. The rename is a write job on the daemon, so it is
-// serialized with ingest: no data is ingested while it runs.
+// serialized with ingest: no data is ingested while it runs. The busy state
+// ends before the result dialog, so an unanswered dialog cannot leave the
+// menu reporting a rename that already finished.
 func (a *trayApp) renameProject() {
-	defer a.endAction()
+	end := sync.OnceFunc(a.endAction)
+	defer end()
 	old, ok := zenityEntry("Rename project", "Current project name:", "")
 	if !ok || old == "" {
 		return
@@ -517,6 +520,7 @@ func (a *trayApp) renameProject() {
 	}
 	cmd := exec.Command(self, "rename", old, newName)
 	raw, err := cmd.CombinedOutput()
+	end()
 	out := strings.TrimSpace(string(raw))
 	if err != nil {
 		log.Printf("rename project: %v: %s", err, out)

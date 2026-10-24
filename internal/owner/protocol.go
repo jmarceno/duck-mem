@@ -153,8 +153,8 @@ func (c *Client) Index(minDF int, full bool) (IndexResult, error) {
 
 // RenameProject asks the owner to rename a project. It runs as a write job,
 // so it is serialized with ingest cycles.
-func (c *Client) RenameProject(old, new string) (int, error) {
-	var out int
+func (c *Client) RenameProject(old, new string) (store.RenameResult, error) {
+	var out store.RenameResult
 	err := c.roundTrip(request{Op: opRename, OldProject: old, NewProject: new}, &out)
 	return out, err
 }
