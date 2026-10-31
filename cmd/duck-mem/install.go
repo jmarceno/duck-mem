@@ -23,10 +23,18 @@ func userHome() string {
 	return home
 }
 
-func binPath() string   { return filepath.Join(userHome(), ".local", "bin", "duck-mem") }
-func unitDir() string   { return filepath.Join(userHome(), ".config", "systemd", "user") }
-func dataDir() string   { return filepath.Join(userHome(), ".local", "share", "duck-mem") }
-func configDir() string { return filepath.Join(userHome(), ".config", "duck-mem") }
+func binPath() string { return filepath.Join(userHome(), ".local", "bin", "duck-mem") }
+func unitDir() string { return filepath.Join(userHome(), ".config", "systemd", "user") }
+func dataDir() string { return filepath.Join(userHome(), ".local", "share", "duck-mem") }
+
+// databaseDesc names what uninstall would delete: the relocated file when
+// one was recorded, the stock data directory otherwise.
+func databaseDesc() string {
+	if custom := configuredDB(); custom != "" {
+		return custom
+	}
+	return dataDir()
+}
 
 func daemonUnit() string {
 	return unitMarker + `[Unit]
@@ -233,6 +241,14 @@ func uninstallUser(args []string) error {
 				return err
 			}
 		}
+		if custom := configuredDB(); custom != "" {
+			if err := os.Remove(custom); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			for _, suffix := range []string{".wal", ".sock", ".owner"} {
+				_ = os.Remove(custom + suffix)
+			}
+		}
 		fmt.Println("Uninstalled duck-mem and deleted its database, config, and sync status.")
 	} else {
 		fmt.Println("Uninstalled duck-mem; kept its database, config, and sync status.")
@@ -241,7 +257,8 @@ func uninstallUser(args []string) error {
 }
 
 func askPurge(in io.Reader, out io.Writer) (bool, error) {
-	fmt.Fprintf(out, "Remove duck-mem database (%s), config (%s), and sync status (%s)? [y/N]: ", dataDir(), configDir(), stateDir())
+	fmt.Fprintf(out, "Remove duck-mem database (%s), config (%s), and sync status (%s)? [y/N]: ",
+		databaseDesc(), configDir(), stateDir())
 	line, err := bufio.NewReader(in).ReadString('\n')
 	if err != nil && err != io.EOF {
 		return false, err

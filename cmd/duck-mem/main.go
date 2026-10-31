@@ -49,7 +49,12 @@ func isSnapshotStore(kind ingest.Kind) bool {
 	return ok
 }
 
+// defaultDB is the database every command and service uses: the location
+// recorded by relocate when there is one, the stock path otherwise.
 func defaultDB() string {
+	if custom := configuredDB(); custom != "" {
+		return custom
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".local", "share", "duck-mem", "memory.duckdb")
 }
@@ -86,6 +91,8 @@ func main() {
 		daemonCmd(os.Args[2:])
 	case "repack":
 		repackCmd(os.Args[2:])
+	case "relocate":
+		relocateCmd(os.Args[2:])
 	case "rename":
 		renameCmd(os.Args[2:])
 	case "projects":
@@ -112,6 +119,11 @@ func usage() {
   duck-mem repack [--db PATH] [--out PATH]
                                          rebuild the database file and reclaim unused
                                          space; without --out it swaps in place
+  duck-mem relocate [--db PATH] <new-path>
+                                         copy the database to a new location, verify the
+                                         copy with a smoke run, then optionally move the
+                                         old file to the trash; with no database yet it
+                                         only records the location every command then uses
   duck-mem rename [--db PATH] <current-name> <new-name>
                                          rename a project: replace its exact name in all stored
                                          data and refresh the indexes; the new name must be unused

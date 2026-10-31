@@ -104,6 +104,10 @@ duck-mem daemon [--db PATH] [--interval 5m] [ROOT...]
 duck-mem repack [--db PATH] [--out PATH]
                                         rebuild the file and reclaim unused space;
                                         without --out it swaps in place
+duck-mem relocate [--db PATH] <new-path>
+                                        copy the database to a new location, verify
+                                        the copy with a smoke run, then optionally move
+                                        the old file to the trash
 duck-mem projects [--db PATH]
                                         list stored projects, session counts, aliases
                                         and captured git identity
@@ -112,6 +116,19 @@ duck-mem projects [--db PATH]
 Flags may come before or after the text. The database defaults to
 `~/.local/share/duck-mem/memory.duckdb`; because it is a plain DuckDB file you
 can also open it with the DuckDB CLI or any DuckDB client.
+
+### Moving the database
+
+`duck-mem relocate <new-path>` chooses where the database lives — every
+command and the installed services follow the recorded location, no `--db`
+needed. On a machine with no database yet it only records the location; the
+file is created there on the first ingest. When a database already exists it
+is copied to the new path, the copy is verified table by table and opened for
+a smoke run, and only then are you asked whether the old file should go to
+the trash — never a permanent deletion, and `n` (the default) keeps it where
+it was. If the copy or the smoke run fails, the old database stays exactly
+where it was. The indexer is stopped for the move and restarted on the new
+location.
 
 ### Search
 
