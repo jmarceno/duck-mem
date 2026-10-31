@@ -29,6 +29,25 @@ import (
 // parserVersion 2 records failed and aborted turns as notes.
 const parserVersion = 2
 const openCodeParserVersion = 1
+const zCodeParserVersion = 1
+
+// snapshotIngestor picks the live-SQLite reader and its parser version.
+func snapshotIngestor(kind ingest.Kind) (read func(string) ([]ingest.Snapshot, error), version int, ok bool) {
+	switch kind {
+	case ingest.KindOpenCode:
+		return ingest.IngestOpenCode, openCodeParserVersion, true
+	case ingest.KindZCode:
+		return ingest.IngestZCode, zCodeParserVersion, true
+	}
+	return nil, 0, false
+}
+
+// isSnapshotStore reports whether the kind is a live SQLite store read whole
+// per cycle instead of per-file.
+func isSnapshotStore(kind ingest.Kind) bool {
+	_, _, ok := snapshotIngestor(kind)
+	return ok
+}
 
 func defaultDB() string {
 	home, _ := os.UserHomeDir()
@@ -331,8 +350,8 @@ func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files
 				entry.Lines += previous.Lines
 				entries[key] = entry
 			}()
-			if ingest.Classify(f) == ingest.KindOpenCode {
-				sessions, messages, err := ingestOpenCode(db, f, identities)
+			if kind := ingest.Classify(f); isSnapshotStore(kind) {
+				sessions, messages, err := ingestSnapshotStore(db, f, kind, identities)
 				entry.Sessions, entry.Lines = sessions, messages
 				nSess += sessions
 				nMsg += messages
@@ -479,7 +498,10 @@ func applyProjectAlias(db *store.DB, sess *store.Session, msgs []store.Message) 
 	return nil
 }
 
-func ingestOpenCode(db *store.DB, path string, identities *identityRecorder) (int, int, error) {
+// ingestSnapshotStore re-reads a live SQLite store (OpenCode, ZCode) whole on
+// every cycle, skipping the work when neither the database nor its WAL changed.
+func ingestSnapshotStore(db *store.DB, path string, kind ingest.Kind, identities *identityRecorder) (int, int, error) {
+	read, parserVersion, _ := snapshotIngestor(kind)
 	before, err := sqliteState(path)
 	if err != nil {
 		return 0, 0, err
@@ -488,12 +510,12 @@ func ingestOpenCode(db *store.DB, path string, identities *identityRecorder) (in
 	if err != nil {
 		return 0, 0, &syncDatabaseError{err}
 	}
-	if checkpoint != nil && checkpoint.ParserVersion == openCodeParserVersion &&
+	if checkpoint != nil && checkpoint.ParserVersion == parserVersion &&
 		checkpoint.Size == before.Size && checkpoint.ModTimeNS == before.ModTimeNS &&
 		checkpoint.TailHash == before.TailHash {
 		return 0, 0, nil
 	}
-	sessions, err := ingest.IngestOpenCode(path)
+	sessions, err := read(path)
 	if err != nil {
 		if errors.Is(err, ingest.ErrUnexpectedFormat) {
 			return 0, 0, err
@@ -520,7 +542,7 @@ func ingestOpenCode(db *store.DB, path string, identities *identityRecorder) (in
 		return completed, count, err
 	}
 	if err == nil && before.Size == after.Size && before.ModTimeNS == after.ModTimeNS && before.TailHash == after.TailHash {
-		after.ParserVersion = openCodeParserVersion
+		after.ParserVersion = parserVersion
 		if err := db.SaveCheckpoint(after); err != nil {
 			return completed, count, &syncDatabaseError{err}
 		}
@@ -529,8 +551,8 @@ func ingestOpenCode(db *store.DB, path string, identities *identityRecorder) (in
 }
 
 func loadSessionCopy(s store.Session) (store.Session, []store.Message, error) {
-	if ingest.Classify(s.Path) == ingest.KindOpenCode {
-		sessions, err := ingest.IngestOpenCode(s.Path)
+	if read, _, ok := snapshotIngestor(ingest.Classify(s.Path)); ok {
+		sessions, err := read(s.Path)
 		if err != nil {
 			return s, nil, err
 		}
@@ -787,7 +809,7 @@ func queryCmd(args []string) {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
 	dbPath := fs.String("db", defaultDB(), "DuckDB file")
 	projectName := fs.String("project", "", "filter by project: name, path, alias or git identity")
-	source := fs.String("source", "", "filter by source: codex|claude|cursor|muse|opencode|dsh")
+	source := fs.String("source", "", "filter by source: codex|claude|cursor|muse|opencode|dsh|zcode")
 	limit := fs.Int("limit", 5, "max sessions")
 	perSession := fs.Int("hits", 3, "max matching messages shown per session")
 	known := map[string]bool{"--db": true, "--project": true, "--source": true, "--limit": true, "--hits": true}

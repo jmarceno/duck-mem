@@ -37,7 +37,14 @@ const (
 	KindCursorPlan
 	KindOpenCode
 	KindDSH
+	KindZCode
 )
+
+// Snapshot is one conversation from a live SQLite store (OpenCode, ZCode).
+type Snapshot struct {
+	Session  store.Session
+	Messages []store.Message
+}
 
 // Classify picks the parser from the file path.
 func Classify(path string) Kind {
@@ -46,6 +53,8 @@ func Classify(path string) Kind {
 		return KindCursorPlan
 	case filepath.Base(path) == "opencode.db":
 		return KindOpenCode
+	case strings.Contains(path, "/.zcode/") && filepath.Base(path) == "db.sqlite":
+		return KindZCode
 	case strings.Contains(path, "/.dsh/sessions/") && strings.HasSuffix(path, ".jsonl.zstd"):
 		return KindDSH
 	case strings.Contains(path, "/agent-transcripts/") && strings.HasSuffix(path, ".jsonl"):
@@ -70,6 +79,7 @@ func DefaultRoots(home string) []string {
 		filepath.Join(home, ".cursor", "projects"),
 		filepath.Join(home, ".cursor", "plans"),
 		filepath.Join(home, ".local", "share", "opencode", "opencode.db"),
+		filepath.Join(home, ".zcode", "cli", "db", "db.sqlite"),
 		filepath.Join(home, ".dsh", "sessions"),
 	}
 }

@@ -6,9 +6,9 @@
 
 <p align="center">
   <b>Give your coding agents a memory they can actually search.</b><br>
-  Every Codex, Claude, Cursor, Muse, OpenCode and DeepSeek Harness session
-  lands in one DuckDB file — conversations only, no tool noise — and becomes a
-  search index your agent can query from the terminal.
+  Every Codex, Claude, Cursor, Muse, OpenCode, DeepSeek Harness and ZCode
+  session lands in one DuckDB file — conversations only, no tool noise — and
+  becomes a search index your agent can query from the terminal.
 </p>
 
 <p align="center">
@@ -40,9 +40,10 @@ Your agents forget everything between sessions, and the raw logs they forget
 with are full of tool calls, environment dumps and half-finished reasoning.
 duck-mem turns those logs into something searchable:
 
-- **One store, six agents.** Codex, Claude, Cursor, Muse, OpenCode and
-  DeepSeek Harness sessions are parsed into a single DuckDB file. Nothing is
-  copied out of the original agent directories, and the stores are read-only.
+- **One store, seven agents.** Codex, Claude, Cursor, Muse, OpenCode,
+  DeepSeek Harness and ZCode sessions are parsed into a single DuckDB file.
+  Nothing is copied out of the original agent directories, and the stores are
+  read-only.
 - **Conversations, not transcripts.** Tool calls, tool output, reasoning blocks
   and metadata are dropped. You keep the prompts, the answers and the text that
   actually explained the work.
@@ -83,8 +84,8 @@ duck-mem --uninstall --keep-data     # noninteractive, keeps the database
 duck-mem --uninstall --purge-data    # also deletes duck-mem data and config
 ```
 
-Uninstalling never touches your Codex, Claude, Cursor, Muse, OpenCode or
-DeepSeek Harness session stores.
+Uninstalling never touches your Codex, Claude, Cursor, Muse, OpenCode,
+DeepSeek Harness or ZCode session stores.
 
 ## Usage
 
@@ -297,6 +298,7 @@ services stopped, and the tray menu offers the same in-place repack.
 | Cursor | `~/.cursor/projects/*/agent-transcripts/*/*.jsonl`, `~/.cursor/plans/*.plan.md` | workspace storage `workspace.json` |
 | Muse | `~/.local/share/muse/sessions/**/session.jsonl` | route facts / workspace root |
 | OpenCode | `~/.local/share/opencode/opencode.db` (read-only, including WAL) | `session_v2.directory`, else the worktree |
+| ZCode | `~/.zcode/cli/db/db.sqlite` (read-only, including WAL) | `session.directory` |
 | DeepSeek Harness | `~/.dsh/sessions/*/*/session.v4.jsonl.zstd` (zstd, read-only) | session header `cwd` |
 
 Project values are normalized when they are parsed (`filepath.Clean`-style:
@@ -307,8 +309,11 @@ Kept: user prompts, assistant text, system and developer text. Dropped
 everywhere: tool calls, tool outputs, reasoning and thinking blocks,
 environment snapshots, queue and metadata records. A Cursor plan file is
 imported whole as a single note, and OpenCode child sessions are imported
-alongside their parents. Cursor transcripts whose project cannot be resolved
-stay under `cursor:<slug>` rather than being given an invented path.
+alongside their parents. ZCode subagent sessions are imported the same way:
+their reports reach the main conversation only as tool output, which is
+dropped, so the subagent rows are the only place that content is kept. Cursor
+transcripts whose project cannot be resolved stay under `cursor:<slug>` rather
+than being given an invented path.
 
 DeepSeek Harness session files are zstd-compressed event logs, decompressed as
 they are read. The one source of system text it does not contribute is its own

@@ -14,15 +14,9 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
-// OpenCodeSession is one conversation from OpenCode's multi-session SQLite store.
-type OpenCodeSession struct {
-	Session  store.Session
-	Messages []store.Message
-}
-
-// IngestOpenCode reads a consistent snapshot of OpenCode's live database.
-// Only visible text fields are decoded; tool and reasoning parts are excluded.
-func IngestOpenCode(path string) ([]OpenCodeSession, error) {
+// snapshotTx opens a live SQLite store read-only and starts a transaction so
+// the whole file is read as one consistent snapshot.
+func snapshotTx(path, source string) (*sql.DB, *sql.Tx, error) {
 	u := url.URL{Scheme: "file", Path: path}
 	q := u.Query()
 	q.Set("mode", "ro")
@@ -30,14 +24,25 @@ func IngestOpenCode(path string) ([]OpenCodeSession, error) {
 	u.RawQuery = q.Encode()
 	db, err := sql.Open("sqlite3", u.String())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer db.Close()
 	db.SetMaxOpenConns(1)
 	tx, err := db.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("open OpenCode snapshot: %w", err)
+		db.Close()
+		return nil, nil, fmt.Errorf("open %s snapshot: %w", source, err)
 	}
+	return db, tx, nil
+}
+
+// IngestOpenCode reads a consistent snapshot of OpenCode's live database.
+// Only visible text fields are decoded; tool and reasoning parts are excluded.
+func IngestOpenCode(path string) ([]Snapshot, error) {
+	db, tx, err := snapshotTx(path, "OpenCode")
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
 	defer tx.Rollback()
 
 	rows, err := tx.Query(`SELECT s.id, COALESCE(NULLIF(s.directory, ''), p.worktree, ''), s.time_created
@@ -45,7 +50,7 @@ func IngestOpenCode(path string) ([]OpenCodeSession, error) {
 	if err != nil {
 		return nil, openCodeReadError("read OpenCode sessions", err)
 	}
-	var sessions []OpenCodeSession
+	var sessions []Snapshot
 	for rows.Next() {
 		var id, dir string
 		var created int64
@@ -53,7 +58,7 @@ func IngestOpenCode(path string) ([]OpenCodeSession, error) {
 			rows.Close()
 			return nil, err
 		}
-		sessions = append(sessions, OpenCodeSession{Session: store.Session{
+		sessions = append(sessions, Snapshot{Session: store.Session{
 			ID: "opencode:" + id, Source: "opencode", Project: project.Clean(dir),
 			Path: path, StartedAt: sqliteTime(created),
 		}})
