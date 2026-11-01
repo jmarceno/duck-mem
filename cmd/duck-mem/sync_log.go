@@ -1,11 +1,14 @@
 package main
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jmarceno/duck-mem/internal/ingest"
@@ -45,6 +48,87 @@ func appendSyncLog(entry syncLogEntry) error {
 		err = errors.Join(err, markerErr)
 	}
 	return errors.Join(err, closeErr)
+}
+
+// logRetentionMonths bounds the gzipped history kept by rotateSyncLogs.
+const logRetentionMonths = 3
+
+// rotateSyncLogs keeps only the current month's log as plain text: every
+// older monthly log is gzipped into a single file, and gzipped months
+// older than the retention window are deleted as time goes on.
+func rotateSyncLogs() error {
+	now := time.Now().UTC()
+	month := now.Format("2006-01")
+	cutoff := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -logRetentionMonths, 0)
+	plain, err := filepath.Glob(filepath.Join(logDir(), "*.jsonl"))
+	if err != nil {
+		return err
+	}
+	for _, p := range plain {
+		label := strings.TrimSuffix(filepath.Base(p), ".jsonl")
+		if _, ok := parseLogMonth(label); !ok || label == month {
+			continue
+		}
+		gz := p + ".gz"
+		if _, statErr := os.Stat(gz); os.IsNotExist(statErr) {
+			if err := gzipFile(p, gz); err != nil {
+				return err
+			}
+		}
+		// The compressed copy exists, so the plain file is redundant.
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	archives, err := filepath.Glob(filepath.Join(logDir(), "*.jsonl.gz"))
+	if err != nil {
+		return err
+	}
+	for _, p := range archives {
+		label := strings.TrimSuffix(filepath.Base(p), ".jsonl.gz")
+		m, ok := parseLogMonth(label)
+		if !ok || !m.Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseLogMonth(label string) (time.Time, bool) {
+	t, err := time.Parse("2006-01", label)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+func gzipFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	gz := gzip.NewWriter(out)
+	_, err = io.Copy(gz, in)
+	if err == nil {
+		err = gz.Close()
+	}
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 func logSyncFailure(harness, reason string, err error) {

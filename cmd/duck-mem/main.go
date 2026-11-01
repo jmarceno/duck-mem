@@ -192,6 +192,9 @@ func ingestCmd(args []string) {
 	}
 	fmt.Printf("files=%d sessions=%d messages=%d skipped=%d blocked=%d db=%s\n", res.Files, res.Sessions, res.Messages, res.Skipped, res.Blocked, *dbPath)
 	fmt.Printf("index: +%d messages, +%d pairs\n", res.NewMsgs, res.NewPairs)
+	if err := rotateSyncLogs(); err != nil {
+		logSyncFailure("all", "Other", fmt.Errorf("log rotation: %w", err))
+	}
 }
 
 func daemonCmd(args []string) {
@@ -272,6 +275,9 @@ func performCycle(db *store.DB, dbPath string, roots []string) (owner.IngestResu
 		return owner.IngestResult{}, err
 	}
 	files, nSess, nMsg, nSkip, nBlocked := runCycle(db, roots, newIdentityRecorder(db))
+	if err := rotateSyncLogs(); err != nil {
+		logSyncFailure("all", "Other", fmt.Errorf("log rotation: %w", err))
+	}
 	copies, err := db.SuppressSessionCopies()
 	if err != nil {
 		return owner.IngestResult{}, err

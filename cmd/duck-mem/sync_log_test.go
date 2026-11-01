@@ -1,12 +1,67 @@
 package main
 
 import (
+	"compress/gzip"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestRotateSyncLogsKeepsCurrentMonthAndPrunesOldArchives(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(logDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	month := func(offset int) string { return now.AddDate(0, offset, 0).Format("2006-01") }
+	write := func(name, body string) string {
+		p := filepath.Join(logDir(), name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	current := write(month(0)+".jsonl", "current\n")
+	previous := write(month(-1)+".jsonl", "previous\n")
+	write(month(-2)+".jsonl.gz", "recent archive\n")
+	stale := write(month(-logRetentionMonths-1)+".jsonl.gz", "stale archive\n")
+	if err := rotateSyncLogs(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(current); err != nil {
+		t.Fatalf("current log removed: %v", err)
+	}
+	if _, err := os.Stat(previous); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("previous month left uncompressed")
+	}
+	f, err := os.Open(filepath.Join(logDir(), month(-1)+".jsonl.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "previous\n" {
+		t.Fatalf("rotated content: %q", body)
+	}
+	if _, err := os.Stat(filepath.Join(logDir(), month(-2)+".jsonl.gz")); err != nil {
+		t.Fatal("archive inside retention removed")
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("archive older than retention kept")
+	}
+}
 
 func TestCleanCycleClearsFailureOnlyWhenNothingWasSkipped(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
