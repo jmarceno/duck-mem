@@ -26,10 +26,12 @@ import (
 	"github.com/jmarceno/duck-mem/internal/store"
 )
 
-// parserVersion 2 records failed and aborted turns as notes.
-const parserVersion = 2
-const openCodeParserVersion = 1
-const zCodeParserVersion = 1
+// parserVersion 2 records failed and aborted turns as notes. Version 3
+// enforces the privacy tags (private, noingest, noduck), so every stored
+// session is re-parsed once and any opened with a tag is purged.
+const parserVersion = 3
+const openCodeParserVersion = 2
+const zCodeParserVersion = 2
 
 // snapshotIngestor picks the live-SQLite reader and its parser version.
 func snapshotIngestor(kind ingest.Kind) (read func(string) ([]ingest.Snapshot, error), version int, ok bool) {
@@ -188,7 +190,7 @@ func ingestCmd(args []string) {
 		logSyncFailure("all", "Database error", err)
 		fatal(err)
 	}
-	fmt.Printf("files=%d sessions=%d messages=%d skipped=%d db=%s\n", res.Files, res.Sessions, res.Messages, res.Skipped, *dbPath)
+	fmt.Printf("files=%d sessions=%d messages=%d skipped=%d blocked=%d db=%s\n", res.Files, res.Sessions, res.Messages, res.Skipped, res.Blocked, *dbPath)
 	fmt.Printf("index: +%d messages, +%d pairs\n", res.NewMsgs, res.NewPairs)
 }
 
@@ -248,8 +250,8 @@ func daemonCmd(args []string) {
 			return
 		}
 		res := val.(owner.IngestResult)
-		fmt.Printf("%s cycle=%d files=%d sessions=%d messages=%d skipped=%d indexed=+%d pairs=+%d\n",
-			time.Now().UTC().Format(time.RFC3339), n, res.Files, res.Sessions, res.Messages, res.Skipped, res.NewMsgs, res.NewPairs)
+		fmt.Printf("%s cycle=%d files=%d sessions=%d messages=%d skipped=%d blocked=%d indexed=+%d pairs=+%d\n",
+			time.Now().UTC().Format(time.RFC3339), n, res.Files, res.Sessions, res.Messages, res.Skipped, res.Blocked, res.NewMsgs, res.NewPairs)
 	}
 	cycle(0)
 	ticker := time.NewTicker(interval)
@@ -269,7 +271,7 @@ func performCycle(db *store.DB, dbPath string, roots []string) (owner.IngestResu
 	if err := db.PrepareSessionCopies(); err != nil {
 		return owner.IngestResult{}, err
 	}
-	files, nSess, nMsg, nSkip := runCycle(db, roots, newIdentityRecorder(db))
+	files, nSess, nMsg, nSkip, nBlocked := runCycle(db, roots, newIdentityRecorder(db))
 	copies, err := db.SuppressSessionCopies()
 	if err != nil {
 		return owner.IngestResult{}, err
@@ -287,7 +289,7 @@ func performCycle(db *store.DB, dbPath string, roots []string) (owner.IngestResu
 	if err := acknowledgeCleanCycle(nSkip); err != nil {
 		logSyncFailure("all", "Other", err)
 	}
-	status := syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip}
+	status := syncStatus{CompletedAt: time.Now(), Files: files, Skipped: nSkip, Blocked: nBlocked}
 	if sessions, _, err := db.Count(); err != nil {
 		logSyncFailure("all", "Other", err)
 		fmt.Fprintln(os.Stderr, "session count:", err)
@@ -300,7 +302,7 @@ func performCycle(db *store.DB, dbPath string, roots []string) (owner.IngestResu
 		fmt.Fprintln(os.Stderr, "sync status:", err)
 	}
 	return owner.IngestResult{
-		Files: files, Sessions: nSess, Messages: nMsg, Skipped: nSkip,
+		Files: files, Sessions: nSess, Messages: nMsg, Skipped: nSkip, Blocked: nBlocked,
 		NewMsgs: newMsgs, NewPairs: newPairs,
 	}, nil
 }
@@ -327,7 +329,8 @@ func performIndex(db *store.DB, minDF int, full bool) (owner.IndexResult, error)
 
 // runCycle skips unchanged files and reads only the appended bytes of
 // append-only JSONL files. Rewrites take the full reconciliation path.
-func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files, nSess, nMsg, nSkip int) {
+// nBlocked counts sessions kept out of memory by privacy tags.
+func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files, nSess, nMsg, nSkip, nBlocked int) {
 	cursorProjects := map[string]map[string]string{}
 	entries := map[string]syncLogEntry{}
 	defer func() {
@@ -363,10 +366,11 @@ func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files
 				entries[key] = entry
 			}()
 			if kind := ingest.Classify(f); isSnapshotStore(kind) {
-				sessions, messages, err := ingestSnapshotStore(db, f, kind, identities)
+				sessions, messages, blocked, err := ingestSnapshotStore(db, f, kind, identities)
 				entry.Sessions, entry.Lines = sessions, messages
 				nSess += sessions
 				nMsg += messages
+				nBlocked += blocked
 				if err != nil {
 					failure, reason = err, extractionReason(err)
 					var dbErr *syncDatabaseError
@@ -462,6 +466,47 @@ func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files
 				nSkip++
 				return
 			}
+			// A session whose first user prompt opens with a privacy tag,
+			// and one already marked, never enters memory: purge rows an
+			// older parser left, mark it, and checkpoint the file so no
+			// later cycle re-reads it. The appended path cannot newly
+			// exclude: the opening prompt lives in the already-parsed prefix.
+			tag := ingest.ExclusionTag(msgs)
+			if tag == "" {
+				marked, err := db.IsNoIngest(sess.ID)
+				if err != nil {
+					failure = err
+					nSkip++
+					return
+				}
+				if marked {
+					tag = "marked"
+				}
+			}
+			if tag != "" {
+				reason = "Database error"
+				if err := db.PurgeSession(sess.ID); err != nil {
+					failure = err
+					nSkip++
+					return
+				}
+				if err := db.MarkNoIngest(sess, tag); err != nil {
+					failure = err
+					nSkip++
+					return
+				}
+				state, err := fileState(f)
+				if err == nil && state.Size == info.Size() && state.ModTimeNS == info.ModTime().UnixNano() {
+					state.SessionID, state.Project, state.ParserVersion = sess.ID, sess.Project, parserVersion
+					if err := db.SaveCheckpoint(state); err != nil {
+						failure = err
+						nSkip++
+					}
+				}
+				entry.Result, entry.Reason, entry.Detail, entry.Path = "no_ingest", tag, tag, f
+				nBlocked++
+				return
+			}
 			reason = "Database error"
 			rawProject := sess.Project
 			err = applyProjectAlias(db, &sess, msgs)
@@ -494,7 +539,7 @@ func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files
 			nMsg += len(msgs)
 		}()
 	}
-	return files, nSess, nMsg, nSkip
+	return files, nSess, nMsg, nSkip, nBlocked
 }
 
 // applyProjectAlias files a parsed session under its renamed project.
@@ -512,54 +557,76 @@ func applyProjectAlias(db *store.DB, sess *store.Session, msgs []store.Message) 
 
 // ingestSnapshotStore re-reads a live SQLite store (OpenCode, ZCode) whole on
 // every cycle, skipping the work when neither the database nor its WAL changed.
-func ingestSnapshotStore(db *store.DB, path string, kind ingest.Kind, identities *identityRecorder) (int, int, error) {
+// It returns the sessions and messages ingested plus the sessions blocked by
+// a privacy tag.
+func ingestSnapshotStore(db *store.DB, path string, kind ingest.Kind, identities *identityRecorder) (int, int, int, error) {
 	read, parserVersion, _ := snapshotIngestor(kind)
 	before, err := sqliteState(path)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	checkpoint, err := db.GetCheckpoint(path)
 	if err != nil {
-		return 0, 0, &syncDatabaseError{err}
+		return 0, 0, 0, &syncDatabaseError{err}
 	}
 	if checkpoint != nil && checkpoint.ParserVersion == parserVersion &&
 		checkpoint.Size == before.Size && checkpoint.ModTimeNS == before.ModTimeNS &&
 		checkpoint.TailHash == before.TailHash {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	sessions, err := read(path)
 	if err != nil {
 		if errors.Is(err, ingest.ErrUnexpectedFormat) {
-			return 0, 0, err
+			return 0, 0, 0, err
 		}
-		return 0, 0, &syncDatabaseError{err}
+		return 0, 0, 0, &syncDatabaseError{err}
 	}
-	count, completed := 0, 0
+	count, completed, blocked := 0, 0, 0
 	for _, s := range sessions {
+		tag := ingest.ExclusionTag(s.Messages)
+		if tag == "" {
+			marked, err := db.IsNoIngest(s.Session.ID)
+			if err != nil {
+				return completed, count, blocked, &syncDatabaseError{err}
+			}
+			if marked {
+				continue
+			}
+		}
+		if tag != "" {
+			if err := db.PurgeSession(s.Session.ID); err != nil {
+				return completed, count, blocked, &syncDatabaseError{err}
+			}
+			if err := db.MarkNoIngest(s.Session, tag); err != nil {
+				return completed, count, blocked, &syncDatabaseError{err}
+			}
+			blocked++
+			continue
+		}
 		rawProject := s.Session.Project
 		if err := applyProjectAlias(db, &s.Session, s.Messages); err != nil {
-			return completed, count, &syncDatabaseError{err}
+			return completed, count, blocked, &syncDatabaseError{err}
 		}
 		if err := identities.record(rawProject, s.Session.Project); err != nil {
-			return completed, count, &syncDatabaseError{err}
+			return completed, count, blocked, &syncDatabaseError{err}
 		}
 		if err := db.SyncConversation(s.Session, s.Messages, false, loadSessionCopy); err != nil {
-			return completed, count, &syncDatabaseError{err}
+			return completed, count, blocked, &syncDatabaseError{err}
 		}
 		count += len(s.Messages)
 		completed++
 	}
 	after, err := sqliteState(path)
 	if err != nil {
-		return completed, count, err
+		return completed, count, blocked, err
 	}
-	if err == nil && before.Size == after.Size && before.ModTimeNS == after.ModTimeNS && before.TailHash == after.TailHash {
+	if before.Size == after.Size && before.ModTimeNS == after.ModTimeNS && before.TailHash == after.TailHash {
 		after.ParserVersion = parserVersion
 		if err := db.SaveCheckpoint(after); err != nil {
-			return completed, count, &syncDatabaseError{err}
+			return completed, count, blocked, &syncDatabaseError{err}
 		}
 	}
-	return len(sessions), count, nil
+	return completed, count, blocked, nil
 }
 
 func loadSessionCopy(s store.Session) (store.Session, []store.Message, error) {

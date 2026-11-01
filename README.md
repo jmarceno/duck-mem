@@ -24,6 +24,7 @@
 
 <p align="center">
   <a href="#what-it-does">What it does</a> ·
+  <a href="#keeping-sessions-private">Keeping sessions private</a> ·
   <a href="#install">Install</a> ·
   <a href="#usage">Usage</a> ·
   <a href="#how-search-works">How search works</a> ·
@@ -56,8 +57,32 @@ duck-mem turns those logs into something searchable:
 - **It keeps itself current.** A systemd user service re-indexes every few
   minutes and skips unchanged files; a tray icon shows status and runs a full
   re-index with one click.
+- **Privacy at the prompt.** Start a session with `private`, `noingest` or
+  `noduck` and duck-mem keeps that session out of memory entirely.
 - **No LLM anywhere.** Ingestion, indexing and search are deterministic. No
   message text ever leaves your machine, and no API key is needed.
+
+## Keeping sessions private
+
+Open a session by starting the first prompt with one of these tags:
+
+| tag | example first prompt |
+|---|---|
+| `private` | `private the payroll merge details` |
+| `noingest` | `noingest: demo of the client login flow` |
+| `noduck` | `noduck read my passwords` |
+
+On the next ingest cycle a tagged session is never stored: if an older
+parser already put it in memory, duck-mem removes its messages, its
+topic-graph contribution and its copy-detection fingerprint. The session
+is then permanently marked in the `no_ingest` table — the mark outlives
+the source log, so the session stays out of memory even if you edit the
+tag away afterwards.
+
+The match is on the **first word of the first user message**,
+case-insensitively and ignoring surrounding punctuation, so `Private:`
+blocks and `privateer the ship` does not. Marked files are checkpointed
+and never re-parsed.
 
 ## Install
 

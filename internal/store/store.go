@@ -237,6 +237,14 @@ func (db *DB) init() error {
 			imported BOOLEAN NOT NULL,
 			duplicate_of TEXT NOT NULL DEFAULT '',
 			seen_at TIMESTAMP NOT NULL DEFAULT current_timestamp)`,
+		// no_ingest marks sessions whose first user prompt opened with a
+		// privacy tag. The mark is permanent: the session's messages never
+		// enter the database, even if the source log later loses the tag.
+		`CREATE TABLE IF NOT EXISTS no_ingest(
+			session_id TEXT PRIMARY KEY,
+			path TEXT NOT NULL DEFAULT '',
+			tag TEXT NOT NULL,
+			marked_at TIMESTAMP NOT NULL DEFAULT current_timestamp)`,
 	} {
 		if _, err := db.sql.Exec(q); err != nil {
 			return err

@@ -42,12 +42,14 @@ const (
 	KindRead
 )
 
-// IngestResult is what one ingest-and-index cycle changed.
+// IngestResult is what one ingest-and-index cycle changed. Blocked counts
+// sessions kept out of memory by a privacy tag.
 type IngestResult struct {
 	Files    int `json:"files"`
 	Sessions int `json:"sessions"`
 	Messages int `json:"messages"`
 	Skipped  int `json:"skipped"`
+	Blocked  int `json:"blocked"`
 	NewMsgs  int `json:"new_msgs"`
 	NewPairs int `json:"new_pairs"`
 }
