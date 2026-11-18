@@ -28,10 +28,12 @@ import (
 
 // parserVersion 2 records failed and aborted turns as notes. Version 3
 // enforces the privacy tags (private, noingest, noduck), so every stored
-// session is re-parsed once and any opened with a tag is purged.
-const parserVersion = 3
-const openCodeParserVersion = 2
-const zCodeParserVersion = 2
+// session is re-parsed once and any opened with a tag is purged. Version 4
+// extracts each session's model, effort and source dates, so every session
+// is re-parsed once to backfill them; unchanged sessions keep their dates.
+const parserVersion = 4
+const openCodeParserVersion = 3
+const zCodeParserVersion = 3
 
 // snapshotIngestor picks the live-SQLite reader and its parser version.
 func snapshotIngestor(kind ingest.Kind) (read func(string) ([]ingest.Snapshot, error), version int, ok bool) {
@@ -337,6 +339,11 @@ func performIndex(db *store.DB, minDF int, full bool) (owner.IndexResult, error)
 // append-only JSONL files. Rewrites take the full reconciliation path.
 // nBlocked counts sessions kept out of memory by privacy tags.
 func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files, nSess, nMsg, nSkip, nBlocked int) {
+	// The one-time OS-timestamp backfill for sessions whose sources carry
+	// no dates of their own; a no-op once its meta marker is recorded.
+	if err := db.BackfillSessionMeta(ingest.FileTimes); err != nil {
+		logSyncFailure("all", "Database error", fmt.Errorf("backfill session metadata: %w", err))
+	}
 	cursorProjects := map[string]map[string]string{}
 	entries := map[string]syncLogEntry{}
 	defer func() {
@@ -948,8 +955,8 @@ func queryCmd(args []string) {
 	fmt.Printf("%d sessions for %q%s, best first. Messages are numbered #seq.\n\n", len(results), q, scope)
 	viaGraph := false
 	for i, r := range results {
-		fmt.Printf("[%d] %s  %s · %s · %d msgs · %s\n", i+1, r.Session.ID, r.Session.Source,
-			dateRange(r.Session.StartedAt, r.LastAt), r.Messages, r.Session.Project)
+		fmt.Printf("[%d] %s  %s · %s · %d msgs · %s · %s\n", i+1, r.Session.ID, r.Session.Source,
+			dateRange(r.Session.StartedAt, r.LastAt), r.Messages, r.Session.Project, modelLabel(r.Session.Model, r.Session.Effort))
 		if r.Named {
 			fmt.Println("    (this session's ID is in the query)")
 		}
@@ -1052,7 +1059,7 @@ func showCmd(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("session %s · %s · %s\n", s.Session.ID, s.Session.Source, s.Session.Project)
+	fmt.Printf("session %s · %s · %s · %s\n", s.Session.ID, s.Session.Source, s.Session.Project, modelLabel(s.Session.Model, s.Session.Effort))
 	fmt.Printf("%s · %d messages (#0–#%d) · log %s\n", dateRange(s.Session.StartedAt, s.LastAt), s.Messages, s.Messages-1, s.Session.Path)
 	if len(msgs) == 0 {
 		fmt.Printf("no conversation in #%d–#%d (host context only; --system shows it)\n", lo, hi)
@@ -1131,6 +1138,19 @@ func projectFlag(project string) string {
 		return ""
 	}
 	return "--project " + project + " "
+}
+
+// modelLabel formats a session's model and effort for display. Rows the
+// backfill has not reached yet may still hold empty strings; they show
+// as the Unknown placeholder rather than a bare separator.
+func modelLabel(model, effort string) string {
+	if model == "" {
+		model = store.UnknownModel
+	}
+	if effort == "" {
+		effort = store.UnknownEffort
+	}
+	return model + "/" + effort
 }
 
 func dateRange(start, last time.Time) string {

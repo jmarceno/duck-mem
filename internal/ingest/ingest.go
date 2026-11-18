@@ -121,23 +121,34 @@ func IngestFile(path string) (store.Session, []store.Message, error) {
 }
 
 // IngestFileWithCursorProjects avoids reloading Cursor's workspace mapping
-// for every transcript in an ingest cycle.
+// for every transcript in an ingest cycle. Cursor transcripts and plans
+// carry no dates of their own, so their sessions take the OS file times.
 func IngestFileWithCursorProjects(path string, projects map[string]string) (store.Session, []store.Message, error) {
-	switch Classify(path) {
-	case KindCodex:
-		return parseCodex(path)
-	case KindClaude:
-		return parseClaude(path)
-	case KindMuse:
-		return parseMuse(path)
-	case KindCursorTranscript:
-		return parseCursorTranscript(path, projects)
-	case KindCursorPlan:
-		return parseCursorPlan(path)
-	case KindDSH:
-		return parseDSH(path)
+	kind := Classify(path)
+	sess, msgs, err := func() (store.Session, []store.Message, error) {
+		switch kind {
+		case KindCodex:
+			return parseCodex(path)
+		case KindClaude:
+			return parseClaude(path)
+		case KindMuse:
+			return parseMuse(path)
+		case KindCursorTranscript:
+			return parseCursorTranscript(path, projects)
+		case KindCursorPlan:
+			return parseCursorPlan(path)
+		case KindDSH:
+			return parseDSH(path)
+		}
+		return store.Session{}, nil, nil
+	}()
+	if err != nil {
+		return sess, msgs, err
 	}
-	return store.Session{}, nil, nil
+	if kind == KindCursorTranscript || kind == KindCursorPlan {
+		sess = applyFileTimes(sess, path)
+	}
+	return sess, msgs, nil
 }
 
 // IngestAppended parses only newly appended JSONL bytes. The caller must
@@ -151,7 +162,11 @@ func IngestAppended(path string, offset int64, previous store.Session, last *sto
 	case KindMuse:
 		return parseMuseFrom(path, offset, previous, last)
 	case KindCursorTranscript:
-		return parseCursorTranscriptFrom(path, offset, previous, last, projects)
+		sess, msgs, err := parseCursorTranscriptFrom(path, offset, previous, last, projects)
+		if err != nil {
+			return sess, msgs, err
+		}
+		return applyFileTimes(sess, path), msgs, nil
 	}
 	return store.Session{}, nil, fmt.Errorf("append parsing unsupported for %s", path)
 }
@@ -171,6 +186,10 @@ type collector struct {
 	msgs    []store.Message
 	nextSeq int
 	last    *store.Message
+	// lastAt is the newest timestamp any kept message carries. Parsers
+	// hand it to finalize so the session's updated date comes from the
+	// source, never from ingest time.
+	lastAt time.Time
 }
 
 func newCollector(sess store.Session, last *store.Message) *collector {
@@ -211,9 +230,34 @@ func (c *collector) add(role, text string, at time.Time) {
 		Text:      text,
 		CreatedAt: at,
 	}
+	if !at.IsZero() && at.After(c.lastAt) {
+		c.lastAt = at
+	}
 	c.msgs = append(c.msgs, m)
 	c.last = &c.msgs[len(c.msgs)-1]
 	c.nextSeq++
+}
+
+// finalize fills the source-derived session metadata parsers leave unset:
+// the updated date from the last kept message (or the created date when
+// the format carries no message timestamps), and the Unknown placeholder
+// for model and effort the format did not carry. It runs at the end of
+// every parse so no parser can forget the defaults.
+func finalize(s store.Session, lastAt time.Time) store.Session {
+	if s.UpdatedAt.IsZero() {
+		if !lastAt.IsZero() {
+			s.UpdatedAt = lastAt
+		} else {
+			s.UpdatedAt = s.StartedAt
+		}
+	}
+	if s.Model == "" {
+		s.Model = store.UnknownModel
+	}
+	if s.Effort == "" {
+		s.Effort = store.UnknownEffort
+	}
+	return s
 }
 
 func readLinesFrom(path string, offset int64, fn func(map[string]any)) error {
@@ -316,6 +360,7 @@ func parseCodex(path string) (store.Session, []store.Message, error) {
 func parseCodexFrom(path string, offset int64, sess store.Session, last *store.Message) (store.Session, []store.Message, error) {
 	c := newCollector(sess, last)
 	cwd, sid, started := sess.Project, sess.ID, sess.StartedAt
+	model, effort := sess.Model, sess.Effort
 	err := readLinesFrom(path, offset, func(o map[string]any) {
 		at := parseTime(o["timestamp"])
 		switch s, _ := o["type"].(string); s {
@@ -328,6 +373,21 @@ func parseCodexFrom(path string, offset int64, sess store.Session, last *store.M
 					sid = v
 				} else if v, _ := p["id"].(string); v != "" && s == "session_meta" {
 					sid = v
+				}
+				// turn_context carries the model of the newest turn;
+				// session_meta only the provider, so the model the
+				// system prompt was generated for is the fallback.
+				if v, _ := p["model"].(string); v != "" {
+					model = v
+				} else if model == "" {
+					if v := str(p, "base_instructions", "provenance", "model"); v != "" {
+						model = v
+					}
+				}
+				if v, _ := p["reasoning_effort"].(string); v != "" {
+					effort = v
+				} else if v, _ := p["effort"].(string); v != "" {
+					effort = v
 				}
 			}
 			if s == "session_meta" {
@@ -402,12 +462,13 @@ func parseCodexFrom(path string, offset int64, sess store.Session, last *store.M
 		return sess, nil, err
 	}
 	sess = newSession(sid, "codex", cwd, path, started)
+	sess.Model, sess.Effort = model, effort
 	c.sess = sess
 	for i := range c.msgs {
 		c.msgs[i].SessionID = sess.ID
 		c.msgs[i].Project = sess.Project
 	}
-	return sess, c.msgs, nil
+	return finalize(sess, c.lastAt), c.msgs, nil
 }
 
 // codexText extracts input_text/output_text from a response_item message.
@@ -463,6 +524,7 @@ func parseClaude(path string) (store.Session, []store.Message, error) {
 func parseClaudeFrom(path string, offset int64, sess store.Session, last *store.Message) (store.Session, []store.Message, error) {
 	c := newCollector(sess, last)
 	sid, cwd, started := sess.ID, sess.Project, sess.StartedAt
+	model, effort := sess.Model, sess.Effort
 	err := readLinesFrom(path, offset, func(o map[string]any) {
 		if v, _ := o["sessionId"].(string); v != "" {
 			sid = v
@@ -473,6 +535,25 @@ func parseClaudeFrom(path string, offset int64, sess store.Session, last *store.
 		at := parseTime(o["timestamp"])
 		if started.IsZero() && !at.IsZero() {
 			started = at
+		}
+		// Assistant records carry the model that answered; request records
+		// carry the effort the turn ran at. Later records win, so a model
+		// or effort switch mid-session keeps the final value.
+		if m, ok := o["message"].(map[string]any); ok && m != nil {
+			if v, _ := m["model"].(string); v != "" {
+				model = v
+			}
+			if v := str(m, "output_config", "effort"); v != "" {
+				effort = v
+			}
+		}
+		if v, _ := o["requestedModel"].(string); v != "" {
+			model = v
+		}
+		if v, _ := o["effort"].(string); v != "" {
+			effort = v
+		} else if v, _ := o["perTurnEffort"].(string); v != "" {
+			effort = v
 		}
 		typ, _ := o["type"].(string)
 		switch typ {
@@ -497,12 +578,13 @@ func parseClaudeFrom(path string, offset int64, sess store.Session, last *store.
 		return sess, nil, err
 	}
 	sess = newSession(sid, "claude", cwd, path, started)
+	sess.Model, sess.Effort = model, effort
 	c.sess = sess
 	for i := range c.msgs {
 		c.msgs[i].SessionID = sess.ID
 		c.msgs[i].Project = sess.Project
 	}
-	return sess, c.msgs, nil
+	return finalize(sess, c.lastAt), c.msgs, nil
 }
 
 // ---- Muse session.jsonl ----
@@ -569,6 +651,7 @@ func parseMuse(path string) (store.Session, []store.Message, error) {
 func parseMuseFrom(path string, offset int64, sess store.Session, last *store.Message) (store.Session, []store.Message, error) {
 	c := newCollector(sess, last)
 	sid, cwd, started := sess.ID, sess.Project, sess.StartedAt
+	model := sess.Model
 	err := readLinesFrom(path, offset, func(o map[string]any) {
 		museRecords(o, func(r map[string]any) {
 			if v := str(r, "stream", "id"); v != "" {
@@ -591,6 +674,9 @@ func parseMuseFrom(path string, offset int64, sess store.Session, last *store.Me
 			case pt == "runtime.session.metadata":
 				if v := str(pl, "record", "workspace_root"); v != "" && cwd == "" {
 					cwd = v
+				}
+				if v := str(pl, "record", "model_id"); v != "" {
+					model = v
 				}
 			case pt == "runtime.user_intent.accepted" || pt == "runtime.user_intent.materialized":
 				var texts []string
@@ -632,12 +718,13 @@ func parseMuseFrom(path string, offset int64, sess store.Session, last *store.Me
 		return sess, nil, err
 	}
 	sess = newSession(sid, "muse", cwd, path, started)
+	sess.Model = model
 	c.sess = sess
 	for i := range c.msgs {
 		c.msgs[i].SessionID = sess.ID
 		c.msgs[i].Project = sess.Project
 	}
-	return sess, c.msgs, nil
+	return finalize(sess, c.lastAt), c.msgs, nil
 }
 
 // ---- Cursor agent transcripts ----
@@ -691,7 +778,7 @@ func parseCursorTranscriptFrom(path string, offset int64, sess store.Session, la
 		c.msgs[i].SessionID = sess.ID
 		c.msgs[i].Project = sess.Project
 	}
-	return sess, c.msgs, nil
+	return finalize(sess, c.lastAt), c.msgs, nil
 }
 
 // CursorHome finds the home directory for a Cursor transcript path.
@@ -773,6 +860,21 @@ func CursorProject(path string, projects map[string]string) string {
 	return "cursor:" + slug
 }
 
+// applyFileTimes gives a Cursor session its OS file timestamps: the
+// transcript or plan carries no dates of its own, so the file's birth
+// time stands in for created and its mtime for last update. Only zero
+// fields are filled so an appended re-parse keeps the original dates.
+func applyFileTimes(sess store.Session, path string) store.Session {
+	created, updated := FileTimes(path)
+	if sess.StartedAt.IsZero() && !created.IsZero() {
+		sess.StartedAt = created
+	}
+	if !updated.IsZero() {
+		sess.UpdatedAt = updated
+	}
+	return sess
+}
+
 // ---- Cursor plan files ----
 
 func parseCursorPlan(path string) (store.Session, []store.Message, error) {
@@ -787,7 +889,7 @@ func parseCursorPlan(path string) (store.Session, []store.Message, error) {
 		Role: "note", Text: strings.TrimSpace(string(raw)),
 	}
 	if msg.Text == "" {
-		return sess, nil, nil
+		return finalize(sess, time.Time{}), nil, nil
 	}
-	return sess, []store.Message{msg}, nil
+	return finalize(sess, time.Time{}), []store.Message{msg}, nil
 }

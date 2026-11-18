@@ -64,7 +64,7 @@ func parseDSH(path string) (store.Session, []store.Message, error) {
 		c.msgs[i].SessionID = c.sess.ID
 		c.msgs[i].Project = c.sess.Project
 	}
-	return c.sess, c.msgs, nil
+	return finalize(c.sess, c.lastAt), c.msgs, nil
 }
 
 // readDSHRecords decodes the event log and folds each record into the
@@ -88,14 +88,20 @@ func readDSHRecords(r io.Reader, c *collector) error {
 	}
 }
 
-// dshRecord folds one event into the conversation. Lifecycle, model, tool and
-// title records carry no conversation text and are ignored.
+// dshRecord folds one event into the conversation. Lifecycle, tool and
+// title records carry no conversation text and are ignored; model
+// records supply the session's model and reasoning effort instead.
 func dshRecord(line []byte, c *collector) error {
 	var o map[string]any
 	if err := json.Unmarshal(line, &o); err != nil {
 		return fmt.Errorf("%w: invalid DSH record", ErrUnexpectedFormat)
 	}
 	at := millisToTime(o["time"])
+	// Every record is timestamped, so the newest one dates the session
+	// even when the conversation ended with a non-message event.
+	if !at.IsZero() && at.After(c.lastAt) {
+		c.lastAt = at
+	}
 	switch typ := str(o, "type"); typ {
 	case "session":
 		if v, _ := o["version"].(float64); int(v) != dshSessionVersion {
@@ -106,6 +112,23 @@ func dshRecord(line []byte, c *collector) error {
 			return fmt.Errorf("%w: DSH session header has no id", ErrUnexpectedFormat)
 		}
 		c.sess = newSession(dshSource+":"+id, dshSource, str(o, "cwd"), c.sess.Path, millisToTime(o["createdAt"]))
+	case "model/selection":
+		d := dshMap(o["data"])
+		if v, _ := d["model"].(string); v != "" {
+			c.sess.Model = v
+		}
+		if v, _ := d["reasoningEffort"].(string); v != "" {
+			c.sess.Effort = v
+		}
+	case "request/header":
+		// Older logs carry the request config only here. Filled only
+		// while empty, so a later model/selection keeps precedence.
+		if v := str(dshMap(o["data"]), "header", "config", "model"); v != "" && c.sess.Model == "" {
+			c.sess.Model = v
+		}
+		if v := str(dshMap(o["data"]), "header", "config", "reasoningEffort"); v != "" && c.sess.Effort == "" {
+			c.sess.Effort = v
+		}
 	case "user/message":
 		d := dshMap(o["data"])
 		if str(d, "source", "kind") != "user" {

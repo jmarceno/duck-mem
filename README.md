@@ -365,6 +365,17 @@ source kind other than `user`, and only records the user actually sent are
 indexed. An unknown session format version is reported as an unexpected format
 instead of being guessed at.
 
+Every session also records the model it ran on, the reasoning effort it ran
+at, and its source dates: created and last-updated, both taken from the
+harness's own data (message timestamps, model-selection records, SQLite update
+columns), never from ingest time. A model or effort switch mid-session keeps
+the final value. Where a harness reports neither field the session stores
+`Unknown` instead of an empty value; Cursor transcripts and plan files carry
+neither dates nor a model, so they take the OS file birth and modification
+times as dates and stay `Unknown` otherwise. A re-ingest that re-reads
+identical content refreshes the metadata but never moves the dates, and
+neither does a project rename: only genuinely new data does.
+
 Imported cross-harness copies are suppressed when their entire conversation
 exactly matches the beginning of another retained session in the same project.
 Matching removes known timestamp/query wrappers, host context, and import
@@ -385,7 +396,8 @@ full re-index is needed.
 ### Schema
 
 ```sql
-sessions(session_id TEXT PRIMARY KEY, source, project, started_at, path)
+sessions(session_id TEXT PRIMARY KEY, source, project, started_at, path,
+         model, effort, updated_at)
 messages(session_id, seq, source, project, role, text, created_at,
          indexed, embedding FLOAT[384], PRIMARY KEY(session_id, seq))
 msg_terms(session_id, seq, term, tf)     -- BM25 postings, Porter-stemmed

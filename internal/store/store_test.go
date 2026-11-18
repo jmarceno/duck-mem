@@ -100,13 +100,13 @@ func TestSyncMessagesWhenEveryRowHasAnEmbedding(t *testing.T) {
 		{SessionID: "s", Seq: 0, Source: "codex", Project: "p", Role: "user", Text: "alpha bravo"},
 		{SessionID: "s", Seq: 1, Source: "codex", Project: "p", Role: "assistant", Text: "charlie delta"},
 	}
-	if err := db.SyncMessages("s", msgs); err != nil {
+	if _, err := db.SyncMessages("s", msgs); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.UpsertSession(Session{ID: "empty", Source: "codex", Project: "p", Path: "g"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SyncMessages("empty", []Message{
+	if _, err := db.SyncMessages("empty", []Message{
 		{SessionID: "empty", Seq: 0, Source: "codex", Project: "p", Role: "user", Text: "..."},
 		{SessionID: "empty", Seq: 1, Source: "codex", Project: "p", Role: "assistant", Text: "echo foxtrot"},
 	}); err != nil {
@@ -622,16 +622,16 @@ func TestSyncMessagesRefreshesEditedSessionAndGraph(t *testing.T) {
 	if err := db.UpsertSession(Session{ID: "other", Source: "codex", Project: "keep", Path: "g"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SyncMessages("other", []Message{{SessionID: "other", Source: "codex", Project: "keep", Role: "user", Text: "bastion aegis"}}); err != nil {
+	if _, err := db.SyncMessages("other", []Message{{SessionID: "other", Source: "codex", Project: "keep", Role: "user", Text: "bastion aegis"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SyncMessages(s.ID, []Message{message(0, "bastion sentry", "old")}); err != nil {
+	if _, err := db.SyncMessages(s.ID, []Message{message(0, "bastion sentry", "old")}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := db.IndexNew(1); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SyncMessages(s.ID, []Message{message(0, "bastion sentry", "old"), message(1, "bastion sentry", "old")}); err != nil {
+	if _, err := db.SyncMessages(s.ID, []Message{message(0, "bastion sentry", "old"), message(1, "bastion sentry", "old")}); err != nil {
 		t.Fatal(err)
 	}
 	if n, _, err := db.IndexNew(1); err != nil || n != 1 || edgeWeight(t, db, "bastion", "sentry") != 2 {
@@ -641,7 +641,7 @@ func TestSyncMessagesRefreshesEditedSessionAndGraph(t *testing.T) {
 	if err := db.UpsertSession(s); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SyncMessages(s.ID, []Message{message(0, "bastion turret", "new"), message(1, "bastion turret", "new")}); err != nil {
+	if _, err := db.SyncMessages(s.ID, []Message{message(0, "bastion turret", "new"), message(1, "bastion turret", "new")}); err != nil {
 		t.Fatal(err)
 	}
 	// The rewrite is subtracted in place: no full rebuild is queued.
@@ -668,7 +668,7 @@ func TestSyncMessagesRefreshesEditedSessionAndGraph(t *testing.T) {
 	if err != nil || len(hits) != 1 || hits[0].Term != "aegis" || hits[0].Weight != 1 {
 		t.Fatalf("other session's graph changed: hits=%+v err=%v", hits, err)
 	}
-	if err := db.SyncMessages(s.ID, nil); err != nil {
+	if _, err := db.SyncMessages(s.ID, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := db.IndexNew(1); err != nil {

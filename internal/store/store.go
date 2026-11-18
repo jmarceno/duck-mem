@@ -34,12 +34,33 @@ type Message struct {
 // project and break every query. A project column value filters with a
 // WHERE clause and an index instead.
 type Session struct {
-	ID        string
-	Source    string
-	Project   string
-	Path      string
+	ID      string
+	Source  string
+	Project string
+	Path    string
+	// StartedAt is when the session was created, taken from the source
+	// (harness record or OS file birth time); never ingest time. Zero
+	// until a source provides it, and frozen once stored.
 	StartedAt time.Time
+	// Model and Effort describe how the harness ran the session. Empty
+	// means the source format carries neither; UpsertSession stores the
+	// Unknown placeholder then, so the columns are never NULL or empty.
+	Model  string
+	Effort string
+	// UpdatedAt is when the session last received data, taken from the
+	// source. Zero until the source provides it, and only written when
+	// the stored message snapshot changes, so a re-ingest that re-reads
+	// the same content cannot advance the date.
+	UpdatedAt time.Time
 }
+
+// UnknownModel and UnknownEffort fill the model and effort columns for
+// sessions whose source format carries neither, so the columns are
+// never NULL or empty.
+const (
+	UnknownModel  = "Unknown"
+	UnknownEffort = "Unknown"
+)
 
 // DB wraps the DuckDB handle. readOnly sessions attach the file from an
 // in-memory connection so duckpgq can build its property graph without
@@ -178,7 +199,10 @@ func (db *DB) init() error {
 			source TEXT NOT NULL,
 			project TEXT NOT NULL DEFAULT '',
 			started_at TIMESTAMPTZ,
-			path TEXT NOT NULL DEFAULT '')`,
+			path TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT 'Unknown',
+			effort TEXT NOT NULL DEFAULT 'Unknown',
+			updated_at TIMESTAMPTZ)`,
 		`CREATE TABLE IF NOT EXISTS messages(
 			session_id TEXT NOT NULL REFERENCES sessions(session_id),
 			seq INTEGER NOT NULL,
@@ -259,10 +283,16 @@ func (db *DB) init() error {
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS indexed INTEGER`,
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS embedding FLOAT[` + strconv.Itoa(embed.Dim) + `]`,
 		`UPDATE messages SET indexed=1 WHERE indexed IS NULL`,
+		`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS model TEXT`,
+		`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS effort TEXT`,
+		`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ`,
 	} {
 		if _, err := db.sql.Exec(q); err != nil {
 			return err
 		}
+	}
+	if err := db.backfillSessionMetaSQL(); err != nil {
+		return err
 	}
 	if err := db.ensureEdgesSchema(); err != nil {
 		return err
@@ -345,11 +375,15 @@ func (db *DB) SaveCheckpoint(c FileCheckpoint) error {
 
 func (db *DB) GetSession(id string) (Session, error) {
 	var s Session
-	var started sql.NullTime
-	err := db.sql.QueryRow(`SELECT session_id, source, project, started_at, path FROM sessions WHERE session_id=?`, id).
-		Scan(&s.ID, &s.Source, &s.Project, &started, &s.Path)
+	var started, updated sql.NullTime
+	err := db.sql.QueryRow(`SELECT session_id, source, project, started_at, path, model, effort, updated_at
+		FROM sessions WHERE session_id=?`, id).
+		Scan(&s.ID, &s.Source, &s.Project, &started, &s.Path, &s.Model, &s.Effort, &updated)
 	if started.Valid {
 		s.StartedAt = started.Time
+	}
+	if updated.Valid {
+		s.UpdatedAt = updated.Time
 	}
 	return s, err
 }
@@ -373,24 +407,123 @@ func (db *DB) LastMessage(sessionID string) (*Message, error) {
 }
 
 // UpsertSession records a session; re-ingests refresh its metadata.
+// Model and effort are stored as the Unknown placeholder when the source
+// carried neither. Dates are treated as source data: on conflict
+// started_at is only filled while still unset and updated_at is never
+// written here, so a re-ingest of unchanged content cannot advance
+// either. SetSessionUpdatedAt records updated_at when content changed.
 func (db *DB) UpsertSession(s Session) error {
+	model := s.Model
+	if model == "" {
+		model = UnknownModel
+	}
+	effort := s.Effort
+	if effort == "" {
+		effort = UnknownEffort
+	}
 	_, err := db.sql.Exec(
-		`INSERT INTO sessions(session_id, source, project, started_at, path)
-		 VALUES(?, ?, ?, ?, ?)
+		`INSERT INTO sessions(session_id, source, project, started_at, path, model, effort, updated_at)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(session_id) DO UPDATE SET source=excluded.source, project=excluded.project,
-		 path=excluded.path, started_at=excluded.started_at`,
-		s.ID, s.Source, s.Project, nullableTime(s.StartedAt), s.Path)
+		 path=excluded.path, model=excluded.model, effort=excluded.effort,
+		 started_at=CASE WHEN started_at IS NULL THEN excluded.started_at ELSE started_at END`,
+		s.ID, s.Source, s.Project, nullableTime(s.StartedAt), s.Path, model, effort, nullableTime(s.UpdatedAt))
 	return err
 }
 
-// SyncMessages replaces a session's stored snapshot only when its content
-// changed. Reparsed sessions can gain, lose, or reorder messages; the old
-// snapshot's graph contributions are then subtracted and the new rows
-// index incrementally, so a rewrite costs one session, not the corpus.
-func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
-	rows, err := db.sql.Query(`SELECT seq, source, project, role, text FROM messages WHERE session_id=? ORDER BY seq`, sessionID)
+// SetSessionUpdatedAt records when a session last received data, taken
+// from its source. Only SyncConversation calls it, and only when the
+// stored message snapshot changed, so a re-ingest that re-reads the same
+// content cannot advance the date. Zero times are ignored: they mean the
+// source format carries no date and the column keeps whatever it holds.
+func (db *DB) SetSessionUpdatedAt(id string, at time.Time) error {
+	if at.IsZero() {
+		return nil
+	}
+	_, err := db.sql.Exec(`UPDATE sessions SET updated_at=? WHERE session_id=?`, at, id)
+	return err
+}
+
+// backfillSessionMetaSQL fills the model, effort and updated_at columns
+// of databases created before they existed. Idempotent and cheap: after
+// the first run the UPDATEs match nothing. Rows with message timestamps
+// take updated_at from them; rows without any (Cursor, which stores no
+// message dates) wait for the OS-timestamp pass in BackfillSessionMeta.
+func (db *DB) backfillSessionMetaSQL() error {
+	for _, q := range []string{
+		`UPDATE sessions SET model='` + UnknownModel + `' WHERE model IS NULL OR model=''`,
+		`UPDATE sessions SET effort='` + UnknownEffort + `' WHERE effort IS NULL OR effort=''`,
+		`UPDATE sessions SET updated_at=m.mx
+			FROM (SELECT session_id, max(created_at) AS mx FROM messages GROUP BY session_id) m
+			WHERE sessions.session_id = m.session_id AND sessions.updated_at IS NULL`,
+	} {
+		if _, err := db.sql.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BackfillSessionMeta finishes the one-time backfill: fileTimes supplies
+// the OS timestamps (created, updated) of a backing file for rows whose
+// source carries no message timestamps, such as Cursor transcripts and
+// plan files. Guarded by a meta marker so the per-row stat pass runs
+// once; the SQL pass already ran when the database opened.
+func (db *DB) BackfillSessionMeta(fileTimes func(string) (time.Time, time.Time)) error {
+	var done string
+	if err := db.sql.QueryRow(`SELECT value FROM meta WHERE key='session_meta_backfill'`).Scan(&done); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if done == "1" {
+		return nil
+	}
+	rows, err := db.sql.Query(`SELECT session_id, path FROM sessions WHERE updated_at IS NULL AND path<>''`)
 	if err != nil {
 		return err
+	}
+	type pending struct{ id, path string }
+	var list []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.path); err != nil {
+			rows.Close()
+			return err
+		}
+		list = append(list, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, p := range list {
+		created, updated := fileTimes(p.path)
+		if created.IsZero() && updated.IsZero() {
+			continue // file gone or undatable: reads fall back instead
+		}
+		if _, err := db.sql.Exec(`UPDATE sessions
+			SET updated_at=COALESCE(?, updated_at, ?),
+			started_at=CASE WHEN started_at IS NULL THEN ? ELSE started_at END
+			WHERE session_id=?`, nullableTime(updated), nullableTime(created), nullableTime(created), p.id); err != nil {
+			return err
+		}
+	}
+	if _, err := db.sql.Exec(`INSERT INTO meta(key, value) VALUES('session_meta_backfill', '1')
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// SyncMessages replaces a session's stored snapshot only when its content
+// changed, and reports whether it did. Reparsed sessions can gain, lose,
+// or reorder messages; the old snapshot's graph contributions are then
+// subtracted and the new rows index incrementally, so a rewrite costs
+// one session, not the corpus. The change flag gates SetSessionUpdatedAt,
+// so a re-ingest that re-reads identical content never moves the date.
+func (db *DB) SyncMessages(sessionID string, msgs []Message) (bool, error) {
+	rows, err := db.sql.Query(`SELECT seq, source, project, role, text FROM messages WHERE session_id=? ORDER BY seq`, sessionID)
+	if err != nil {
+		return false, err
 	}
 	type stored struct {
 		seq                         int
@@ -401,13 +534,13 @@ func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
 		var m stored
 		if err := rows.Scan(&m.seq, &m.source, &m.project, &m.role, &m.text); err != nil {
 			rows.Close()
-			return err
+			return false, err
 		}
 		old = append(old, m)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return false, err
 	}
 	prefixMatches := len(old) <= len(msgs)
 	if prefixMatches {
@@ -419,7 +552,7 @@ func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
 			}
 		}
 		if prefixMatches && len(old) == len(msgs) {
-			return nil
+			return false, nil
 		}
 	}
 	start := 0
@@ -428,17 +561,17 @@ func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
 	}
 	for _, m := range msgs[start:] {
 		if m.SessionID != sessionID {
-			return fmt.Errorf("message session %q does not match %q", m.SessionID, sessionID)
+			return false, fmt.Errorf("message session %q does not match %q", m.SessionID, sessionID)
 		}
 	}
 	fresh := msgs[start:]
 	var undo graphUndo
 	if !prefixMatches && len(old) > 0 {
 		if undo, err = db.sessionContribution(sessionID); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return db.withTx(func(conn *duckdb.Conn) error {
+	if err := db.withTx(func(conn *duckdb.Conn) error {
 		if !prefixMatches {
 			if err := undo.apply(conn, sessionID); err != nil {
 				return err
@@ -451,7 +584,10 @@ func (db *DB) SyncMessages(sessionID string, msgs []Message) error {
 			}
 		}
 		return copyMessages(conn, stageMessages(fresh, false), false)
-	})
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // InsertMessages stores messages; re-ingesting the same (session_id, seq)

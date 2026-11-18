@@ -531,12 +531,12 @@ func (db *DB) describeEnding(r *SessionResult) error {
 func (db *DB) describeSession(r *SessionResult) error {
 	var started, last sql.NullTime
 	var title sql.NullString
-	err := db.queryRow(`SELECT s.source, s.project, s.path, s.started_at,
+	err := db.queryRow(`SELECT s.source, s.project, s.path, s.started_at, s.model, s.effort,
 		(SELECT count(*) FROM messages m WHERE m.session_id = s.session_id),
-		(SELECT max(created_at) FROM messages m WHERE m.session_id = s.session_id),
+		COALESCE(s.updated_at, (SELECT max(created_at) FROM messages m WHERE m.session_id = s.session_id)),
 		(SELECT text FROM messages m WHERE m.session_id = s.session_id AND `+titleFilter+` ORDER BY seq LIMIT 1)
 		FROM sessions s WHERE s.session_id = ?`, r.Session.ID).
-		Scan(&r.Session.Source, &r.Session.Project, &r.Session.Path, &started, &r.Messages, &last, &title)
+		Scan(&r.Session.Source, &r.Session.Project, &r.Session.Path, &started, &r.Session.Model, &r.Session.Effort, &r.Messages, &last, &title)
 	if err != nil {
 		return err
 	}

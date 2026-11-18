@@ -55,7 +55,7 @@ duck-mem query --project omen-the-game enemy disengage barricade
 ```text
 5 sessions for "enemy disengage barricade" in projects matching "omen-the-game", best first. Messages are numbered #seq.
 
-[1] faf44a7a-c1fa-4603-831d-095cb89dc375  claude · 2026-09-27 · 11 msgs · /home/u/Projects/omen-the-game
+[1] faf44a7a-c1fa-4603-831d-095cb89dc375  claude · 2026-09-27 · 11 msgs · /home/u/Projects/omen-the-game · claude-opus-5-5/low
     opened with: "We have some issues with the enemy AI. They are too passive…"
     #0 user 2026-09-27 11:57: …once the player spawns a barricade enemies lose sight and they promptly disengage…
     #4 assistant 2026-09-27 11:59: …barricade breaching (ranged shoot it, melee/exploders attack it)…

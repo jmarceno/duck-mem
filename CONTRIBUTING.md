@@ -53,6 +53,9 @@ the session it should return first.
 - One concern per commit; the commit subject says what changed and why.
 - Note schema changes and parser-version bumps explicitly — existing databases
   are migrated in place, so a silent change to either is a compatibility break.
+  Sessions carry source-derived dates (`started_at`, `updated_at`) and the
+  model and effort they ran with (`Unknown` when the harness reports neither):
+  a re-ingest may refresh metadata but must not advance those dates.
 
 ## Reporting bugs
 

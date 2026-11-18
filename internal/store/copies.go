@@ -217,6 +217,9 @@ type CopyLoader func(Session) (Session, []Message, error)
 
 // SyncConversation also protects suppressed dependents before a rewrite.
 // Appends preserve their prefixes; changed copies always take the full path.
+// The session's updated date moves only when the stored message snapshot
+// changes, so a re-ingest of unchanged content (a parser version bump, a
+// project rename) cannot advance it.
 func (db *DB) SyncConversation(s Session, msgs []Message, appended bool, load CopyLoader) error {
 	if !appended {
 		sessions, err := db.copySessions(s.ID)
@@ -246,7 +249,10 @@ func (db *DB) SyncConversation(s Session, msgs []Message, appended bool, load Co
 			if err := db.UpsertSession(restored); err != nil {
 				return err
 			}
-			if err := db.SyncMessages(c.ID, snapshot); err != nil {
+			if _, err := db.SyncMessages(c.ID, snapshot); err != nil {
+				return err
+			}
+			if err := db.SetSessionUpdatedAt(c.ID, restored.UpdatedAt); err != nil {
 				return err
 			}
 			if err := db.refreshCopyIdentity(c.ID); err != nil {
@@ -260,14 +266,21 @@ func (db *DB) SyncConversation(s Session, msgs []Message, appended bool, load Co
 	if appended && len(msgs) == 0 {
 		return nil
 	}
+	var changed bool
 	var err error
 	if appended {
+		changed = true
 		err = db.InsertMessages(msgs)
 	} else {
-		err = db.SyncMessages(s.ID, msgs)
+		changed, err = db.SyncMessages(s.ID, msgs)
 	}
 	if err != nil {
 		return err
+	}
+	if changed {
+		if err := db.SetSessionUpdatedAt(s.ID, s.UpdatedAt); err != nil {
+			return err
+		}
 	}
 	return db.refreshCopyIdentity(s.ID)
 }

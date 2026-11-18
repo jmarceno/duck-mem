@@ -82,10 +82,10 @@ func TestCopySuppressionPromotionAndOwnerRewrite(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := db.SyncMessages(owner.ID, original); err != nil {
+	if _, err := db.SyncMessages(owner.ID, original); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SyncMessages(copySess.ID, copied); err != nil {
+	if _, err := db.SyncMessages(copySess.ID, copied); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := db.IndexNew(1); err != nil {

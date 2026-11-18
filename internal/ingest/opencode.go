@@ -45,26 +45,7 @@ func IngestOpenCode(path string) ([]Snapshot, error) {
 	defer db.Close()
 	defer tx.Rollback()
 
-	rows, err := tx.Query(`SELECT s.id, COALESCE(NULLIF(s.directory, ''), p.worktree, ''), s.time_created
-		FROM session_v2 s LEFT JOIN project p ON p.id = s.project_id ORDER BY s.time_created, s.id`)
-	if err != nil {
-		return nil, openCodeReadError("read OpenCode sessions", err)
-	}
-	var sessions []Snapshot
-	for rows.Next() {
-		var id, dir string
-		var created int64
-		if err := rows.Scan(&id, &dir, &created); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		sessions = append(sessions, Snapshot{Session: store.Session{
-			ID: "opencode:" + id, Source: "opencode", Project: project.Clean(dir),
-			Path: path, StartedAt: sqliteTime(created),
-		}})
-	}
-	err = rows.Err()
-	rows.Close()
+	sessions, err := openCodeSessions(tx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +88,86 @@ func IngestOpenCode(path string) ([]Snapshot, error) {
 		}
 	}
 	return sessions, nil
+}
+
+// openCodeSessions reads the session table with its model and update time
+// when the live schema carries them, falling back to the columns older
+// stores have. Missing columns are not an unexpected format: the session
+// then just runs as Unknown with its creation date.
+func openCodeSessions(tx *sql.Tx, storePath string) ([]Snapshot, error) {
+	rows, err := tx.Query(`SELECT s.id, COALESCE(NULLIF(s.directory, ''), p.worktree, ''), s.time_created,
+			s.model, s.time_updated
+		FROM session_v2 s LEFT JOIN project p ON p.id = s.project_id ORDER BY s.time_created, s.id`)
+	if err != nil {
+		if !missingSchema(err) {
+			return nil, openCodeReadError("read OpenCode sessions", err)
+		}
+		return openCodeSessionsLegacy(tx, storePath)
+	}
+	return scanOpenCodeSessions(rows, storePath, true)
+}
+
+func openCodeSessionsLegacy(tx *sql.Tx, storePath string) ([]Snapshot, error) {
+	rows, err := tx.Query(`SELECT s.id, COALESCE(NULLIF(s.directory, ''), p.worktree, ''), s.time_created
+		FROM session_v2 s LEFT JOIN project p ON p.id = s.project_id ORDER BY s.time_created, s.id`)
+	if err != nil {
+		return nil, openCodeReadError("read OpenCode sessions", err)
+	}
+	return scanOpenCodeSessions(rows, storePath, false)
+}
+
+func scanOpenCodeSessions(rows *sql.Rows, storePath string, enriched bool) ([]Snapshot, error) {
+	var sessions []Snapshot
+	for rows.Next() {
+		var id, dir string
+		var created int64
+		var model sql.NullString
+		var updated sql.NullInt64
+		if enriched {
+			if err := rows.Scan(&id, &dir, &created, &model, &updated); err != nil {
+				rows.Close()
+				return nil, err
+			}
+		} else if err := rows.Scan(&id, &dir, &created); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		sess := store.Session{
+			ID: "opencode:" + id, Source: "opencode", Project: project.Clean(dir),
+			Path: storePath, StartedAt: sqliteTime(created), UpdatedAt: sqliteTime(updated.Int64),
+		}
+		if enriched {
+			var m openCodeModel
+			if model.Valid && json.Unmarshal([]byte(model.String), &m) == nil && m.ID != "" {
+				sess.Model = m.ID
+				// The variant names the model flavour the session ran,
+				// which is as close to an effort level as OpenCode keeps.
+				sess.Effort = m.Variant
+			}
+		}
+		sessions = append(sessions, Snapshot{Session: finalize(sess, time.Time{})})
+	}
+	err := rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	return sessions, nil
+}
+
+// openCodeModel decodes session_v2.model JSON.
+type openCodeModel struct {
+	ID         string `json:"id"`
+	ProviderID string `json:"providerID"`
+	Variant    string `json:"variant"`
+}
+
+// missingSchema reports whether a live-store read failed because its
+// schema predates the columns the enriched query selects. Older stores
+// are read with the columns they have rather than reported as an
+// unexpected format.
+func missingSchema(err error) bool {
+	return err != nil && (strings.Contains(err.Error(), "no such column") || strings.Contains(err.Error(), "no such table"))
 }
 
 func sqliteTime(ms int64) time.Time {
