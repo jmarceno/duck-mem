@@ -38,12 +38,22 @@ const (
 	KindOpenCode
 	KindDSH
 	KindZCode
+	KindAntigravity
 )
 
 // Snapshot is one conversation from a live SQLite store (OpenCode, ZCode).
 type Snapshot struct {
 	Session  store.Session
 	Messages []store.Message
+}
+
+// Projects carries the workspace mappings harnesses keep outside their
+// transcripts: Cursor's workspace storage and Antigravity's conversation
+// summaries. A parser reads only the map for its own harness, so a nil map
+// simply means that harness's mapping was not resolved.
+type Projects struct {
+	Cursor      map[string]string
+	Antigravity map[string]string
 }
 
 // Classify picks the parser from the file path.
@@ -57,6 +67,12 @@ func Classify(path string) Kind {
 		return KindZCode
 	case strings.Contains(path, "/.dsh/sessions/") && strings.HasSuffix(path, ".jsonl.zstd"):
 		return KindDSH
+	// Only the untruncated log: transcript.jsonl beside it holds the same
+	// conversation with long content clipped, and chunks/ holds partitions
+	// of both, so accepting either would import one conversation twice.
+	case strings.Contains(path, "/.gemini/antigravity/brain/") &&
+		strings.HasSuffix(path, "/.system_generated/logs/transcript_full.jsonl"):
+		return KindAntigravity
 	case strings.Contains(path, "/agent-transcripts/") && strings.HasSuffix(path, ".jsonl"):
 		return KindCursorTranscript
 	case filepath.Base(path) == "session.jsonl" && strings.Contains(path, "/muse/sessions/"):
@@ -81,6 +97,7 @@ func DefaultRoots(home string) []string {
 		filepath.Join(home, ".local", "share", "opencode", "opencode.db"),
 		filepath.Join(home, ".zcode", "cli", "db", "db.sqlite"),
 		filepath.Join(home, ".dsh", "sessions"),
+		filepath.Join(home, ".gemini", "antigravity", "brain"),
 	}
 }
 
@@ -114,16 +131,20 @@ func DiscoverWithErrors(roots []string, report func(string, error)) []string {
 
 // IngestFile parses one session file into a session plus kept messages.
 func IngestFile(path string) (store.Session, []store.Message, error) {
-	if Classify(path) == KindCursorTranscript {
-		return IngestFileWithCursorProjects(path, LoadCursorProjects(CursorHome(path)))
+	var projects Projects
+	switch Classify(path) {
+	case KindCursorTranscript:
+		projects.Cursor = LoadCursorProjects(CursorHome(path))
+	case KindAntigravity:
+		projects.Antigravity = LoadAntigravityProjects(AntigravityDir(path))
 	}
-	return IngestFileWithCursorProjects(path, nil)
+	return IngestFileWithProjects(path, projects)
 }
 
-// IngestFileWithCursorProjects avoids reloading Cursor's workspace mapping
-// for every transcript in an ingest cycle. Cursor transcripts and plans
+// IngestFileWithProjects avoids reloading a harness's outside workspace
+// mapping for every transcript in an ingest cycle. Cursor transcripts and plans
 // carry no dates of their own, so their sessions take the OS file times.
-func IngestFileWithCursorProjects(path string, projects map[string]string) (store.Session, []store.Message, error) {
+func IngestFileWithProjects(path string, projects Projects) (store.Session, []store.Message, error) {
 	kind := Classify(path)
 	sess, msgs, err := func() (store.Session, []store.Message, error) {
 		switch kind {
@@ -134,11 +155,13 @@ func IngestFileWithCursorProjects(path string, projects map[string]string) (stor
 		case KindMuse:
 			return parseMuse(path)
 		case KindCursorTranscript:
-			return parseCursorTranscript(path, projects)
+			return parseCursorTranscript(path, projects.Cursor)
 		case KindCursorPlan:
 			return parseCursorPlan(path)
 		case KindDSH:
 			return parseDSH(path)
+		case KindAntigravity:
+			return parseAntigravity(path, projects.Antigravity)
 		}
 		return store.Session{}, nil, nil
 	}()
@@ -153,7 +176,7 @@ func IngestFileWithCursorProjects(path string, projects map[string]string) (stor
 
 // IngestAppended parses only newly appended JSONL bytes. The caller must
 // verify the old file prefix and fall back to a full parse on metadata change.
-func IngestAppended(path string, offset int64, previous store.Session, last *store.Message, projects map[string]string) (store.Session, []store.Message, error) {
+func IngestAppended(path string, offset int64, previous store.Session, last *store.Message, projects Projects) (store.Session, []store.Message, error) {
 	switch Classify(path) {
 	case KindCodex:
 		return parseCodexFrom(path, offset, previous, last)
@@ -161,8 +184,10 @@ func IngestAppended(path string, offset int64, previous store.Session, last *sto
 		return parseClaudeFrom(path, offset, previous, last)
 	case KindMuse:
 		return parseMuseFrom(path, offset, previous, last)
+	case KindAntigravity:
+		return parseAntigravityFrom(path, offset, previous, last, projects.Antigravity)
 	case KindCursorTranscript:
-		sess, msgs, err := parseCursorTranscriptFrom(path, offset, previous, last, projects)
+		sess, msgs, err := parseCursorTranscriptFrom(path, offset, previous, last, projects.Cursor)
 		if err != nil {
 			return sess, msgs, err
 		}
@@ -302,6 +327,10 @@ func readLinesFrom(path string, offset int64, fn func(map[string]any)) error {
 		case KindCursorTranscript:
 			// Cursor interleaves turn lifecycle records with conversation messages.
 			valid = (str(o, "role") != "" && o["message"] != nil) || str(o, "type") == "turn_ended"
+		case KindAntigravity:
+			// One record per step; a step type added later is dropped by the
+			// parser rather than reported as an unexpected format.
+			valid = str(o, "type") != "" && o["step_index"] != nil
 		}
 		if !valid {
 			return fmt.Errorf("%w: unrecognized record envelope at byte %d", ErrUnexpectedFormat, offset)

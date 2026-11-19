@@ -190,6 +190,8 @@ func harnessName(kind ingest.Kind) string {
 		return "dsh"
 	case ingest.KindZCode:
 		return "zcode"
+	case ingest.KindAntigravity:
+		return "antigravity"
 	default:
 		return "unknown"
 	}

@@ -6,9 +6,9 @@
 
 <p align="center">
   <b>Give your coding agents a memory they can actually search.</b><br>
-  Every Codex, Claude, Cursor, Muse, OpenCode, DeepSeek Harness and ZCode
-  session lands in one DuckDB file — conversations only, no tool noise — and
-  becomes a search index your agent can query from the terminal.
+  Every Codex, Claude, Cursor, Muse, OpenCode, DeepSeek Harness, ZCode and
+  Antigravity session lands in one DuckDB file — conversations only, no tool
+  noise — and becomes a search index your agent can query from the terminal.
 </p>
 
 <p align="center">
@@ -41,10 +41,10 @@ Your agents forget everything between sessions, and the raw logs they forget
 with are full of tool calls, environment dumps and half-finished reasoning.
 duck-mem turns those logs into something searchable:
 
-- **One store, seven agents.** Codex, Claude, Cursor, Muse, OpenCode,
-  DeepSeek Harness and ZCode sessions are parsed into a single DuckDB file.
-  Nothing is copied out of the original agent directories, and the stores are
-  read-only.
+- **One store, eight agents.** Codex, Claude, Cursor, Muse, OpenCode,
+  DeepSeek Harness, ZCode and Antigravity sessions are parsed into a single
+  DuckDB file. Nothing is copied out of the original agent directories, and the
+  stores are read-only.
 - **Conversations, not transcripts.** Tool calls, tool output, reasoning blocks
   and metadata are dropped. You keep the prompts, the answers and the text that
   actually explained the work.
@@ -110,7 +110,7 @@ duck-mem --uninstall --purge-data    # also deletes duck-mem data and config
 ```
 
 Uninstalling never touches your Codex, Claude, Cursor, Muse, OpenCode,
-DeepSeek Harness or ZCode session stores.
+DeepSeek Harness, ZCode or Antigravity session stores.
 
 ## Usage
 
@@ -342,6 +342,7 @@ services stopped, and the tray menu offers the same in-place repack.
 | OpenCode | `~/.local/share/opencode/opencode.db` (read-only, including WAL) | `session_v2.directory`, else the worktree |
 | ZCode | `~/.zcode/cli/db/db.sqlite` (read-only, including WAL) | `session.directory` |
 | DeepSeek Harness | `~/.dsh/sessions/*/*/session.v4.jsonl.zstd` (zstd, read-only) | session header `cwd` |
+| Antigravity | `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript_full.jsonl` | `conversation_summaries.db` `workspace_uris` |
 
 Project values are normalized when they are parsed (`filepath.Clean`-style:
 trailing and repeated separators, `~`, backslash paths), compared
@@ -364,6 +365,36 @@ runtime state and skill catalog it injects, as user-role records carrying a
 source kind other than `user`, and only records the user actually sent are
 indexed. An unknown session format version is reported as an unexpected format
 instead of being guessed at.
+
+Antigravity conversations are append-only JSONL step logs. Each prompt is
+stored as the text inside the `<USER_REQUEST>` wrapper, without the metadata
+blocks the app appends for the model (local time, model-selection notices), and
+only user input the user actually sent and the model's visible replies are
+kept: tool output records and reasoning are dropped. `transcript.jsonl` beside
+each log is the same conversation with long content clipped, and `chunks/`
+holds partitions of both, so only the untruncated log is read and one
+conversation can never be imported twice. The model id carries its reasoning
+level (`gemini-3.8-flash-high`), which is split into the model and effort
+columns; suffixes that are part of the model name (`-tiered`, `-n`, `-lite`)
+stay in the model and leave the effort `Unknown`. A conversation outside any
+project keeps an empty project rather than an invented path.
+
+Three Antigravity behaviours are documented as temporary limitations, kept
+until there is data to design against:
+
+- **Failed and aborted turns leave no note.** Every step observed reported
+  `DONE`, so the shape a failure or a user cancellation writes is unknown. A
+  turn that ended without a reply looks like it stopped, unlike Codex and
+  Cursor, which record a "turn failed" or "turn aborted" note.
+- **Subagent conversations are not linked to their parent.** The summaries
+  index carries `parent_conversation_id` and `nesting_depth`, but no subagent
+  brain directory has been observed, so it is unknown whether a subagent gets
+  one of its own. A subagent that does is ingested as an ordinary unlinked
+  session.
+- **A conversation stored only as chunks is skipped.** The full log and its
+  chunk partitions have existed side by side in every sample. If a long
+  conversation ever ships chunks without the full log, nothing is ingested
+  rather than half-importing it or duplicating the conversation.
 
 Every session also records the model it ran on, the reasoning effort it ran
 at, and its source dates: created and last-updated, both taken from the

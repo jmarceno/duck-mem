@@ -60,7 +60,7 @@ func TestCodexAppendParsesOnlyNewMessages(t *testing.T) {
 		`{"timestamp":"2026-09-27T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}}`,
 	}, "\n") + "\n"
 	writeTemp(t, path, initial+appendText)
-	updated, added, err := IngestAppended(path, int64(len(initial)), sess, &old[len(old)-1], nil)
+	updated, added, err := IngestAppended(path, int64(len(initial)), sess, &old[len(old)-1], Projects{})
 	if err != nil || updated.ID != sess.ID || updated.Project != sess.Project || len(added) != 1 || added[0].Seq != 2 || added[0].Text != "next" {
 		t.Fatalf("append parse: session=%+v messages=%+v err=%v", updated, added, err)
 	}
@@ -92,7 +92,7 @@ func TestOtherJSONLAppendParsersKeepSequence(t *testing.T) {
 			t.Fatalf("%s initial parse: messages=%+v err=%v", tc.path, old, err)
 		}
 		writeTemp(t, tc.path, tc.initial+"\n"+tc.added+"\n")
-		updated, added, err := IngestAppended(tc.path, int64(len(tc.initial)+1), sess, &old[0], LoadCursorProjects(dir))
+		updated, added, err := IngestAppended(tc.path, int64(len(tc.initial)+1), sess, &old[0], Projects{Cursor: LoadCursorProjects(dir)})
 		if err != nil || updated.ID != sess.ID || len(added) != 1 || added[0].Seq != 1 || added[0].Text != "next" {
 			t.Fatalf("%s append parse: session=%+v messages=%+v err=%v", tc.path, updated, added, err)
 		}

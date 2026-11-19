@@ -49,7 +49,7 @@ func TestCursorTurnEndedRecordsPreserveFullAndAppendedConversation(t *testing.T)
 	}
 	writeTemp(t, path, initial+`{"type":"turn_ended","status":"completed"}`+"\n"+
 		`{"role":"user","message":{"content":[{"type":"text","text":"next"}]}}`+"\n")
-	_, added, err := IngestAppended(path, int64(len(initial)), sess, &msgs[2], nil)
+	_, added, err := IngestAppended(path, int64(len(initial)), sess, &msgs[2], Projects{})
 	if err != nil || len(added) != 1 || added[0].Text != "next" || added[0].Seq != 3 {
 		t.Fatalf("append parse: messages=%+v error=%v", added, err)
 	}

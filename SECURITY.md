@@ -12,14 +12,16 @@ instead of a public issue, and expect an acknowledgement within a week.
 
 Worth reporting: anything that reads or writes outside the paths duck-mem is
 documented to touch (`~/.codex`, `~/.claude`, `~/.cursor`, the Muse sessions
-directory, the OpenCode SQLite store, the ZCode SQLite store, and duck-mem's
-own database, config and state directories), a command that deletes more than
+directory, the OpenCode SQLite store, the ZCode SQLite store, the Antigravity
+transcripts and conversation summaries index, and duck-mem's own database,
+config and state directories), a command that deletes more than
 its own data, or session text that leaves the machine.
 
 ## What duck-mem does not do
 
 - It never writes to another agent's session store. Reads are read-only,
-  including the OpenCode and ZCode SQLite databases and their WALs.
+  including the OpenCode, ZCode and Antigravity SQLite databases and their
+  WALs.
 - It makes no network calls of its own. The DuckDB `vss`, `fts` and `duckpgq`
   extensions are installed from the DuckDB community repository on first run,
   which is the one outbound request the tool triggers.

@@ -345,6 +345,7 @@ func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files
 		logSyncFailure("all", "Database error", fmt.Errorf("backfill session metadata: %w", err))
 	}
 	cursorProjects := map[string]map[string]string{}
+	antigravityProjects := map[string]map[string]string{}
 	entries := map[string]syncLogEntry{}
 	defer func() {
 		keys := make([]string, 0, len(entries))
@@ -401,15 +402,24 @@ func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files
 				nSkip++
 				return
 			}
-			var projects map[string]string
+			var projects ingest.Projects
 			kind := ingest.Classify(f)
-			if kind == ingest.KindCursorTranscript {
+			switch kind {
+			case ingest.KindCursorTranscript:
 				home := ingest.CursorHome(f)
 				var ok bool
-				projects, ok = cursorProjects[home]
+				projects.Cursor, ok = cursorProjects[home]
 				if !ok {
-					projects = ingest.LoadCursorProjects(home)
-					cursorProjects[home] = projects
+					projects.Cursor = ingest.LoadCursorProjects(home)
+					cursorProjects[home] = projects.Cursor
+				}
+			case ingest.KindAntigravity:
+				dir := ingest.AntigravityDir(f)
+				var ok bool
+				projects.Antigravity, ok = antigravityProjects[dir]
+				if !ok {
+					projects.Antigravity = ingest.LoadAntigravityProjects(dir)
+					antigravityProjects[dir] = projects.Antigravity
 				}
 			}
 			reason = "Database error"
@@ -419,9 +429,19 @@ func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files
 				nSkip++
 				return
 			}
-			projectMatches := kind != ingest.KindCursorTranscript
+			// A harness that keeps its workspace mapping outside the transcript
+			// can resolve it after the transcript was first ingested, so the
+			// project is re-checked even when the file has not changed.
+			var workspace string
+			switch kind {
+			case ingest.KindCursorTranscript:
+				workspace = ingest.CursorProject(f, projects.Cursor)
+			case ingest.KindAntigravity:
+				workspace = ingest.AntigravityProject(f, projects.Antigravity)
+			}
+			projectMatches := workspace == ""
 			if !projectMatches && checkpoint != nil {
-				current, err := db.ResolveProject(ingest.CursorProject(f, projects))
+				current, err := db.ResolveProject(workspace)
 				if err != nil {
 					failure = err
 					nSkip++
@@ -468,7 +488,7 @@ func runCycle(db *store.DB, roots []string, identities *identityRecorder) (files
 			}
 			reason = "Other"
 			if !appended {
-				sess, msgs, err = ingest.IngestFileWithCursorProjects(f, projects)
+				sess, msgs, err = ingest.IngestFileWithProjects(f, projects)
 			}
 			if err == nil && sess.ID == "" {
 				err = ingest.ErrUnexpectedFormat
@@ -901,7 +921,7 @@ func queryCmd(args []string) {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
 	dbPath := fs.String("db", defaultDB(), "DuckDB file")
 	projectName := fs.String("project", "", "filter by project: name, path, alias or git identity")
-	source := fs.String("source", "", "filter by source: codex|claude|cursor|muse|opencode|dsh|zcode")
+	source := fs.String("source", "", "filter by source: codex|claude|cursor|muse|opencode|dsh|zcode|antigravity")
 	limit := fs.Int("limit", 5, "max sessions")
 	perSession := fs.Int("hits", 3, "max matching messages shown per session")
 	known := map[string]bool{"--db": true, "--project": true, "--source": true, "--limit": true, "--hits": true}
