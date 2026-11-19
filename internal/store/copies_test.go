@@ -91,11 +91,11 @@ func TestCopySuppressionPromotionAndOwnerRewrite(t *testing.T) {
 	if _, _, err := db.IndexNew(1); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.PrepareSessionCopies(); err != nil {
-		t.Fatal(err)
+	if added, err := db.PrepareSessionCopies(); err != nil || added != 2 {
+		t.Fatalf("first backfill added=%d err=%v", added, err)
 	}
-	if err := db.PrepareSessionCopies(); err != nil {
-		t.Fatal(err)
+	if added, err := db.PrepareSessionCopies(); err != nil || added != 0 {
+		t.Fatalf("second backfill added=%d err=%v", added, err)
 	}
 	suppress := func(want int) {
 		t.Helper()

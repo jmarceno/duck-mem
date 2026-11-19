@@ -43,6 +43,8 @@ Description=Duck-mem session memory indexer
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/duck-mem daemon --interval 5m
+Environment=GOMEMLIMIT=1GiB
+MemoryHigh=1G
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=30min

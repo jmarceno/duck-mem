@@ -7,7 +7,6 @@ import (
 	"image/draw"
 	"image/png"
 	"math"
-	"sync"
 
 	"github.com/jmarceno/duck-mem/assets"
 )
@@ -92,25 +91,20 @@ func failureIcon(logo *image.NRGBA) *image.NRGBA {
 	return img
 }
 
-var (
-	logoOnce    sync.Once
-	logoDecoded *image.NRGBA
-	logoErr     error
-)
-
+// logoImage decodes the embedded artwork. The decoded 4 MB bitmap is only
+// needed while newTrayIcons pre-renders the sizes, so it is returned as a
+// local value and left to the collector instead of being cached for the
+// lifetime of the tray process.
 func logoImage() (*image.NRGBA, error) {
-	logoOnce.Do(func() {
-		img, err := png.Decode(bytes.NewReader(assets.Logo))
-		if err != nil {
-			logoErr = err
-			return
-		}
-		// The logo is a square RGBA raster; tray sizes come straight off it.
-		b := img.Bounds()
-		logoDecoded = image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
-		draw.Draw(logoDecoded, logoDecoded.Bounds(), img, b.Min, draw.Src)
-	})
-	return logoDecoded, logoErr
+	img, err := png.Decode(bytes.NewReader(assets.Logo))
+	if err != nil {
+		return nil, err
+	}
+	// The logo is a square RGBA raster; tray sizes come straight off it.
+	b := img.Bounds()
+	logo := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(logo, logo.Bounds(), img, b.Min, draw.Src)
+	return logo, nil
 }
 
 // resampleArea box-filters src down to size×size. It averages premultiplied

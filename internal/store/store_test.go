@@ -697,6 +697,36 @@ func TestIndexFullHealsThresholdDrift(t *testing.T) {
 	}
 }
 
+// A streamed rebuild still attributes every edge to its own project.
+func TestIndexFullKeepsProjectsSeparate(t *testing.T) {
+	db := openTemp(t)
+	add := func(sid, project, text string) {
+		t.Helper()
+		if err := db.UpsertSession(Session{ID: sid, Source: "codex", Project: project, Path: "f"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.InsertMessages([]Message{{
+			SessionID: sid, Seq: 0, Source: "codex", Project: project, Role: "user", Text: text,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("a", "alpha-project", "bastion sentry")
+	add("b", "beta-project", "bastion turret")
+	if err := db.IndexFull(1); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ project, want string }{
+		{"alpha-project", "sentry"},
+		{"beta-project", "turret"},
+	} {
+		hits, err := db.Related(context.Background(), "bastion", tc.project, 1, 10)
+		if err != nil || len(hits) != 1 || hits[0].Term != tc.want {
+			t.Fatalf("%s: hits=%+v err=%v", tc.project, hits, err)
+		}
+	}
+}
+
 // A typed relation seen twice outranks co-mentions; a one-off, often a
 // misparse like "barricade's actual shape", ranks by weight like them.
 // Word forms share one graph node, shown by its most common surface word.

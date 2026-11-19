@@ -112,7 +112,10 @@ func Repack(source, destination string) (err error) {
 	}
 	defer os.RemoveAll(dir)
 	tmp := filepath.Join(dir, "memory.duckdb")
-	sdb, err := sql.Open("duckdb", "?"+storageConfig)
+	if err := ensureTempDirectory(source); err != nil {
+		return err
+	}
+	sdb, err := sql.Open("duckdb", "?"+storageConfig+"&"+runtimeConfig(source))
 	if err != nil {
 		return err
 	}

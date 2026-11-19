@@ -75,3 +75,46 @@ func TestZCodeKeepsVisibleTextOnly(t *testing.T) {
 		t.Fatalf("subagent session missing or wrong: %+v", child)
 	}
 }
+
+// A watermark makes a live store read only the sessions that moved, while
+// a zero watermark still reads everything.
+func TestZCodeSinceSkipsUnchangedSessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zcode", "db.sqlite")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		`CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER)`,
+		`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)`,
+		`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)`,
+		`INSERT INTO session VALUES ('sess_old', '/old', 1000, 1000)`,
+		`INSERT INTO session VALUES ('sess_new', '/new', 2000, 2000)`,
+		`INSERT INTO message VALUES ('m_old', 'sess_old', 1000, '{"role":"user"}')`,
+		`INSERT INTO part VALUES ('p_old', 'm_old', 'sess_old', 1000, '{"type":"text","text":"old text"}')`,
+		`INSERT INTO message VALUES ('m_new', 'sess_new', 2000, '{"role":"user"}')`,
+		`INSERT INTO part VALUES ('p_new', 'm_new', 'sess_new', 2000, '{"type":"text","text":"new text"}')`,
+	} {
+		if _, err := db.Exec(query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := IngestZCodeSince(path, 1500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 1 || changed[0].Session.ID != "zcode:new" ||
+		len(changed[0].Messages) != 1 || changed[0].Messages[0].Text != "new text" {
+		t.Fatalf("watermark did not isolate the changed session: %+v", changed)
+	}
+	all, err := IngestZCode(path)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("full read lost sessions: n=%d err=%v", len(all), err)
+	}
+}

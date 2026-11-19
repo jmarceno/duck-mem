@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -19,7 +21,35 @@ const (
 	storageConfig      = "storage_compatibility_version=" + zstdStorageVersion + "&force_compression=zstd"
 )
 
-func dsn(path string) string { return path + "?" + storageConfig }
+// The process owns a DuckDB instance for its whole lifetime, so its
+// defaults (80% of RAM and every core) let the buffer pool and parallel
+// operators grow until the machine is under pressure. The store is a
+// single-user index, not a warehouse: cap memory and threads, and spill
+// beside the database instead of the process working directory.
+const (
+	// 768 MB leaves headroom for the Go heap and the shared binary under
+	// a 1 GB MemoryHigh safety net while still letting a search spill
+	// rather than grow without bound.
+	duckMemoryLimit = "768MB"
+	duckThreads     = "4"
+	tempDirName     = "duckdb-tmp"
+)
+
+func tempDirectory(path string) string {
+	return filepath.Join(filepath.Dir(path), tempDirName)
+}
+
+func ensureTempDirectory(path string) error {
+	return os.MkdirAll(tempDirectory(path), 0o755)
+}
+
+func runtimeConfig(path string) string {
+	return "memory_limit=" + duckMemoryLimit +
+		"&threads=" + duckThreads +
+		"&temp_directory=" + url.QueryEscape(tempDirectory(path))
+}
+
+func dsn(path string) string { return path + "?" + storageConfig + "&" + runtimeConfig(path) }
 
 // upgradeStorage rewrites a database file created with a storage version
 // that cannot hold ZSTD segments. Every table is copied into a new file
@@ -30,6 +60,9 @@ func dsn(path string) string { return path + "?" + storageConfig }
 func upgradeStorage(path string) error {
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
+	}
+	if err := ensureTempDirectory(path); err != nil {
+		return err
 	}
 	sdb, err := sql.Open("duckdb", "?"+storageConfig)
 	if err != nil {
@@ -106,6 +139,9 @@ func supportsZstd(version string) bool {
 // copy has the same row count. (COPY FROM DATABASE ignores that order and
 // fails on the foreign keys.)
 func copyTables(sdb *sql.DB) error {
+	// Copy in bounded rowid ranges: a single INSERT of a multi-million-row
+	// table plus its indexes exceeds a sane memory limit.
+	const chunk = 250_000
 	tables := map[string]string{}
 	rows, err := sdb.Query(`SELECT table_name, sql FROM duckdb_tables() WHERE database_name='old_db' AND schema_name='main'`)
 	if err != nil {
@@ -156,8 +192,25 @@ func copyTables(sdb *sql.DB) error {
 			if err := sdb.QueryRow(`SELECT count(*) FROM old_db.main.` + quoted).Scan(&a); err != nil {
 				return err
 			}
-			if _, err := sdb.Exec(`INSERT INTO new_db.main.` + quoted + ` SELECT * FROM old_db.main.` + quoted); err != nil {
-				return fmt.Errorf("copy %s: %w", name, err)
+			if a <= chunk {
+				// A small table fits in one transaction and keeps the
+				// forced ZSTD compression of the original bulk copy.
+				if _, err := sdb.Exec(`INSERT INTO new_db.main.` + quoted + ` SELECT * FROM old_db.main.` + quoted); err != nil {
+					return fmt.Errorf("copy %s: %w", name, err)
+				}
+			} else {
+				var lo, hi sql.NullInt64
+				if err := sdb.QueryRow(`SELECT min(rowid), max(rowid) FROM old_db.main.`+quoted).Scan(&lo, &hi); err != nil {
+					return fmt.Errorf("copy %s: %w", name, err)
+				}
+				for start := lo.Int64; lo.Valid && start <= hi.Int64; start += chunk {
+					end := start + chunk - 1
+					if _, err := sdb.Exec(`INSERT INTO new_db.main.`+quoted+
+						` SELECT * FROM old_db.main.`+quoted+
+						` WHERE rowid >= ? AND rowid <= ? ORDER BY rowid`, start, end); err != nil {
+						return fmt.Errorf("copy %s: %w", name, err)
+					}
+				}
 			}
 			if err := sdb.QueryRow(`SELECT count(*) FROM new_db.main.` + quoted).Scan(&b); err != nil {
 				return err

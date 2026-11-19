@@ -249,6 +249,63 @@ func copyTopicsAndEdges(conn *duckdb.Conn, topics []stagedTopic, edges []stagedE
 	return execConn(conn, edgeSQL)
 }
 
+// copyProjectEdges streams one project's graph straight into the empty
+// topics and topic_edges tables. Topics are appended first so the foreign
+// key is satisfied, then both directions of every edge go to the appender.
+// No per-edge slice, driver.Value matrix or staging copy is materialised.
+func copyProjectEdges(conn *duckdb.Conn, edges map[ProjectEdge]int, evidence map[ProjectEdge]string, labels map[string]string) error {
+	if len(edges) == 0 {
+		return nil
+	}
+	label := func(term string) string {
+		if l := labels[term]; l != "" {
+			return l
+		}
+		return term
+	}
+	seen := make(map[string]struct{}, len(edges)/2)
+	topics := make([]stagedTopic, 0, len(edges)/2)
+	for e := range edges {
+		for _, end := range [2]struct{ term string }{{e.A}, {e.B}} {
+			id := topicID(e.Project, end.term)
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			topics = append(topics, stagedTopic{id: id, project: e.Project, term: end.term, label: label(end.term)})
+		}
+	}
+	topicApp, err := duckdb.NewAppenderFromConn(conn, "", "topics")
+	if err != nil {
+		return err
+	}
+	for _, t := range topics {
+		if err := topicApp.AppendRow(t.id, t.project, t.term, t.label); err != nil {
+			_ = topicApp.Close()
+			return err
+		}
+	}
+	if err := topicApp.Close(); err != nil {
+		return err
+	}
+	edgeApp, err := duckdb.NewAppenderFromConn(conn, "", "topic_edges")
+	if err != nil {
+		return err
+	}
+	for e, w := range edges {
+		ev := evidence[e]
+		for _, end := range [2][2]string{{e.A, e.B}, {e.B, e.A}} {
+			src, dst := topicID(e.Project, end[0]), topicID(e.Project, end[1])
+			if err := edgeApp.AppendRow(edgeID(src, dst, e.kind(), e.From, e.To), src, dst,
+				e.Project, e.A, e.B, int32(w), e.kind(), e.From, e.To, ev); err != nil {
+				_ = edgeApp.Close()
+				return err
+			}
+		}
+	}
+	return edgeApp.Close()
+}
+
 type stagedDF struct {
 	project, term string
 	msgs          int32

@@ -17,6 +17,13 @@ import (
 // are excluded. Subagent sessions (parent_id set) are kept: their reports
 // reach the main conversation only as tool output, which is dropped.
 func IngestZCode(path string) ([]Snapshot, error) {
+	return IngestZCodeSince(path, 0)
+}
+
+// IngestZCodeSince reads only sessions updated after since (Unix
+// milliseconds). A zero since reads the whole store. Stores whose schema
+// predates the update column fall back to a full read.
+func IngestZCodeSince(path string, since int64) ([]Snapshot, error) {
 	db, tx, err := snapshotTx(path, "ZCode")
 	if err != nil {
 		return nil, err
@@ -24,7 +31,7 @@ func IngestZCode(path string) ([]Snapshot, error) {
 	defer db.Close()
 	defer tx.Rollback()
 
-	sessions, rawIDs, err := zCodeSessions(tx, path)
+	sessions, rawIDs, err := zCodeSessions(tx, path, since)
 	if err != nil {
 		return nil, err
 	}
@@ -114,9 +121,12 @@ func IngestZCode(path string) ([]Snapshot, error) {
 // zCodeSessions reads the session table with its update time when the
 // live schema carries it, falling back to the columns older stores have.
 // Raw IDs are returned alongside because stored IDs carry a source prefix.
-func zCodeSessions(tx *sql.Tx, storePath string) ([]Snapshot, []string, error) {
+// A nonzero since keeps only sessions updated after it.
+func zCodeSessions(tx *sql.Tx, storePath string, since int64) ([]Snapshot, []string, error) {
 	rows, err := tx.Query(`SELECT id, COALESCE(NULLIF(directory, ''), ''), time_created, time_updated
-		FROM session ORDER BY time_created, id`)
+		FROM session
+		WHERE (? = 0 OR COALESCE(time_updated, time_created) >= ?)
+		ORDER BY time_created, id`, since, since)
 	if err != nil {
 		if !missingSchema(err) {
 			return nil, nil, openCodeReadError("read ZCode sessions", err)

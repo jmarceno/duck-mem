@@ -68,6 +68,9 @@ const (
 type DB struct {
 	sql      *sql.DB
 	readOnly bool
+	// path is the database file opened by Open. reopen uses it to get a
+	// fresh DuckDB instance after the graph tables were recreated.
+	path string
 	// readCtx cancels agent reads. Writes leave it nil and use a background context.
 	readCtx context.Context
 }
@@ -121,6 +124,9 @@ type FileCheckpoint struct {
 // Open creates/opens the DuckDB file and initializes the schema.
 // duckpgq is required: related does not run without it.
 func Open(path string) (*DB, error) {
+	if err := ensureTempDirectory(path); err != nil {
+		return nil, err
+	}
 	if err := upgradeStorage(path); err != nil {
 		return nil, err
 	}
@@ -129,7 +135,7 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	sdb.SetMaxOpenConns(1)
-	db := &DB{sql: sdb}
+	db := &DB{sql: sdb, path: path}
 	if err := db.init(); err != nil {
 		_ = sdb.Close()
 		return nil, err
@@ -144,12 +150,15 @@ func OpenReadOnly(path string) (*DB, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("database not found: %s (run ingest or daemon first)", path)
 	}
-	sdb, err := sql.Open("duckdb", "")
+	if err := ensureTempDirectory(path); err != nil {
+		return nil, err
+	}
+	sdb, err := sql.Open("duckdb", "?"+runtimeConfig(path))
 	if err != nil {
 		return nil, err
 	}
 	sdb.SetMaxOpenConns(1)
-	db := &DB{sql: sdb, readOnly: true}
+	db := &DB{sql: sdb, readOnly: true, path: path}
 	if err := loadExtensions(sdb); err != nil {
 		_ = sdb.Close()
 		return nil, err
@@ -349,6 +358,28 @@ func (db *DB) dropLegacyVectorIndex() error {
 // Close releases the handle.
 func (db *DB) Close() error { return db.sql.Close() }
 
+// reopen gives the store a fresh DuckDB handle on the same file. A full
+// rebuild drops and recreates the graph tables; writing them again in the
+// same instance can misread their ZSTD segments ("ZSTD Decompression
+// failed"). Closing and reopening, like a separate process, clears that
+// state before the incremental writes start.
+func (db *DB) reopen() error {
+	if db.readOnly || db.path == "" {
+		return nil
+	}
+	path := db.path
+	if err := db.sql.Close(); err != nil {
+		return err
+	}
+	fresh, err := Open(path)
+	if err != nil {
+		return err
+	}
+	db.sql = fresh.sql
+	fresh.sql = nil
+	return nil
+}
+
 func (db *DB) GetCheckpoint(path string) (*FileCheckpoint, error) {
 	var c FileCheckpoint
 	err := db.sql.QueryRow(`SELECT path, size, mtime_ns, tail_hash, ends_line, session_id, project, parser_version
@@ -372,6 +403,33 @@ func (db *DB) SaveCheckpoint(c FileCheckpoint) error {
 		c.Path, c.Size, c.ModTimeNS, c.TailHash, c.EndsLine, c.SessionID, c.Project, c.ParserVersion)
 	return err
 }
+
+// SnapshotWatermark is the newest source update time already ingested for a
+// live SQLite store, in Unix milliseconds. Zero means read the whole store.
+func (db *DB) SnapshotWatermark(path string) (int64, error) {
+	var v string
+	err := db.sql.QueryRow(`SELECT value FROM meta WHERE key=?`, snapshotMarkKey(path)).Scan(&v)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	ms, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid snapshot watermark for %s: %w", path, err)
+	}
+	return ms, nil
+}
+
+// SetSnapshotWatermark records the newest source update time ingested.
+func (db *DB) SetSnapshotWatermark(path string, ms int64) error {
+	_, err := db.sql.Exec(`INSERT INTO meta(key, value) VALUES(?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, snapshotMarkKey(path), strconv.FormatInt(ms, 10))
+	return err
+}
+
+func snapshotMarkKey(path string) string { return "snapshot_mark:" + path }
 
 func (db *DB) GetSession(id string) (Session, error) {
 	var s Session
@@ -714,11 +772,21 @@ func (db *DB) ensureEdgesSchema() error {
 			kind TEXT NOT NULL,
 			from_term TEXT NOT NULL,
 			to_term TEXT NOT NULL)`,
-		// The graph was just dropped: every message needs indexing again.
-		`UPDATE messages SET indexed=0`,
 		`DELETE FROM term_df`,
 	} {
 		if _, err := tx.Exec(q); err != nil {
+			return err
+		}
+	}
+	// An existing corpus needs a streamed full rebuild. A fresh database
+	// has nothing to rebuild and must not skip its first incremental index.
+	var hasMessages bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM messages)`).Scan(&hasMessages); err != nil {
+		return err
+	}
+	if hasMessages {
+		if _, err := tx.Exec(`INSERT INTO meta(key, value) VALUES('graph_dirty', '1')
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`); err != nil {
 			return err
 		}
 	}
@@ -745,13 +813,25 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 		return 0, 0, err
 	}
 	if dirty == "1" {
-		if err := db.sql.QueryRow(`SELECT count(*) FROM messages WHERE indexed=0`).Scan(&newMsgs); err != nil {
+		// A full rebuild reindexes the whole corpus, not only the rows
+		// whose marker was cleared.
+		if err := db.sql.QueryRow(`SELECT count(*) FROM messages`).Scan(&newMsgs); err != nil {
 			return 0, 0, err
 		}
 		if err := db.IndexFull(minDF); err != nil {
 			return 0, 0, err
 		}
 		return newMsgs, 0, nil
+	}
+	// A quiet cycle must not build the document-frequency map to discover
+	// that there is nothing to index. Checking the one-column marker is a
+	// cheap scan; the old path loaded every term first.
+	var pending int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM messages WHERE indexed=0`).Scan(&pending); err != nil {
+		return 0, 0, err
+	}
+	if pending == 0 {
+		return 0, 0, nil
 	}
 	df, totals, err := db.loadDF()
 	if err != nil {
@@ -865,71 +945,115 @@ func (db *DB) IndexNew(minDF int) (newMsgs, newPairs int, err error) {
 }
 
 // IndexFull rebuilds the graph from scratch: exact thresholds, healed
-// drift. Run on a schedule (e.g. weekly cron); IndexNew covers the days.
+// drift. It streams one project at a time, so a rebuild never holds the
+// whole corpus, every edge and every staged row in memory at once. The
+// dirty marker makes an interrupted rebuild retry on the next cycle.
 func (db *DB) IndexFull(minDF int) error {
 	if err := db.ensureEdgesSchema(); err != nil {
 		return err
 	}
-	docs, err := db.AllTexts()
+	if err := db.markGraphDirty(); err != nil {
+		return err
+	}
+	projects, err := db.projects()
 	if err != nil {
 		return err
 	}
-	missingSet, err := db.missingEmbeddings()
-	if err != nil {
+	if err := db.resetFullGraph(); err != nil {
 		return err
 	}
-	groups := map[string][]int{}
-	texts := make([]string, len(docs))
-	missing := make([]bool, len(docs))
-	for i, d := range docs {
-		texts[i] = d.Text
-		groups[d.Project] = append(groups[d.Project], i)
-		_, missing[i] = missingSet[msgKey{d.SessionID, d.Seq}]
-	}
-	scanned, vecs := prepareMessages(texts, missing)
-	labels, err := db.stemDocs(scanned)
-	if err != nil {
+	if err := db.reopen(); err != nil {
 		return err
 	}
-	edgeW := map[ProjectEdge]int{}
-	evidence := map[ProjectEdge]string{}
-	var dfRows []stagedDF
-	var log []edgeLogRow
-	for proj, idxs := range groups {
-		df := map[string]int{}
-		for _, i := range idxs {
-			for _, w := range scanned[i].Terms {
-				df[w]++
-			}
+	for _, proj := range projects {
+		docs, missing, err := db.projectDocs(proj)
+		if err != nil {
+			return err
 		}
-		maxDF := topics.HubCap(len(idxs), minDF)
-		for _, i := range idxs {
-			d := docs[i]
-			for _, e := range topics.SelectPairsFromTerms(scanned[i].Terms, df, minDF, maxDF) {
-				pe := ProjectEdge{Project: proj, A: e[0], B: e[1]}
-				edgeW[pe]++
-				log = append(log, edgeLogRow{d.SessionID, d.Seq, pe})
-			}
-			for _, tp := range scanned[i].Typed {
-				e := ProjectEdge{Project: proj, A: tp.A, B: tp.B, From: tp.From, To: tp.To, Kind: tp.Kind}
-				edgeW[e]++
-				log = append(log, edgeLogRow{d.SessionID, d.Seq, e})
-				if evidence[e] == "" {
-					evidence[e] = fmt.Sprintf("%s#%d: %s", d.SessionID, d.Seq, tp.Evidence)
-				}
-			}
+		if len(docs) == 0 {
+			continue
 		}
-		for w, n := range df {
-			dfRows = append(dfRows, stagedDF{project: proj, term: w, msgs: int32(n)})
+		if err := db.indexFullProject(proj, docs, missing, minDF); err != nil {
+			return err
 		}
 	}
-	topicRows, edgeRows := collectEdges(edgeW, evidence, labels)
-	var embRows []stagedEmb
-	for i, d := range docs {
-		if vecs[i] != nil {
-			embRows = append(embRows, stagedEmb{sessionID: d.SessionID, seq: int32(d.Seq), vec: vecs[i]})
+	if err := db.markIndexed(); err != nil {
+		return err
+	}
+	_, err = db.sql.Exec(`DELETE FROM meta WHERE key='graph_dirty'`)
+	return err
+}
+
+// markIndexed flips the incremental marker in bounded batches. A single
+// UPDATE over every message plus its index can exceed the memory limit
+// after a full rebuild, and the dirty marker makes a partial pass safe to
+// retry from scratch.
+func (db *DB) markIndexed() error {
+	for {
+		res, err := db.sql.Exec(`UPDATE messages SET indexed=1 WHERE rowid IN (
+			SELECT rowid FROM messages WHERE indexed=0 LIMIT 20000)`)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
 		}
 	}
+}
+
+func (db *DB) projects() ([]string, error) {
+	rows, err := db.sql.Query(`SELECT DISTINCT project FROM messages ORDER BY project`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) projectDocs(proj string) ([]TextDoc, []bool, error) {
+	rows, err := db.sql.Query(`SELECT session_id, seq, project, text, embedding IS NULL
+		FROM messages WHERE project=? ORDER BY session_id, seq`, proj)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var docs []TextDoc
+	var missing []bool
+	for rows.Next() {
+		var d TextDoc
+		var miss bool
+		if err := rows.Scan(&d.SessionID, &d.Seq, &d.Project, &d.Text, &miss); err != nil {
+			return nil, nil, err
+		}
+		docs = append(docs, d)
+		missing = append(missing, miss)
+	}
+	return docs, missing, rows.Err()
+}
+
+func (db *DB) markGraphDirty() error {
+	_, err := db.sql.Exec(`INSERT INTO meta(key, value) VALUES('graph_dirty', '1')
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+	return err
+}
+
+func (db *DB) resetFullGraph() error {
+	// Dropping and recreating the graph tables is fast and leaves their
+	// ZSTD segments clean. The handle is reopened right after the commit
+	// (see reopen) because DuckDB otherwise misreads its own segments when
+	// the recreated tables are written again in the same instance.
 	return db.withTx(func(conn *duckdb.Conn) error {
 		if err := resetGraphTables(conn); err != nil {
 			return err
@@ -937,28 +1061,83 @@ func (db *DB) IndexFull(minDF int) error {
 		if err := execConn(conn, `DELETE FROM term_df`); err != nil {
 			return err
 		}
-		if err := execConn(conn, `DELETE FROM msg_edges`); err != nil {
-			return err
+		return execConn(conn, `DELETE FROM msg_edges`)
+	})
+}
+
+// edgeLogChunk bounds the per-message edge log held in Go while a project is
+// analysed. Larger projects flush in batches inside the rebuild.
+const edgeLogChunk = 100_000
+
+func (db *DB) indexFullProject(proj string, docs []TextDoc, missing []bool, minDF int) error {
+	texts := make([]string, len(docs))
+	for i := range docs {
+		texts[i] = docs[i].Text
+	}
+	scanned, vecs := prepareMessages(texts, missing)
+	labels, err := db.stemDocs(scanned)
+	if err != nil {
+		return err
+	}
+	df := map[string]int{}
+	for i := range scanned {
+		for _, w := range scanned[i].Terms {
+			df[w]++
 		}
-		if err := appendEdgeLog(conn, log); err != nil {
-			return err
+	}
+	maxDF := topics.HubCap(len(docs), minDF)
+	edgeW := map[ProjectEdge]int{}
+	evidence := map[ProjectEdge]string{}
+	log := make([]edgeLogRow, 0, edgeLogChunk)
+	flushLog := func() error {
+		if len(log) == 0 {
+			return nil
 		}
-		if err := copyTopicsAndEdges(conn, topicRows, edgeRows, false); err != nil {
-			return err
+		rows := log
+		log = make([]edgeLogRow, 0, edgeLogChunk)
+		return db.withTx(func(conn *duckdb.Conn) error { return appendEdgeLog(conn, rows) })
+	}
+	for i, d := range docs {
+		for _, e := range topics.SelectPairsFromTerms(scanned[i].Terms, df, minDF, maxDF) {
+			pe := ProjectEdge{Project: proj, A: e[0], B: e[1]}
+			edgeW[pe]++
+			log = append(log, edgeLogRow{d.SessionID, d.Seq, pe})
 		}
-		if err := ensurePropertyGraphConn(conn, false); err != nil {
+		for _, tp := range scanned[i].Typed {
+			e := ProjectEdge{Project: proj, A: tp.A, B: tp.B, From: tp.From, To: tp.To, Kind: tp.Kind}
+			edgeW[e]++
+			log = append(log, edgeLogRow{d.SessionID, d.Seq, e})
+			if evidence[e] == "" {
+				evidence[e] = fmt.Sprintf("%s#%d: %s", d.SessionID, d.Seq, tp.Evidence)
+			}
+		}
+		if len(log) >= edgeLogChunk {
+			if err := flushLog(); err != nil {
+				return err
+			}
+		}
+	}
+	if err := flushLog(); err != nil {
+		return err
+	}
+	dfRows := make([]stagedDF, 0, len(df))
+	for w, n := range df {
+		dfRows = append(dfRows, stagedDF{project: proj, term: w, msgs: int32(n)})
+	}
+	var embRows []stagedEmb
+	for i, d := range docs {
+		if vecs[i] != nil {
+			embRows = append(embRows, stagedEmb{sessionID: d.SessionID, seq: int32(d.Seq), vec: vecs[i]})
+		}
+	}
+	return db.withTx(func(conn *duckdb.Conn) error {
+		if err := copyProjectEdges(conn, edgeW, evidence, labels); err != nil {
 			return err
 		}
 		if err := copyTermDF(conn, dfRows, false); err != nil {
 			return err
 		}
-		if err := copyEmbeddings(conn, embRows); err != nil {
-			return err
-		}
-		if err := execConn(conn, `UPDATE messages SET indexed=1`); err != nil {
-			return err
-		}
-		return execConn(conn, `DELETE FROM meta WHERE key='graph_dirty'`)
+		return copyEmbeddings(conn, embRows)
 	})
 }
 

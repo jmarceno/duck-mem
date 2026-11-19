@@ -35,21 +35,31 @@ const parserVersion = 4
 const openCodeParserVersion = 3
 const zCodeParserVersion = 3
 
+// snapshotIngest is one live-SQLite reader. readSince takes a watermark in
+// Unix milliseconds and returns only sessions updated after it, so a
+// changed store does not re-parse its whole history; a zero watermark reads
+// everything.
+type snapshotIngest struct {
+	read      func(string) ([]ingest.Snapshot, error)
+	readSince func(string, int64) ([]ingest.Snapshot, error)
+	version   int
+}
+
 // snapshotIngestor picks the live-SQLite reader and its parser version.
-func snapshotIngestor(kind ingest.Kind) (read func(string) ([]ingest.Snapshot, error), version int, ok bool) {
+func snapshotIngestor(kind ingest.Kind) (snapshotIngest, bool) {
 	switch kind {
 	case ingest.KindOpenCode:
-		return ingest.IngestOpenCode, openCodeParserVersion, true
+		return snapshotIngest{ingest.IngestOpenCode, ingest.IngestOpenCodeSince, openCodeParserVersion}, true
 	case ingest.KindZCode:
-		return ingest.IngestZCode, zCodeParserVersion, true
+		return snapshotIngest{ingest.IngestZCode, ingest.IngestZCodeSince, zCodeParserVersion}, true
 	}
-	return nil, 0, false
+	return snapshotIngest{}, false
 }
 
 // isSnapshotStore reports whether the kind is a live SQLite store read whole
 // per cycle instead of per-file.
 func isSnapshotStore(kind ingest.Kind) bool {
-	_, _, ok := snapshotIngestor(kind)
+	_, ok := snapshotIngestor(kind)
 	return ok
 }
 
@@ -273,19 +283,26 @@ func daemonCmd(args []string) {
 }
 
 func performCycle(db *store.DB, dbPath string, roots []string) (owner.IngestResult, error) {
-	if err := db.PrepareSessionCopies(); err != nil {
+	added, err := db.PrepareSessionCopies()
+	if err != nil {
 		return owner.IngestResult{}, err
 	}
 	files, nSess, nMsg, nSkip, nBlocked := runCycle(db, roots, newIdentityRecorder(db))
 	if err := rotateSyncLogs(); err != nil {
 		logSyncFailure("all", "Other", fmt.Errorf("log rotation: %w", err))
 	}
-	copies, err := db.SuppressSessionCopies()
-	if err != nil {
-		return owner.IngestResult{}, err
-	}
-	if copies > 0 {
-		fmt.Printf("suppressed %d copied sessions (files remain watched)\n", copies)
+	copies := 0
+	// Duplicate relationships only change when a session identity was
+	// added or session content moved. A quiet cycle skips loading every
+	// stored hash list just to confirm nothing changed.
+	if added > 0 || nMsg > 0 {
+		copies, err = db.SuppressSessionCopies()
+		if err != nil {
+			return owner.IngestResult{}, err
+		}
+		if copies > 0 {
+			fmt.Printf("suppressed %d copied sessions (files remain watched)\n", copies)
+		}
 	}
 	newMsgs, newPairs, err := db.IndexNew(2)
 	if err != nil {
@@ -588,12 +605,13 @@ func applyProjectAlias(db *store.DB, sess *store.Session, msgs []store.Message) 
 	return nil
 }
 
-// ingestSnapshotStore re-reads a live SQLite store (OpenCode, ZCode) whole on
-// every cycle, skipping the work when neither the database nor its WAL changed.
-// It returns the sessions and messages ingested plus the sessions blocked by
-// a privacy tag.
+// ingestSnapshotStore reads a live SQLite store (OpenCode, ZCode) when its
+// database or WAL changed. After a first full read it asks the parser only
+// for sessions updated past the stored watermark, so a live store no longer
+// re-parses its whole history every cycle. It returns the sessions and
+// messages ingested plus the sessions blocked by a privacy tag.
 func ingestSnapshotStore(db *store.DB, path string, kind ingest.Kind, identities *identityRecorder) (int, int, int, error) {
-	read, parserVersion, _ := snapshotIngestor(kind)
+	ing, _ := snapshotIngestor(kind)
 	before, err := sqliteState(path)
 	if err != nil {
 		return 0, 0, 0, err
@@ -602,12 +620,20 @@ func ingestSnapshotStore(db *store.DB, path string, kind ingest.Kind, identities
 	if err != nil {
 		return 0, 0, 0, &syncDatabaseError{err}
 	}
-	if checkpoint != nil && checkpoint.ParserVersion == parserVersion &&
+	if checkpoint != nil && checkpoint.ParserVersion == ing.version &&
 		checkpoint.Size == before.Size && checkpoint.ModTimeNS == before.ModTimeNS &&
 		checkpoint.TailHash == before.TailHash {
 		return 0, 0, 0, nil
 	}
-	sessions, err := read(path)
+	// A parser change or a first read has no trusted watermark: read it all.
+	since := int64(0)
+	if checkpoint != nil && checkpoint.ParserVersion == ing.version {
+		since, err = db.SnapshotWatermark(path)
+		if err != nil {
+			return 0, 0, 0, &syncDatabaseError{err}
+		}
+	}
+	sessions, err := ing.readSince(path, since)
 	if err != nil {
 		if errors.Is(err, ingest.ErrUnexpectedFormat) {
 			return 0, 0, 0, err
@@ -615,7 +641,13 @@ func ingestSnapshotStore(db *store.DB, path string, kind ingest.Kind, identities
 		return 0, 0, 0, &syncDatabaseError{err}
 	}
 	count, completed, blocked := 0, 0, 0
+	maxUpdated := int64(0)
 	for _, s := range sessions {
+		if !s.Session.UpdatedAt.IsZero() {
+			if ms := s.Session.UpdatedAt.UnixMilli(); ms > maxUpdated {
+				maxUpdated = ms
+			}
+		}
 		tag := ingest.ExclusionTag(s.Messages)
 		if tag == "" {
 			marked, err := db.IsNoIngest(s.Session.ID)
@@ -653,8 +685,17 @@ func ingestSnapshotStore(db *store.DB, path string, kind ingest.Kind, identities
 	if err != nil {
 		return completed, count, blocked, err
 	}
+	// Advance the watermark even when the store kept changing during the
+	// read: the transaction saw a consistent snapshot, and newer sessions
+	// carry a newer update time. Only the checkpoint, which describes the
+	// exact file state, needs the stable-file condition.
+	if maxUpdated > since {
+		if err := db.SetSnapshotWatermark(path, maxUpdated); err != nil {
+			return completed, count, blocked, &syncDatabaseError{err}
+		}
+	}
 	if before.Size == after.Size && before.ModTimeNS == after.ModTimeNS && before.TailHash == after.TailHash {
-		after.ParserVersion = parserVersion
+		after.ParserVersion = ing.version
 		if err := db.SaveCheckpoint(after); err != nil {
 			return completed, count, blocked, &syncDatabaseError{err}
 		}
@@ -663,8 +704,8 @@ func ingestSnapshotStore(db *store.DB, path string, kind ingest.Kind, identities
 }
 
 func loadSessionCopy(s store.Session) (store.Session, []store.Message, error) {
-	if read, _, ok := snapshotIngestor(ingest.Classify(s.Path)); ok {
-		sessions, err := read(s.Path)
+	if ing, ok := snapshotIngestor(ingest.Classify(s.Path)); ok {
+		sessions, err := ing.read(s.Path)
 		if err != nil {
 			return s, nil, err
 		}

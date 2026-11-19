@@ -38,6 +38,13 @@ func snapshotTx(path, source string) (*sql.DB, *sql.Tx, error) {
 // IngestOpenCode reads a consistent snapshot of OpenCode's live database.
 // Only visible text fields are decoded; tool and reasoning parts are excluded.
 func IngestOpenCode(path string) ([]Snapshot, error) {
+	return IngestOpenCodeSince(path, 0)
+}
+
+// IngestOpenCodeSince reads only sessions updated after since (Unix
+// milliseconds). A zero since reads the whole store. Stores whose schema
+// predates the update column fall back to a full read.
+func IngestOpenCodeSince(path string, since int64) ([]Snapshot, error) {
 	db, tx, err := snapshotTx(path, "OpenCode")
 	if err != nil {
 		return nil, err
@@ -45,7 +52,7 @@ func IngestOpenCode(path string) ([]Snapshot, error) {
 	defer db.Close()
 	defer tx.Rollback()
 
-	sessions, err := openCodeSessions(tx, path)
+	sessions, err := openCodeSessions(tx, path, since)
 	if err != nil {
 		return nil, err
 	}
@@ -93,11 +100,14 @@ func IngestOpenCode(path string) ([]Snapshot, error) {
 // openCodeSessions reads the session table with its model and update time
 // when the live schema carries them, falling back to the columns older
 // stores have. Missing columns are not an unexpected format: the session
-// then just runs as Unknown with its creation date.
-func openCodeSessions(tx *sql.Tx, storePath string) ([]Snapshot, error) {
+// then just runs as Unknown with its creation date. A nonzero since keeps
+// only sessions updated after it.
+func openCodeSessions(tx *sql.Tx, storePath string, since int64) ([]Snapshot, error) {
 	rows, err := tx.Query(`SELECT s.id, COALESCE(NULLIF(s.directory, ''), p.worktree, ''), s.time_created,
 			s.model, s.time_updated
-		FROM session_v2 s LEFT JOIN project p ON p.id = s.project_id ORDER BY s.time_created, s.id`)
+		FROM session_v2 s LEFT JOIN project p ON p.id = s.project_id
+		WHERE (? = 0 OR COALESCE(s.time_updated, s.time_created) >= ?)
+		ORDER BY s.time_created, s.id`, since, since)
 	if err != nil {
 		if !missingSchema(err) {
 			return nil, openCodeReadError("read OpenCode sessions", err)

@@ -67,3 +67,44 @@ func TestOpenCodeKeepsVisibleTextOnly(t *testing.T) {
 		t.Fatalf("child or fallback project missing: %+v", child)
 	}
 }
+
+// A watermark makes a live store read only the sessions that moved, while
+// a zero watermark still reads everything.
+func TestOpenCodeSinceSkipsUnchangedSessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode", "opencode.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		`CREATE TABLE project (id TEXT, worktree TEXT)`,
+		`CREATE TABLE session_v2 (id TEXT, project_id TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER, model TEXT)`,
+		`CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT)`,
+		`INSERT INTO session_v2 VALUES ('old', NULL, '/old', 1000, 1000, NULL)`,
+		`INSERT INTO session_v2 VALUES ('new', NULL, '/new', 2000, 2000, NULL)`,
+		`INSERT INTO session_message VALUES ('a', 'old', 'user', 1, 1000, '{"text":"old text"}')`,
+		`INSERT INTO session_message VALUES ('b', 'new', 'user', 1, 2000, '{"text":"new text"}')`,
+	} {
+		if _, err := db.Exec(query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := IngestOpenCodeSince(path, 1500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 1 || changed[0].Session.ID != "opencode:new" ||
+		len(changed[0].Messages) != 1 || changed[0].Messages[0].Text != "new text" {
+		t.Fatalf("watermark did not isolate the changed session: %+v", changed)
+	}
+	all, err := IngestOpenCode(path)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("full read lost sessions: n=%d err=%v", len(all), err)
+	}
+}

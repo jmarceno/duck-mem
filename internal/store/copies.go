@@ -92,13 +92,27 @@ func identityValues(id string, c copyIdentity) []driver.Value {
 
 // PrepareSessionCopies backfills identities from the existing database once,
 // including backup-only sessions. It never needs the original logs to do so.
-func (db *DB) PrepareSessionCopies() error {
-	rows, err := db.sql.Query(`SELECT s.session_id, m.role, m.text FROM sessions s
-  LEFT JOIN messages m USING(session_id)
-  WHERE NOT EXISTS(SELECT 1 FROM session_copies c WHERE c.session_id=s.session_id)
-  ORDER BY s.session_id, m.seq`)
+// It returns how many identities it added, so the cycle can skip duplicate
+// suppression when no session could have changed.
+func (db *DB) PrepareSessionCopies() (int, error) {
+	var missing int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM sessions s
+		ANTI JOIN session_copies c ON c.session_id = s.session_id`).Scan(&missing); err != nil {
+		return 0, err
+	}
+	if missing == 0 {
+		return 0, nil
+	}
+	rows, err := db.sql.Query(`WITH missing AS (
+		SELECT s.session_id FROM sessions s
+		ANTI JOIN session_copies c ON c.session_id = s.session_id
+	)
+	SELECT s.session_id, m.role, m.text FROM missing x
+	JOIN sessions s USING(session_id)
+	LEFT JOIN messages m USING(session_id)
+	ORDER BY s.session_id, m.seq`)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var values [][]driver.Value
 	var id string
@@ -108,7 +122,7 @@ func (db *DB) PrepareSessionCopies() error {
 		var role, text sql.NullString
 		if err := rows.Scan(&sid, &role, &text); err != nil {
 			rows.Close()
-			return err
+			return 0, err
 		}
 		if sid != id {
 			if id != "" {
@@ -122,15 +136,15 @@ func (db *DB) PrepareSessionCopies() error {
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return 0, err
 	}
 	if id != "" {
 		values = append(values, identityValues(id, b.copyIdentity))
 	}
 	if len(values) == 0 {
-		return nil
+		return 0, nil
 	}
-	return db.withTx(func(conn *duckdb.Conn) error { return appendTable(conn, "session_copies", values) })
+	return len(values), db.withTx(func(conn *duckdb.Conn) error { return appendTable(conn, "session_copies", values) })
 }
 
 func (db *DB) refreshCopyIdentity(id string) error {
